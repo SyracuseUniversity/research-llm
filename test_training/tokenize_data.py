@@ -1,22 +1,24 @@
 # tokenize_data.py
 
-from transformers import LLaMATokenizer
+from transformers import AutoTokenizer
 
-def load_tokenizer(model_path):
-    """Loads the LLaMA tokenizer."""
-    tokenizer = LLaMATokenizer.from_pretrained(model_path)
+def load_tokenizer(model_name):
+    """Loads the tokenizer."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     return tokenizer
 
-def preprocess_function(examples, tokenizer):
-    """Preprocesses text for training."""
-    inputs = tokenizer("summarize: " + examples["text"], max_length=1024, truncation=True)
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(examples["summary"], max_length=256, truncation=True)
-    inputs["labels"] = labels["input_ids"]
-    return inputs
-
-def tokenize_dataset(dataset, model_path):
+def tokenize_dataset(dataset, tokenizer):
     """Tokenizes the dataset."""
-    tokenizer = load_tokenizer(model_path)
-    tokenized_data = [preprocess_function(item, tokenizer) for item in dataset]
+    def preprocess_function(examples):
+        inputs = ["Summarize: " + doc for doc in examples["text"]]
+        model_inputs = tokenizer(
+            inputs, max_length=512, truncation=True, padding='max_length'
+        )
+        labels = tokenizer(
+            examples["summary"], max_length=150, truncation=True, padding='max_length'
+        )
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+
+    tokenized_data = dataset.map(preprocess_function, batched=True)
     return tokenized_data
