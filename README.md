@@ -29,22 +29,39 @@ This repository contains a workflow for:
 ## Project Structure
 
 ├── chatbot.py
+
 ├── data_pre.py
+
 ├── database_handler.py
+
 ├── llama_model.py
+
 ├── main.py
+
 ├── pdf_pre.py
+
 ├── t5_model.py
+
 ├── train_llama.py
+
 ├── researchers.db            # SQLite database (auto-generated if not present)
+
 ├── download_pdfs/           # Folder containing your PDFs
+
 │   ├── paper1.pdf
+
 │   ├── paper2.pdf
+
 │   └── ...
+
 ├── fine_tuned_t5/           # Directory for fine-tuned T5 model (created by main.py)
+
 ├── fine_tuned_llama/        # Directory for fine-tuned LLaMA model (created by train_llama.py)
+
 ├── Llama-3.2-1B-Instruct/   # Base LLaMA model directory (assumes local copy)
+
 └── processed_training_data.pkl # Pickled training data for LLaMA (created by train_llama.py)
+
 
 ---
 
