@@ -71,7 +71,6 @@ This repository contains a workflow for:
 
 Create and activate a virtual environment (optional but recommended):
 
-\`\`\`bash
 python -m venv venv
 
 # On Linux or Mac:
