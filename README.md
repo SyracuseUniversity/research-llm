@@ -79,14 +79,12 @@ source venv/bin/activate
 
 # On Windows:
 venv\Scripts\activate
-\`\`\`
 
 Install required packages:
 
-\`\`\`bash
 pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu118 \
 transformers datasets PyPDF2==3.0.1 pandas pysqlite3
-\`\`\`
+
 
 Ensure you have your LLaMA base model folder (\`Llama-3.2-1B-Instruct/\` in the example) placed within the same directory. You may need to adjust the folder name or path in \`llama_model.py\`.
 
@@ -97,27 +95,27 @@ Ensure you have your LLaMA base model folder (\`Llama-3.2-1B-Instruct/\` in the 
 1. **Place your PDFs** in the \`download_pdfs/\` folder.
 
 2. **Run the main pipeline**:
-    \`\`\`bash
+
     python main.py
-    \`\`\`
+
     This script performs:
     - **STEP 1**: Reads all PDFs in \`download_pdfs/\`, extracts text, and populates \`researchers.db\`.
     - **STEP 2**: Summarizes unsummarized papers using the T5 model (the base \`t5-small\` by default).
     - **STEP 3**: Fine-tunes the T5 model on the newly generated summaries, saving the model to the \`fine_tuned_t5/\` folder.
 
 3. (Optional) **Fine-tune LLaMA** on your summarized data by running:
-    \`\`\`bash
+
     python train_llama.py
-    \`\`\`
+
     This script:
     - Loads summarized data from \`researchers.db\`.
     - Saves a pickle file (\`processed_training_data.pkl\`).
     - Fine-tunes the LLaMA model, saving it to \`fine_tuned_llama/\`.
 
 4. **Chat with the fine-tuned LLaMA** by running:
-    \`\`\`bash
+
     python chatbot.py
-    \`\`\`
+
     Type your questions into the console prompt, and the chatbot will generate answers using the fine-tuned LLaMA model.
 
 ---
