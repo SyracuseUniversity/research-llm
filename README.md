@@ -28,8 +28,6 @@ This repository contains a workflow for:
 
 ## Project Structure
 
-\`\`\`plaintext
-your_project/
 ├── chatbot.py
 ├── data_pre.py
 ├── database_handler.py
@@ -47,7 +45,6 @@ your_project/
 ├── fine_tuned_llama/        # Directory for fine-tuned LLaMA model (created by train_llama.py)
 ├── Llama-3.2-1B-Instruct/   # Base LLaMA model directory (assumes local copy)
 └── processed_training_data.pkl # Pickled training data for LLaMA (created by train_llama.py)
-\`\`\`
 
 ---
 
