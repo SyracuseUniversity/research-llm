@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+MANIFEST
+.env
+.venv
+env/
+venv/
+ENV/
+.python-version
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+
+# macOS
+.DS_Store
+.AppleDouble
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+
+# Unit test / reports
+.pytest_cache/
+reports/
+
+# Logs
+*.log
+logs/
+
+#project
+local_workspace/
