@@ -4,9 +4,16 @@ pdf_pre.py
 This module provides functions for extracting and cleaning text from PDF files.
 It uses PyPDF2 to read PDFs and includes a new function to extract researcher information
 using basic heuristics.
+It uses docling and markdowncleaner to extract and clean markdown from PDFs
 """
 
 from PyPDF2 import PdfReader
+
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+from markdowncleaner import MarkdownCleaner
+
 import re
 
 def extract_text_from_pdf(file_path):
@@ -82,3 +89,26 @@ def extract_research_info_from_pdf(file_path):
         }
     else:
         return None
+
+def extract_markdown_from_pdf(file_path):
+    """Extracts markdown from a PDF file."""
+    # set backend to PyPdfium (avoids some artifacts, introduces some others; faster than default DoclingParseV2DocumentBackend)
+    backend=PyPdfiumDocumentBackend 
+
+    try:
+        doc_converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(backend=backend)
+            }
+        )
+        result = doc_converter.convert(file_path)
+        return result.document.export_to_markdown()
+    
+    except Exception as e:
+        print(f"Failed to process {file_path}: {e}")
+        return None
+
+def clean_markdown(text):
+    """Cleans extracted markdown using markdowncleaner package with default configuration."""
+    cleaner = MarkdownCleaner()
+    return cleaner.clean_markdown_string(text)
