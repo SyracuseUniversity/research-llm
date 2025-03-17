@@ -5,7 +5,14 @@ This pipeline is designed to process research PDFs and researcher data to build 
 ---
 
 # Folder Structure
-pipeline_project/ ├── main.py ├── pdfs.py ├── pdf_pre.py ├── model.py ├── database_handler.py ├── data_pre.py └── chatbot.py
+pipeline_project/
+├── main.py
+├── pdfs.py 
+├── pdf_pre.py
+├── model.py
+├── database_handler.py
+├── data_pre.py
+└── chatbot.py
 
 
 - **main.py:** Orchestrates the entire pipeline. It populates the database from PDFs, loads researcher info from a CSV file, generates summaries, and fine‑tunes both T5 and LLaMA models.
