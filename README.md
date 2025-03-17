@@ -1,173 +1,390 @@
-# Research Paper Summarization and Fine-Tuning Pipeline
+# Pipeline Overview
 
-This repository contains a workflow for:
-1. **Extracting text from PDFs** and storing them in a local SQLite database,
-2. **Summarizing PDFs** using a T5 model,
-3. **Fine-tuning the T5 model** with the summarized text,
-4. **Fine-tuning a LLaMA model** for research Q&A, and
-5. **Interacting with the fine-tuned LLaMA model** via a chatbot interface.
+This pipeline is designed to process research PDFs and researcher data to build a database, generate summaries using a T5 model, and fine‑tune both T5 and LLaMA models on the summarized data. A chatbot is also provided that queries researcher information from the database to answer subject‑specific queries. The pipeline is checkpoint‑aware, so both the T5 and LLaMA models resume training from the latest checkpoint.
 
 ---
 
-## Table of Contents
-1. [Project Structure](#project-structure)  
-2. [Dependencies and Installation](#dependencies-and-installation)  
-3. [Usage](#usage)  
-4. [Scripts Overview](#scripts-overview)  
-   - [chatbot.py](#chatbotpy)  
-   - [data_pre.py](#data_prepy)  
-   - [database_handler.py](#database_handlerpy)  
-   - [llama_model.py](#llama_modelpy)  
-   - [main.py](#mainpy)  
-   - [pdf_pre.py](#pdf_prepy)  
-   - [t5_model.py](#t5_modelpy)  
-   - [train_llama.py](#train_llamapy)  
-5. [Notes and Tips](#notes-and-tips)
+# Folder Structure
+pipeline_project/ ├── main.py ├── pdfs.py ├── pdf_pre.py ├── model.py ├── database_handler.py ├── data_pre.py └── chatbot.py
+
+
+- **main.py:** Orchestrates the entire pipeline. It populates the database from PDFs, loads researcher info from a CSV file, generates summaries, and fine‑tunes both T5 and LLaMA models.
+- **pdfs.py:** Contains functionality to download PDFs from a CSV source (if used in your pipeline).
+- **pdf_pre.py:** Provides functions to extract and clean text from PDF files and extract researcher information using basic heuristics.
+- **model.py:** Contains functions for generating summaries using the T5 model and fine‑tuning the T5 model on research papers. It supports checkpoint resumption.
+- **database_handler.py:** Manages all database operations, including creating and populating two tables: `works` for PDF content and `research_info` for researcher records.
+- **data_pre.py:** Provides a helper function to preprocess text for T5 summarization.
+- **chatbot.py:** Implements an interactive chatbot that queries the `research_info` table for researcher information and returns formatted results.
 
 ---
 
-## Project Structure
+# Detailed File and Function Documentation
 
-├── chatbot.py
+## 1. data_pre.py
 
-├── data_pre.py
+### Purpose
+Prepares raw text for input into the T5 summarization model.
 
-├── database_handler.py
+### Function
 
-├── llama_model.py
-
-├── main.py
-
-├── pdf_pre.py
-
-├── t5_model.py
-
-├── train_llama.py
-
-├── researchers.db            # SQLite database (auto-generated if not present)
-
-├── download_pdfs/           # Folder containing your PDFs
-
-│   ├── paper1.pdf
-
-│   ├── paper2.pdf
-
-│   └── ...
-
-├── fine_tuned_t5/           # Directory for fine-tuned T5 model (created by main.py)
-
-├── fine_tuned_llama/        # Directory for fine-tuned LLaMA model (created by train_llama.py)
-
-├── Llama-3.2-1B-Instruct/   # Base LLaMA model directory (assumes local copy)
-
-└── processed_training_data.pkl # Pickled training data for LLaMA (created by train_llama.py)
-
+- **`preprocess_text_for_t5(text, model_name="t5-small")`**
+  - **Description:**  
+    Adds a task prefix ("summarize: ") to the input text, truncates it to the first 1000 characters, and tokenizes it using the T5 tokenizer.
+  - **Parameters:**
+    - `text` (str): The raw input text.
+    - `model_name` (str): Name of the T5 model to use; default is `"t5-small"`.
+  - **Returns:**  
+    A tokenized representation of the input text with a fixed maximum length (512 tokens).
 
 ---
 
-## Dependencies and Installation
+## 2. database_handler.py
 
-**Python 3.7+ recommended.**
+### Purpose
+Handles all interactions with the SQLite database. The database contains two main tables:
 
-Create and activate a virtual environment (optional but recommended):
+- **`works` table:** Stores information about PDFs (filename, extracted text, summaries, and progress flags).
+- **`research_info` table:** Stores detailed researcher records (researcher name, work title, authors, and additional information).
 
-python -m venv venv
+### Functions
 
-# On Linux or Mac:
-source venv/bin/activate
+- **`setup_database()`**
+  - **Description:**  
+    Creates the `works` table if it does not already exist.
+  - **Returns:**  
+    None.
 
-# On Windows:
-venv\Scripts\activate
+- **`remove_duplicates()`**
+  - **Description:**  
+    Removes duplicate entries in the `works` table based on the `file_name` column.
+  - **Returns:**  
+    None.
 
-Install required packages:
+- **`insert_work(file_name, full_text, summary=None, summary_status="unsummarized", progress=0)`**
+  - **Description:**  
+    Inserts a record into the `works` table. Uses a unique constraint on `file_name` to avoid duplicates.
+  - **Parameters:**
+    - `file_name` (str): The name of the PDF file.
+    - `full_text` (str): The extracted text from the PDF.
+    - `summary` (str, optional): Summary of the work.
+    - `summary_status` (str): Status flag (defaults to `'unsummarized'`).
+    - `progress` (int): A flag indicating processing progress (default is 0).
 
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu118 \
-transformers datasets PyPDF2==3.0.1 pandas pysqlite3
+- **`fetch_unsummarized_works(limit=None)`**
+  - **Description:**  
+    Retrieves all records from the `works` table that have not been summarized.
+  - **Parameters:**
+    - `limit` (int, optional): Limit on the number of records to fetch.
+  - **Returns:**  
+    A list of tuples, each containing `(id, full_text)`.
 
+- **`update_summary(work_id, summary)`**
+  - **Description:**  
+    Updates a work’s summary and marks it as summarized in the `works` table.
+  - **Parameters:**
+    - `work_id` (int): The database ID for the work.
+    - `summary` (str): The generated summary.
 
-Ensure you have your LLaMA base model folder (\`Llama-3.2-1B-Instruct/\` in the example) placed within the same directory. You may need to adjust the folder name or path in \`llama_model.py\`.
+- **`count_entries_in_table(table_name="works")`**
+  - **Description:**  
+    Returns the count of rows in a specified table.
+  - **Parameters:**
+    - `table_name` (str): Name of the table (defaults to `"works"`).
+  - **Returns:**  
+    An integer count of entries.
 
----
+- **`check_missing_files_in_db(pdf_files)`**
+  - **Description:**  
+    Given a list of PDF file names, checks which ones are not present in the `works` table.
+  - **Parameters:**
+    - `pdf_files` (list): List of PDF filenames.
+  - **Returns:**  
+    A set of filenames that are missing from the database.
 
-## Usage
+- **`setup_research_info_table()`**
+  - **Description:**  
+    Creates the `research_info` table if it does not already exist. This table stores researcher information.
+  - **Returns:**  
+    None.
 
-1. **Place your PDFs** in the \`download_pdfs/\` folder.
+- **`insert_research_info(researcher_name, work_title, authors, info)`**
+  - **Description:**  
+    Inserts a new researcher record into the `research_info` table.
+  - **Parameters:**
+    - `researcher_name` (str): The primary researcher’s name.
+    - `work_title` (str): Title of the work.
+    - `authors` (str): List of authors.
+    - `info` (str): Additional information (e.g., DOI, publication date).
+  
+- **`fetch_research_info()`**
+  - **Description:**  
+    Retrieves all records from the `research_info` table.
+  - **Returns:**  
+    A list of tuples for each record.
 
-2. **Run the main pipeline**:
-
-    python main.py
-
-    This script performs:
-    - **STEP 1**: Reads all PDFs in \`download_pdfs/\`, extracts text, and populates \`researchers.db\`.
-    - **STEP 2**: Summarizes unsummarized papers using the T5 model (the base \`t5-small\` by default).
-    - **STEP 3**: Fine-tunes the T5 model on the newly generated summaries, saving the model to the \`fine_tuned_t5/\` folder.
-
-3. (Optional) **Fine-tune LLaMA** on your summarized data by running:
-
-    python train_llama.py
-
-    This script:
-    - Loads summarized data from \`researchers.db\`.
-    - Saves a pickle file (\`processed_training_data.pkl\`).
-    - Fine-tunes the LLaMA model, saving it to \`fine_tuned_llama/\`.
-
-4. **Chat with the fine-tuned LLaMA** by running:
-
-    python chatbot.py
-
-    Type your questions into the console prompt, and the chatbot will generate answers using the fine-tuned LLaMA model.
-
----
-
-## Scripts Overview
-
-### \`chatbot.py\`
-- Launches a command-line chatbot.
-- Checks if the user’s input is a greeting; if so, it responds with a friendly message.
-- Otherwise, it queries \`chatbot_answer\` from \`llama_model.py\` for a response.
-
-### \`data_pre.py\`
-- Contains a helper function \`preprocess_text_for_t5\` to tokenize and prepare text for T5 summarization.
-
-### \`database_handler.py\`
-- Manages an SQLite database (\`researchers.db\`).
-- Provides functions to:
-  - **Create tables** (\`setup_database\`)
-  - **Insert or update records** (\`insert_work\`, \`update_summary\`)
-  - **Fetch records** (\`fetch_unsummarized_works\`)
-  - **Remove duplicates** (\`remove_duplicates\`)
-  - **Count entries** (\`count_entries_in_table\`)
-  - **Identify missing files** (\`check_missing_files_in_db\`)
-
-### \`llama_model.py\`
-- Loads a base LLaMA model or a fine-tuned LLaMA model if one exists.
-- Implements \`chatbot_answer\` for generating responses to user queries.
-- Implements \`fine_tune_llama_on_papers\` to fine-tune LLaMA using the text–summary pairs.
-
-### \`main.py\`
-- High-level pipeline:
-  - \`populate_database_from_pdfs()\`: Reads PDFs from \`download_pdfs/\`, extracts text, and populates the database.
-  - \`generate_summaries_for_database()\`: Summarizes unsummarized papers using T5.
-  - \`fine_tune_model_on_summaries()\`: Fine-tunes T5 on the summarized data.
-
-### \`pdf_pre.py\`
-- Contains functions for PDF text extraction (\`extract_text_from_pdf\`) using PyPDF2.
-- Cleans the extracted text to remove unwanted characters.
-
-### \`t5_model.py\`
-- Loads the base \`t5-small\` model for summarization.
-- Implements \`summarize_text\` for quick one-off summarization.
-- Implements \`fine_tune_t5_on_papers\` to further fine-tune T5 on your dataset.
-
-### \`train_llama.py\`
-- Loads summarized data from the database.
-- Saves that data as a pickle file for quick reloads.
-- Calls \`fine_tune_llama_on_papers\` to fine-tune the LLaMA model on the T5-generated summaries.
+- **`close_connection()`**
+  - **Description:**  
+    Closes the database connection.
+  - **Returns:**  
+    None.
 
 ---
 
-## Notes and Tips
+## 3. pdf_pre.py
 
-- Ensure that your PDFs are stored in the \`download_pdfs/\` folder before running the pipeline.
-- Check the output directories for the fine-tuned models (\`fine_tuned_t5/\` and \`fine_tuned_llama/\`).
-- LLaMA fine-tuning may take a long time, depending on the dataset size and model configuration.
+### Purpose
+Provides functionality to extract and clean text from PDF files and extract researcher information using basic heuristics.
+
+### Functions
+
+- **`extract_text_from_pdf(file_path)`**
+  - **Description:**  
+    Reads a PDF file, concatenates text from each page, and returns a cleaned version of the text.
+  - **Parameters:**
+    - `file_path` (str): Path to the PDF file.
+  - **Returns:**  
+    Cleaned text as a string or `None` on failure.
+
+- **`clean_text(text)`**
+  - **Description:**  
+    Removes extra whitespace and unwanted characters from the extracted text.
+  - **Parameters:**
+    - `text` (str): Raw extracted text.
+  - **Returns:**  
+    A cleaned string.
+
+- **`extract_research_info_from_pdf(file_path)`**
+  - **Description:**  
+    Uses basic heuristics to extract researcher information from a PDF.
+    - Assumes the first line is the work title.
+    - Looks for lines starting with “Author:” or “Authors:” to extract author names.
+    - The first author is assumed to be the primary researcher.
+  - **Parameters:**
+    - `file_path` (str): Path to the PDF file.
+  - **Returns:**  
+    A dictionary with keys: `researcher_name`, `work_title`, `authors`, and `info` (first 1000 characters of the text), or `None` if extraction fails.
+
+---
+
+## 4. model.py
+
+### Purpose
+Contains functions for generating summaries using a T5 model and for fine-tuning T5 on research papers. Supports checkpoint resumption.
+
+### Functions
+
+- **`clear_memory()`**
+  - **Description:**  
+    Clears GPU and CPU memory by emptying CUDA cache and running garbage collection.
+  - **Returns:**  
+    None.
+
+- **`summarize_text(text, idx=None, total=None)`**
+  - **Description:**  
+    Generates a summary for the input text using the T5 model. The text is truncated to 1000 characters, prefixed with "summarize:", tokenized, and then summarized.
+  - **Parameters:**
+    - `text` (str): The text to be summarized.
+    - `idx` (int, optional): Current index (for logging).
+    - `total` (int, optional): Total number of texts (for logging).
+  - **Returns:**  
+    A generated summary as a string.
+
+- **`fine_tune_t5_on_papers(dataset, output_dir=r"C:\codes\t5-db\fine_tuned_t5")`**
+  - **Description:**  
+    Fine-tunes the T5 model on a dataset of research papers.
+    - Tokenizes the input texts and summaries.
+    - Sets up training arguments.
+    - Resumes training from the latest checkpoint if one exists.
+  - **Parameters:**
+    - `dataset` (pandas DataFrame): Must contain `input_text` and `summary` columns.
+    - `output_dir` (str): Directory to save the fine-tuned model.
+  - **Returns:**  
+    The output directory where the model is saved.
+
+---
+
+## 5. llama_model.py
+
+### Purpose
+Provides functions for using the LLaMA model for inference (chatbot) and for fine-tuning on research data. Supports checkpoint resumption.
+
+### Functions
+
+- **`clear_memory()`**
+  - **Description:**  
+    Clears GPU and CPU memory.
+  - **Returns:**  
+    None.
+
+- **`chatbot_answer(question)`**
+  - **Description:**  
+    Generates an answer for the given research question using the LLaMA model.
+    - Constructs a prompt instructing the model to act as a knowledgeable research assistant.
+    - Tokenizes the prompt and generates an answer.
+    - Post-processes the output to ensure a clean answer.
+  - **Parameters:**
+    - `question` (str): The research question.
+  - **Returns:**  
+    A generated answer as a string.
+
+- **`fine_tune_llama_on_papers(dataset, output_dir=FINE_TUNED_MODEL_PATH)`**
+  - **Description:**  
+    Fine-tunes the LLaMA model on a dataset of research papers.
+    - The dataset must include `input_text` and `target_text` columns (where `target_text` is typically the summary).
+    - Tokenizes the combined prompt and target text, masking out prompt tokens so that loss is computed only on the target.
+    - Resumes training from the latest checkpoint if available.
+  - **Parameters:**
+    - `dataset` (pandas DataFrame): Contains `input_text` and `target_text` columns.
+    - `output_dir` (str): Directory where the fine-tuned model will be saved.
+  - **Returns:**  
+    The output directory where the fine-tuned model is saved.
+
+*Note: The variable `FINE_TUNED_MODEL_PATH` should be defined (in the environment or in `main.py`) and points to where the fine-tuned LLaMA model is saved.*
+
+---
+
+## 6. chatbot.py
+
+### Purpose
+Implements an interactive chatbot that serves as a subject matter expert. It queries the `research_info` table for matching researcher records and returns formatted details.
+
+### Functions
+
+- **`get_research_info(query, db_path=r"C:\codes\t5-db\researchers.db")`**
+  - **Description:**  
+    Queries the `research_info` table for records where `researcher_name`, `work_title`, or `authors` contain the query substring (case‑insensitive).
+  - **Parameters:**
+    - `query` (str): The user's query.
+    - `db_path` (str): Path to the database.
+  - **Returns:**  
+    A formatted string of matching records if found, or `None`.
+
+- **`run_chatbot()`**
+  - **Description:**  
+    Runs an interactive loop that accepts user input.
+    - Responds to greetings with a friendly message.
+    - For other queries, it uses `get_research_info()` to find matching records and displays the results, or “Not found” if no match is detected.
+  - **Returns:**  
+    None.
+
+---
+
+## 7. main.py
+
+### Purpose
+Acts as the main orchestrator for the entire pipeline. It executes the following steps in order:
+
+1. **Populate the `works` Table from PDFs:**
+   - Reads all PDF files from a designated folder.
+   - Extracts full text using `extract_text_from_pdf()`.
+   - Inserts records into the `works` table.
+
+2. **Populate the `research_info` Table from CSV:**
+   - Reads researcher data from a CSV file (`merged_cleaned.csv`).
+   - Extracts relevant fields (e.g., `author_name`, `title`, `doi_url`, etc.).
+   - Inserts records into the `research_info` table.
+
+3. **Generate Summaries:**
+   - Retrieves unsummarized works from the `works` table.
+   - Generates summaries using the T5 model.
+   - Updates the records in the database.
+
+4. **Fine-tune the T5 Model:**
+   - Uses the summarized data to fine-tune the T5 model.
+   - Resumes training from the latest checkpoint if available.
+
+5. **Fine-tune the LLaMA Model:**
+   - Uses the same summarized data (after renaming columns appropriately) to fine-tune the LLaMA model.
+   - Resumes training from the latest checkpoint if available.
+
+### Functions
+
+- **`clear_memory()`**
+  - **Description:**  
+    Clears GPU and CPU memory.
+  - **Returns:**  
+    None.
+
+- **`populate_database_from_pdfs()`**
+  - **Description:**  
+    Processes all PDF files in the specified folder, extracts their full text, and inserts records into the `works` table.
+  - **Returns:**  
+    None.
+
+- **`populate_research_info_from_csv()`**
+  - **Description:**  
+    Reads the CSV file (`merged_cleaned.csv`), extracts researcher information (using columns such as `author_name`, `title`, etc.), and inserts records into the `research_info` table.
+  - **Returns:**  
+    None.
+
+- **`generate_summaries_for_database()`**
+  - **Description:**  
+    Retrieves unsummarized works from the database and generates summaries using the T5 model. Updates the records accordingly.
+  - **Returns:**  
+    None.
+
+- **`fine_tune_model_on_summaries()`**
+  - **Description:**  
+    Fine-tunes the T5 model on the summarized data (from the `works` table), resuming from the latest checkpoint if one exists.
+  - **Returns:**  
+    None.
+
+- **`fine_tune_llama_model_on_summaries()`**
+  - **Description:**  
+    Fine-tunes the LLaMA model on the summarized data (after renaming columns appropriately), resuming from the latest checkpoint if one exists.
+  - **Returns:**  
+    None.
+
+### Main Execution Block
+
+When executed, `main.py` calls each function in sequence. Finally, the database connection is closed, and a completion message is printed.
+
+---
+
+# Dependency Diagram
+
+Below is a Mermaid diagram showing the dependencies between the files in the pipeline. Paste this code into a Markdown file (e.g., in VS Code with Mermaid support or using a Mermaid Live Editor) to view the diagram.
+
+```mermaid
+flowchart LR
+    subgraph Pipeline Overview
+        A["main.py<br>Orchestrates Pipeline"] --> B["pdf_pre.py<br>Extract & Clean PDF Text"]
+        A --> C["database_handler.py<br>DB Operations"]
+        A --> D["model.py<br>T5 Summarization & Fine-tuning"]
+        A --> E["llama_model.py<br>LLaMA Summarization & Fine-tuning"]
+        A --> F["CSV Data<br>merged_cleaned.csv"]
+        A --> G["pdfs.py<br>Optional Downloading"]
+        A --> H["data_pre.py<br>Optional Preprocessing"]
+        
+        subgraph Chatbot
+            I["chatbot.py<br>Interactive Chatbot"] -->|Queries| C
+            I -->|Uses LLaMA| E
+        end
+        
+        D --> H
+        B --> C
+        E --> C
+    end
+```
+How to Run the Pipeline
+Folder Setup:
+Place all files into a directory (e.g., pipeline_project).
+
+Run the Pipeline:
+Open a terminal, navigate to the folder, and execute:
+
+python main.py
+This will:
+
+Populate the works table from PDFs.
+Populate the research_info table from merged_cleaned.csv.
+Generate summaries for unsummarized works.
+Fine-tune the T5 model on summarized data (resuming from the latest checkpoint if available).
+Fine-tune the LLaMA model on summarized data (resuming from the latest checkpoint if available).
+Run the Chatbot:
+To start the interactive chatbot, execute:
+
+python chatbot.py
+The chatbot queries the research_info table and returns formatted researcher information if found.
+
+End of Documentation
