@@ -6,6 +6,7 @@ This pipeline is designed to process research PDFs and researcher data to build 
 
 # Folder Structure
 pipeline_project/
+
 ├── main.py
 
 ├── pdfs.py 
