@@ -356,8 +356,6 @@ When executed, `main.py` calls each function in sequence. Finally, the database 
 
 # Dependency Diagram
 
-Below is a Mermaid diagram showing the dependencies between the files in the pipeline. Paste this code into a Markdown file (e.g., in VS Code with Mermaid support or using a Mermaid Live Editor) to view the diagram.
-
 ```mermaid
 flowchart LR
     subgraph Pipeline Overview
