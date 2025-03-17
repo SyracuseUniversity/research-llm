@@ -1,21 +1,27 @@
+"""
+llama_model.py
+
+This module handles LLaMA model operations for both inference (chatbot functionality)
+and fine-tuning. It loads the base LLaMA model (or a fine-tuned version if available)
+and provides functions to generate answers and fine-tune the model.
+"""
+
+import os
 import torch
 import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, EarlyStoppingCallback
 from datasets import Dataset
-import os
 
-# Build relative paths to the LLaMA base model and fine-tuned model directories
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-BASE_MODEL_PATH = os.path.join(script_dir, "Llama-3.2-1B-Instruct")  # Put your base model folder here
-FINE_TUNED_MODEL_PATH = os.path.join(script_dir, "fine_tuned_llama")
+# Define base and fine-tuned model paths.
+BASE_MODEL_PATH = r"C:\codes\llama32\Llama-3.2-1B-Instruct"
+FINE_TUNED_MODEL_PATH = r"C:\codes\llama32\fine_tuned_llama"
 
 print("Using base model from:", BASE_MODEL_PATH)
 print("Fine-tuned model will be saved to:", FINE_TUNED_MODEL_PATH)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load the model: If fine-tuned directory exists, load from there; otherwise load base model.
+# Load the fine-tuned model if available; otherwise, load the base model.
 if os.path.isdir(FINE_TUNED_MODEL_PATH):
     print("Loading fine-tuned LLaMA model from:", FINE_TUNED_MODEL_PATH)
     llama_model = AutoModelForCausalLM.from_pretrained(FINE_TUNED_MODEL_PATH).to(device)
@@ -25,7 +31,7 @@ else:
 
 llama_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH)
 llama_tokenizer.pad_token = llama_tokenizer.eos_token
-print("Manually setting pad token to eos token.")
+print("Manually setting pad token to eos token for LLaMA.")
 
 if hasattr(llama_model, "enable_gradient_checkpointing"):
     llama_model.enable_gradient_checkpointing()
@@ -40,13 +46,14 @@ def chatbot_answer(question):
     """
     Generates an answer for the given research question using the fine-tuned LLaMA model.
     
-    The prompt instructs the model to answer concisely and accurately.
+    Constructs a prompt instructing the model to act as a knowledgeable research assistant,
+    tokenizes the prompt, generates a response, and post-processes the output.
     """
     prompt = (
         "You are a knowledgeable research assistant trained on a large corpus of research papers. "
         "Answer the following research question concisely and accurately, using only your learned knowledge. "
-        "Ensure your answer is complete and ends with a proper punctuation mark (e.g., '.', '?', or '!').\n\n"
-        f"Question: {question}\n\n"
+        "Ensure your answer is complete and ends with proper punctuation (e.g., '.', '?', or '!').\n\n"
+        "Question: " + question + "\n\n"
         "Answer:"
     )
     inputs = llama_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256).to(device)
@@ -61,24 +68,25 @@ def chatbot_answer(question):
     )
     clear_memory()
     generated_text = llama_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Post-process: split on "Answer:" and take the part after the last occurrence.
     if "Answer:" in generated_text:
         final_answer = generated_text.split("Answer:")[-1].strip()
     else:
         final_answer = generated_text.strip()
-    
-    # Ensure the final answer ends with proper punctuation.
-    if not final_answer.endswith(('.', '?', '!')):
+    if not final_answer.endswith((".", "?", "!")):
         final_answer += "."
-    
     return final_answer
 
 def fine_tune_llama_on_papers(dataset, output_dir=FINE_TUNED_MODEL_PATH):
     """
-    Fine-tunes the LLaMA model using paired data:
-      - Input: full paper text.
-      - Target: T5-generated summary.
+    Fine-tunes the LLaMA model on a dataset of research papers.
+    
+    The dataset must have two columns:
+      - 'input_text': The full paper text.
+      - 'target_text': The corresponding summary.
+    
+    The training sequence is formatted as:
+      "Paper: {input_text}\nSummary: {target_text}"
+    with the prompt portion masked so that loss is computed only on summary tokens.
     """
     if 'input_text' not in dataset.columns or 'target_text' not in dataset.columns:
         raise ValueError("Dataset must contain 'input_text' and 'target_text' columns!")
@@ -86,9 +94,9 @@ def fine_tune_llama_on_papers(dataset, output_dir=FINE_TUNED_MODEL_PATH):
     def tokenize_function(examples):
         combined_texts = []
         labels_list = []
-        for full_text, summary in zip(examples['input_text'], examples['target_text']):
-            prompt = "Paper: " + full_text + "\nSummary:"
-            combined = prompt + " " + summary
+        for inp, tgt in zip(examples['input_text'], examples['target_text']):
+            prompt = "Paper: " + inp + "\nSummary:"
+            combined = prompt + " " + tgt
             tokenized = llama_tokenizer(combined, truncation=True, padding="max_length", max_length=256)
             combined_ids = tokenized['input_ids']
             prompt_ids = llama_tokenizer(prompt, truncation=True, padding=False)['input_ids']
@@ -134,15 +142,14 @@ def fine_tune_llama_on_papers(dataset, output_dir=FINE_TUNED_MODEL_PATH):
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
     )
 
-    os.makedirs(output_dir, exist_ok=True)
-    
+    # Check for existing checkpoints in the output directory.
     checkpoint = None
     if os.path.isdir(output_dir):
         checkpoints = [os.path.join(output_dir, d) for d in os.listdir(output_dir) if d.startswith("checkpoint")]
         if checkpoints:
             checkpoint = sorted(checkpoints, key=lambda x: int(x.split("-")[-1]))[-1]
-            print(f"Resuming training from checkpoint: {checkpoint}")
-
+            print(f"Resuming LLaMA training from checkpoint: {checkpoint}")
+    
     print("Starting fine-tuning for LLaMA model...")
     trainer.train(resume_from_checkpoint=checkpoint)
     print(f"Saving fine-tuned LLaMA model to {output_dir}...")

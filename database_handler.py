@@ -1,9 +1,17 @@
-import sqlite3
-import os
+"""
+database_handler.py
 
-# Build a path to 'researchers.db' in the same directory as this script
-script_dir = os.path.dirname(os.path.abspath(__file__))
-db_path = os.path.join(script_dir, "researchers.db")
+This module manages all interactions with the SQLite database.
+It creates and maintains two tables:
+  - 'works' for storing PDF content and summaries.
+  - 'research_info' for storing correct researcher information 
+    (researcher_name, work_title, authors, and additional info).
+"""
+
+import sqlite3
+
+# Adjust this path if needed
+db_path = r"C:\codes\t5-db\researchers.db"
 
 # Connect to SQLite database
 conn = sqlite3.connect(db_path)
@@ -69,9 +77,9 @@ def update_summary(work_id, summary):
     """, (summary, work_id))
     conn.commit()
 
-def count_entries_in_table():
-    """Count the total number of entries in the database."""
-    cursor.execute("SELECT COUNT(*) FROM works")
+def count_entries_in_table(table_name="works"):
+    """Count the total number of entries in the specified table (default: 'works')."""
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
     return cursor.fetchone()[0]
 
 def check_missing_files_in_db(pdf_files):
@@ -79,6 +87,49 @@ def check_missing_files_in_db(pdf_files):
     cursor.execute("SELECT file_name FROM works")
     db_files = {row[0] for row in cursor.fetchall()}
     return set(pdf_files) - db_files
+
+# NEW: Additional table for storing researcher information (without affiliation)
+def setup_research_info_table():
+    """
+    Create the 'research_info' table if it doesn't exist.
+    This table stores:
+      - researcher_name: Name of the primary researcher.
+      - work_title: Title of the research work.
+      - authors: List of authors.
+      - info: Additional correct information.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS research_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            researcher_name TEXT,
+            work_title TEXT,
+            authors TEXT,
+            info TEXT
+        )
+    """)
+    conn.commit()
+    print("research_info table setup completed.")
+
+def insert_research_info(researcher_name, work_title, authors, info):
+    """
+    Insert a new record into the 'research_info' table.
+    """
+    try:
+        cursor.execute("""
+            INSERT INTO research_info (researcher_name, work_title, authors, info)
+            VALUES (?, ?, ?, ?)
+        """, (researcher_name, work_title, authors, info))
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        print(f"Error inserting research info: {e}")
+
+def fetch_research_info():
+    """
+    Fetch all records from the 'research_info' table.
+    Returns a list of tuples.
+    """
+    cursor.execute("SELECT researcher_name, work_title, authors, info FROM research_info")
+    return cursor.fetchall()
 
 def close_connection():
     """Close the database connection."""
