@@ -398,4 +398,3 @@ To start the interactive chatbot, execute:
 python chatbot.py
 The chatbot queries the research_info table and returns formatted researcher information if found.
 
-End of Documentation
