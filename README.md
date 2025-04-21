@@ -217,7 +217,6 @@ flowchart LR
     C --> B
 
 
-```
 mermaid
 flowchart LR
     subgraph Pipeline Overview
@@ -238,3 +237,5 @@ flowchart LR
         B --> C
         E --> C
     end
+
+```
