@@ -186,42 +186,76 @@ CRUD operations for SQLite:
 
 # Dependency Diagram
 
+
+- **`train_pipeline.py`**  
+  Orchestrates data ingestion, summarization, and model fine‑tuning in one shot.
+
+- **`rag_pipeline.py`**  
+  Loads ChromaDB + LangChain + LLaMA to serve an interactive chatbot.
+
+- **`test_rag.py`**  
+  Runs a list of test questions through your RAG chain and logs outputs.
+
+- **`migrate_sqlite_to_chromadb.py`**  
+  One‑time migration of all SQLite data into ChromaDB.
+
+- **`pdfs.py`** / **`pdf_pre.py`**  
+  Download, extract, and clean PDF text.
+
+- **`model.py`**  
+  T5 summarization & fine‑tuning utilities.
+
+- **`llama_model.py`**  
+  LLaMA fine‑tuning utilities.
+
+- **`database_handler.py`**  
+  SQLite schema & CRUD helpers.
+
+- **`data_pre.py`**  
+  Text‑to‑T5 preprocessing helper.
+
+---
+
+# Dependency & Pipeline Flowchart
+
+```mermaid
 flowchart LR
-    subgraph Training_Pipeline
-        TP[train_pipeline.py]
-        TP --> DBH[database_handler.py]
-        TP --> PDFs[pdfs.py]
-        TP --> PDFPre[pdf_pre.py]
-        TP --> T5[model.py]
-        TP --> LLaMA[llama_model.py]
-        TP --> Pre[data_pre.py]
+    subgraph Training Pipeline
+        TP[train_pipeline.py<br/>Full data→model training]
     end
 
-    subgraph Chatbot_Service
-        RAG[rag_pipeline.py]
-        TEST[test_rag.py]
-        RAG --> DBH
-        RAG --> T5
-        RAG --> LLaMA
-        TEST --> RAG
-        RAG --> MIGRATE[migrate_sqlite_to_chromadb.py]
+    subgraph RAG Service
+        RP[rag_pipeline.py<br/>Interactive chatbot]
+        TR[test_rag.py<br/>Automated tests]
     end
 
-flowchart TD
-    A["train_pipeline.py<br>Orchestrates Training"] --> B["pdfs.py<br>Optional PDF Downloads"]
-    A --> C["pdf_pre.py<br>Extract & Clean Text"]
-    A --> D["database_handler.py<br>Manage DB"]
-    A --> E["model.py<br>T5 Summary & Fine-tuning"]
-    A --> F["llama_model.py<br>LLaMA Fine-tuning"]
-    A --> G["data_pre.py<br>Preprocess for T5"]
-    A --> H["CSV File<br>merged_cleaned.csv"]
+    subgraph Helpers
+        MG[migrate_sqlite_to_chromadb.py<br/>One‑time migration]
+        PDF[pdfs.py<br/>Download PDFs]
+        PRE[pdf_pre.py<br/>Extract & clean text]
+        T5[model.py<br/>T5 summarization & fine‑tuning]
+        LLM[llama_model.py<br/>LLaMA fine‑tuning]
+        DB[database_handler.py<br/>SQLite CRUD]
+        DP[data_pre.py<br/>T5 preprocessing]
+    end
 
+    TP --> DB
+    TP --> PDF
+    TP --> PRE
+    TP --> T5
+    TP --> LLM
+
+    RP --> MG
+    RP --> T5
+    RP --> LLM
+
+    TR --> RP
+flowchart TB
     subgraph Chatbot
-        I["rag_pipeline.py<br>Interactive RAG Chatbot"]
-        J["test_rag.py<br>Evaluate with Questions"]
-        I --> D
-        I --> F
-        I --> E
-        J --> I
+      RP2[rag_pipeline.py<br/>RAG retrieval & generation]
+      UI[User Input/Output]
     end
+
+    RP2 --> UI
+
 
