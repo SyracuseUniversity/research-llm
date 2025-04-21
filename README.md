@@ -218,47 +218,33 @@ CRUD operations for SQLite:
 
 # Dependency & Pipeline Flowchart
 
-
 ```mermaid
 flowchart LR
     subgraph Training Pipeline
-        TP["train_pipeline.py\nFull data→model training"]
+      A[train_pipeline.py]
     end
 
     subgraph RAG Service
-        RP["rag_pipeline.py\nInteractive chatbot"]
-        TR["test_rag.py\nAutomated tests"]
+      B[rag_pipeline.py]
+      C[test_rag.py]
     end
 
     subgraph Helpers
-        MG["migrate_sqlite_to_chromadb.py\nOne-time migration"]
-        PDF["pdfs.py\nDownload PDFs"]
-        PRE["pdf_pre.py\nExtract & clean text"]
-        T5["model.py\nT5 summarization & fine-tuning"]
-        LLM["llama_model.py\nLLaMA fine-tuning"]
-        DB["database_handler.py\nSQLite CRUD"]
-        DP["data_pre.py\nT5 preprocessing"]
+      D[migrate_sqlite_to_chromadb.py]
+      E[pdfs.py] & F[pdf_pre.py]
+      G[model.py] & H[llama_model.py]
+      I[database_handler.py] & J[data_pre.py]
     end
 
-    TP --> DB
-    TP --> PDF
-    TP --> PRE
-    TP --> T5
-    TP --> LLM
+    A --> I
+    A --> E
+    A --> F
+    A --> G
+    A --> H
 
-    RP --> MG
-    RP --> T5
-    RP --> LLM
+    B --> D
+    B --> G
+    B --> H
 
-    TR --> RP
-flowchart TB
-
-    subgraph Chatbot
-        A["rag_pipeline.py\nRAG retrieval & generation"]
-        B["test_rag.py\nEvaluate with questions"]
-        UI["User Input/Output"]
-    end
-
-    A --> UI
-    B --> A
+    C --> B
 
