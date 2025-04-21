@@ -186,56 +186,42 @@ CRUD operations for SQLite:
 
 # Dependency Diagram
 
-```mermaid
 flowchart LR
-    subgraph Training Pipeline
-      A[train_pipeline.py]
+    subgraph Training_Pipeline
+        TP[train_pipeline.py]
+        TP --> DBH[database_handler.py]
+        TP --> PDFs[pdfs.py]
+        TP --> PDFPre[pdf_pre.py]
+        TP --> T5[model.py]
+        TP --> LLaMA[llama_model.py]
+        TP --> Pre[data_pre.py]
     end
 
-    subgraph RAG Service
-      B[rag_pipeline.py]
-      C[test_rag.py]
+    subgraph Chatbot_Service
+        RAG[rag_pipeline.py]
+        TEST[test_rag.py]
+        RAG --> DBH
+        RAG --> T5
+        RAG --> LLaMA
+        TEST --> RAG
+        RAG --> MIGRATE[migrate_sqlite_to_chromadb.py]
     end
 
-    subgraph Helpers
-      D[migrate_sqlite_to_chromadb.py]
-      E[pdfs.py] & F[pdf_pre.py]
-      G[model.py] & H[llama_model.py]
-      I[database_handler.py] & J[data_pre.py]
+flowchart TD
+    A["train_pipeline.py<br>Orchestrates Training"] --> B["pdfs.py<br>Optional PDF Downloads"]
+    A --> C["pdf_pre.py<br>Extract & Clean Text"]
+    A --> D["database_handler.py<br>Manage DB"]
+    A --> E["model.py<br>T5 Summary & Fine-tuning"]
+    A --> F["llama_model.py<br>LLaMA Fine-tuning"]
+    A --> G["data_pre.py<br>Preprocess for T5"]
+    A --> H["CSV File<br>merged_cleaned.csv"]
+
+    subgraph Chatbot
+        I["rag_pipeline.py<br>Interactive RAG Chatbot"]
+        J["test_rag.py<br>Evaluate with Questions"]
+        I --> D
+        I --> F
+        I --> E
+        J --> I
     end
 
-    A --> I
-    A --> E
-    A --> F
-    A --> G
-    A --> H
-
-    B --> D
-    B --> G
-    B --> H
-
-    C --> B
-
-
-mermaid
-flowchart LR
-    subgraph Pipeline Overview
-        A["main.py<br>Orchestrates Pipeline"] --> B["pdf_pre.py<br>Extract & Clean PDF Text"]
-        A --> C["database_handler.py<br>DB Operations"]
-        A --> D["model.py<br>T5 Summarization & Fine-tuning"]
-        A --> E["llama_model.py<br>LLaMA Summarization & Fine-tuning"]
-        A --> F["CSV Data<br>merged_cleaned.csv"]
-        A --> G["pdfs.py<br>Optional Downloading"]
-        A --> H["data_pre.py<br>Optional Preprocessing"]
-        
-        subgraph Chatbot
-            I["chatbot.py<br>Interactive Chatbot"] -->|Queries| C
-            I -->|Uses LLaMA| E
-        end
-        
-        D --> H
-        B --> C
-        E --> C
-    end
-
-```
