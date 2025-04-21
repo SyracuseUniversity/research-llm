@@ -215,3 +215,25 @@ flowchart LR
     B --> H
 
     C --> B
+
+
+mermaid
+flowchart LR
+    subgraph Pipeline Overview
+        A["main.py<br>Orchestrates Pipeline"] --> B["pdf_pre.py<br>Extract & Clean PDF Text"]
+        A --> C["database_handler.py<br>DB Operations"]
+        A --> D["model.py<br>T5 Summarization & Fine-tuning"]
+        A --> E["llama_model.py<br>LLaMA Summarization & Fine-tuning"]
+        A --> F["CSV Data<br>merged_cleaned.csv"]
+        A --> G["pdfs.py<br>Optional Downloading"]
+        A --> H["data_pre.py<br>Optional Preprocessing"]
+        
+        subgraph Chatbot
+            I["chatbot.py<br>Interactive Chatbot"] -->|Queries| C
+            I -->|Uses LLaMA| E
+        end
+        
+        D --> H
+        B --> C
+        E --> C
+    end
