@@ -218,7 +218,6 @@ CRUD operations for SQLite:
 
 # Dependency & Pipeline Flowchart
 
-# Dependency & Pipeline Flowchart
 
 ```mermaid
 flowchart LR
@@ -252,5 +251,14 @@ flowchart LR
     RP --> LLM
 
     TR --> RP
+flowchart TB
 
+    subgraph Chatbot
+        A["rag_pipeline.py\nRAG retrieval & generation"]
+        B["test_rag.py\nEvaluate with questions"]
+        UI["User Input/Output"]
+    end
+
+    A --> UI
+    B --> A
 
