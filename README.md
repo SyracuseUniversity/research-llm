@@ -23,15 +23,25 @@ All scripts assume your code lives under `C:\codes\…`.
 ## Folder Structure
 pipeline_project/ 
 ├── train_pipeline.py
+
 ├── rag_pipeline.py
+
 ├── test_rag.py
+
 ├── migrate_sqlite_to_chromadb.py
+
 ├── pdfs.py
+
 ├── pdf_pre.py
+
 ├── model.py
+
 ├── llama_model.py
+
 ├── database_handler.py
+
 ├── data_pre.py
+
 └── (optional helper scripts)
 
 
