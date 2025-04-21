@@ -218,25 +218,27 @@ CRUD operations for SQLite:
 
 # Dependency & Pipeline Flowchart
 
+# Dependency & Pipeline Flowchart
+
 ```mermaid
 flowchart LR
     subgraph Training Pipeline
-        TP[train_pipeline.py<br/>Full data→model training]
+        TP["train_pipeline.py\nFull data→model training"]
     end
 
     subgraph RAG Service
-        RP[rag_pipeline.py<br/>Interactive chatbot]
-        TR[test_rag.py<br/>Automated tests]
+        RP["rag_pipeline.py\nInteractive chatbot"]
+        TR["test_rag.py\nAutomated tests"]
     end
 
     subgraph Helpers
-        MG[migrate_sqlite_to_chromadb.py<br/>One‑time migration]
-        PDF[pdfs.py<br/>Download PDFs]
-        PRE[pdf_pre.py<br/>Extract & clean text]
-        T5[model.py<br/>T5 summarization & fine‑tuning]
-        LLM[llama_model.py<br/>LLaMA fine‑tuning]
-        DB[database_handler.py<br/>SQLite CRUD]
-        DP[data_pre.py<br/>T5 preprocessing]
+        MG["migrate_sqlite_to_chromadb.py\nOne-time migration"]
+        PDF["pdfs.py\nDownload PDFs"]
+        PRE["pdf_pre.py\nExtract & clean text"]
+        T5["model.py\nT5 summarization & fine-tuning"]
+        LLM["llama_model.py\nLLaMA fine-tuning"]
+        DB["database_handler.py\nSQLite CRUD"]
+        DP["data_pre.py\nT5 preprocessing"]
     end
 
     TP --> DB
@@ -250,12 +252,5 @@ flowchart LR
     RP --> LLM
 
     TR --> RP
-flowchart TB
-    subgraph Chatbot
-      RP2[rag_pipeline.py<br/>RAG retrieval & generation]
-      UI[User Input/Output]
-    end
-
-    RP2 --> UI
 
 
