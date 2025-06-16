@@ -1,262 +1,167 @@
-# # from transformers import T5ForConditionalGeneration, T5Tokenizer, Trainer, TrainingArguments
-# # from datasets import Dataset
-# # import torch
-# # import gc
+"""
+model.py  –  T5 summarization and fine-tuning utilities (no emojis).
+"""
 
-# # model_name = "t5-small"
-# # print("Loading T5 model on GPU...")
-# # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# # t5_model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
-# # t5_tokenizer = T5Tokenizer.from_pretrained(model_name)
-
-# # def clear_memory():
-# #     """Clear GPU and CPU memory."""
-# #     torch.cuda.empty_cache()
-# #     gc.collect()
-# #     print("Cleared memory and cache.")
-
-# # def summarize_text(text, idx=None, total=None):
-# #     """Generates a summary for the given text using T5."""
-# #     if idx is not None and total is not None:
-# #         print(f"Summarizing text [{idx}/{total}]...")
-# #     input_text = "summarize: " + text[:1000]  # Truncate to the first 1000 characters
-# #     inputs = t5_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512).to(device)
-# #     outputs = t5_model.generate(
-# #         **inputs,
-# #         max_length=150,
-# #         num_beams=4,
-# #         early_stopping=True
-# #     )
-
-# #     clear_memory()  # Clear memory after summarization
-# #     return t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-# # def fine_tune_t5_on_papers(dataset, output_dir=r"C:\codes\t5-db\fine_tuned_t5"):
-# #     """Fine-tune the T5 model on the papers dataset."""
-# #     print("Preparing dataset for fine-tuning...")
-
-# #     # Ensure columns exist
-# #     if 'input_text' not in dataset.columns or 'summary' not in dataset.columns:
-# #         raise ValueError("Dataset must contain 'input_text' and 'summary' columns!")
-
-# #     def tokenize_function(examples):
-# #         inputs = t5_tokenizer(examples['input_text'], padding="max_length", truncation=True, max_length=512)
-# #         targets = t5_tokenizer(examples['summary'], padding="max_length", truncation=True, max_length=150)
-# #         inputs['labels'] = targets['input_ids'] 
-# #         return inputs
-
-# #     hf_dataset = Dataset.from_pandas(dataset)
-# #     tokenized_dataset = hf_dataset.map(tokenize_function, batched=True)
-
-# #     training_args = TrainingArguments(
-# #         output_dir=output_dir,
-# #         save_total_limit=2,         # Limit the number of checkpoints
-# #         save_steps=500,             # Save model every 500 steps
-# #         evaluation_strategy="no",   # Disable evaluation
-# #         logging_dir="./logs",
-# #         logging_steps=100,
-# #         per_device_train_batch_size=4,
-# #         gradient_accumulation_steps=2,
-# #         learning_rate=5e-5,
-# #         num_train_epochs=3,
-# #         weight_decay=0.01,
-# #         fp16=True,                  # Enable mixed precision
-# #     )
-
-# #     trainer = Trainer(
-# #         model=t5_model,
-# #         args=training_args,
-# #         train_dataset=tokenized_dataset
-# #     )
-
-# #     print("Starting fine-tuning on GPU...")
-# #     trainer.train()
-
-# #     print(f"Saving the fine-tuned model to {output_dir}...")
-# #     trainer.save_model(output_dir)
-# #     print("Model fine-tuned and saved successfully!")
-# #     clear_memory()
-
-# #     return output_dir
-
-
-# from transformers import T5ForConditionalGeneration, T5Tokenizer, Trainer, TrainingArguments
-# from datasets import Dataset
-# import torch
-# import gc
-
-# model_name = "t5-small"
-# print("Loading T5 model on GPU...")
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# t5_model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
-# t5_tokenizer = T5Tokenizer.from_pretrained(model_name)
-
-# def clear_memory():
-#     """Clear GPU and CPU memory."""
-#     torch.cuda.empty_cache()
-#     gc.collect()
-#     print("Cleared memory and cache.")
-
-# def summarize_text(text, idx=None, total=None):
-#     """Generates a summary for the given text using T5."""
-#     if idx is not None and total is not None:
-#         print(f"Summarizing text [{idx}/{total}]...")
-#     input_text = "summarize: " + text[:1000]  # Truncate to first 1000 characters
-#     inputs = t5_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512).to(device)
-#     outputs = t5_model.generate(
-#         **inputs,
-#         max_length=150,
-#         num_beams=4,
-#         early_stopping=True
-#     )
-#     clear_memory()  # Clear memory after summarization
-#     return t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-# def fine_tune_t5_on_papers(dataset, output_dir=r"C:\codes\t5-db\fine_tuned_t5"):
-#     """Fine-tune the T5 model on the papers dataset."""
-#     print("Preparing dataset for fine-tuning...")
-
-#     if 'input_text' not in dataset.columns or 'summary' not in dataset.columns:
-#         raise ValueError("Dataset must contain 'input_text' and 'summary' columns!")
-
-#     def tokenize_function(examples):
-#         inputs = t5_tokenizer(examples['input_text'], padding="max_length", truncation=True, max_length=512)
-#         targets = t5_tokenizer(examples['summary'], padding="max_length", truncation=True, max_length=150)
-#         inputs['labels'] = targets['input_ids']
-#         return inputs
-
-#     hf_dataset = Dataset.from_pandas(dataset)
-#     tokenized_dataset = hf_dataset.map(tokenize_function, batched=True)
-
-#     training_args = TrainingArguments(
-#         output_dir=output_dir,
-#         save_total_limit=2,
-#         save_steps=500,
-#         evaluation_strategy="no",
-#         logging_dir="./logs",
-#         logging_steps=100,
-#         per_device_train_batch_size=4,
-#         gradient_accumulation_steps=2,
-#         learning_rate=5e-5,
-#         num_train_epochs=3,
-#         weight_decay=0.01,
-#         fp16=True,
-#     )
-
-#     trainer = Trainer(
-#         model=t5_model,
-#         args=training_args,
-#         train_dataset=tokenized_dataset
-#     )
-
-#     print("Starting fine-tuning on GPU...")
-#     trainer.train()
-
-#     print(f"Saving the fine-tuned model to {output_dir}...")
-#     trainer.save_model(output_dir)
-#     print("Model fine-tuned and saved successfully!")
-#     clear_memory()
-
-#     return output_dir
-
-# model.py
-
-from transformers import T5ForConditionalGeneration, T5Tokenizer, Trainer, TrainingArguments
-from datasets import Dataset
-import torch
+import os
 import gc
+import torch
+import random
+import numpy as np
+from transformers import (
+    T5ForConditionalGeneration,
+    T5Tokenizer,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
+from datasets import Dataset
 
-# Model paths and settings
-model_name = "t5-small"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_NAME = "t5-small"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Globals (lazy loading)
 t5_model = None
 t5_tokenizer = None
 
+SUMMARIZE_MAX_INPUT = 512
+SUMMARIZE_MAX_TARGET = 150
+TRUNCATE_TEXT_CHARS = 1000
+SEED = 42
+
+
 def load_t5_model():
-    """Load T5 model and tokenizer only once."""
+    """
+    Lazy-load the T5 model and tokenizer. Returns (model, tokenizer, device).
+    """
     global t5_model, t5_tokenizer
+
     if t5_model is not None and t5_tokenizer is not None:
-        return t5_model, t5_tokenizer, device
+        return t5_model, t5_tokenizer, DEVICE
 
-    print("Loading T5 model on GPU...")
-    t5_model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
-    t5_tokenizer = T5Tokenizer.from_pretrained(model_name)
+    print("Loading T5 model and tokenizer…")
+    t5_model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+    t5_tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME)
+    if t5_tokenizer.pad_token_id is None:
+        t5_tokenizer.pad_token_id = t5_tokenizer.eos_token_id
 
-    return t5_model, t5_tokenizer, device
+    return t5_model, t5_tokenizer, DEVICE
+
 
 def clear_memory():
-    """Clear GPU and CPU memory."""
+    """
+    Free up GPU cache and run Python garbage collection.
+    """
     torch.cuda.empty_cache()
     gc.collect()
-    print("Cleared memory and cache.")
 
-def summarize_text(text, idx=None, total=None):
-    """Generate a summary for a given text using T5."""
-    if t5_model is None or t5_tokenizer is None:
-        load_t5_model()
+
+def summarize_text(text: str, idx: int = None, total: int = None) -> str:
+    """
+    Summarize a single piece of text using T5:
+      1) Truncate raw text to first TRUNCATE_TEXT_CHARS chars.
+      2) Prepend "summarize: " so T5 uses its summarization head.
+      3) Generate with beam search, max length 150.
+
+    Returns the generated summary string.
+    """
+    model, tokenizer, device = load_t5_model()
 
     if idx is not None and total is not None:
-        print(f"Summarizing text [{idx}/{total}]...")
+        print(f"Summarizing [{idx}/{total}]…")
 
-    input_text = "summarize: " + text[:1000]  # Truncate to first 1000 characters
-    inputs = t5_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512).to(device)
-    outputs = t5_model.generate(
+    raw_snippet = text[:TRUNCATE_TEXT_CHARS]
+    prompt = "summarize: " + raw_snippet
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=SUMMARIZE_MAX_INPUT,
+    ).to(device)
+
+    outputs = model.generate(
         **inputs,
-        max_length=150,
+        max_length=SUMMARIZE_MAX_TARGET,
         num_beams=4,
-        early_stopping=True
+        early_stopping=True,
+        no_repeat_ngram_size=2,
     )
+
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
     clear_memory()
-    return t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return summary
 
-def fine_tune_t5_on_papers(dataset, output_dir=r"C:\codes\t5-db\fine_tuned_t5"):
-    """Fine-tune the T5 model on the papers dataset."""
-    if t5_model is None or t5_tokenizer is None:
-        load_t5_model()
 
-    print("Preparing dataset for fine-tuning...")
+def fine_tune_t5_on_papers(
+    df,
+    output_dir: str = r"C:\codes\t5-db\fine_tuned_t5"
+) -> str:
+    """
+    Fine-tune T5 on a DataFrame with columns ['input_text', 'summary'].
+    Saves the fine-tuned model + tokenizer to output_dir.
+    """
+    model, tokenizer, device = load_t5_model()
 
-    if 'input_text' not in dataset.columns or 'summary' not in dataset.columns:
-        raise ValueError("Dataset must contain 'input_text' and 'summary' columns.")
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
 
-    def tokenize_function(examples):
-        inputs = t5_tokenizer(examples['input_text'], padding="max_length", truncation=True, max_length=512)
-        targets = t5_tokenizer(examples['summary'], padding="max_length", truncation=True, max_length=150)
-        inputs['labels'] = targets['input_ids']
-        return inputs
+    required = {"input_text", "summary"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"DataFrame missing column(s): {missing}")
 
-    hf_dataset = Dataset.from_pandas(dataset)
-    tokenized_dataset = hf_dataset.map(tokenize_function, batched=True)
+    print("Fine-tuning T5 on provided data…")
 
-    training_args = TrainingArguments(
+    def tokenize_fn(batch):
+        enc_in = tokenizer(
+            batch["input_text"],
+            padding="max_length",
+            truncation=True,
+            max_length=512,
+        )
+        enc_out = tokenizer(
+            batch["summary"],
+            padding="max_length",
+            truncation=True,
+            max_length=150,
+        )
+        enc_in["labels"] = enc_out["input_ids"]
+        return enc_in
+
+    hf_ds = Dataset.from_pandas(df)
+    tokenized = hf_ds.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=list(df.columns),
+        load_from_cache_file=False,
+    )
+
+    args = TrainingArguments(
         output_dir=output_dir,
-        save_total_limit=2,
         save_steps=500,
-        evaluation_strategy="no",
-        logging_dir="./logs",
-        logging_steps=100,
         per_device_train_batch_size=4,
-        gradient_accumulation_steps=2,
-        learning_rate=5e-5,
+        gradient_accumulation_steps=1,
         num_train_epochs=3,
+        evaluation_strategy="no",
+        learning_rate=5e-5,
         weight_decay=0.01,
         fp16=True,
+        logging_steps=100,
+        report_to=[],
+        save_total_limit=1,
+        seed=SEED,
     )
 
     trainer = Trainer(
-        model=t5_model,
-        args=training_args,
-        train_dataset=tokenized_dataset
+        model=model,
+        args=args,
+        train_dataset=tokenized,
+        tokenizer=tokenizer,
     )
 
-    print("Starting fine-tuning on GPU...")
     trainer.train()
-
-    print(f"Saving the fine-tuned T5 model to {output_dir}...")
     trainer.save_model(output_dir)
-    print("Model fine-tuned and saved successfully!")
+    tokenizer.save_pretrained(output_dir)
+    print(f"T5 fine-tuned and saved to {output_dir}")
     clear_memory()
-
     return output_dir
