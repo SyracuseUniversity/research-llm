@@ -22,6 +22,7 @@ All scripts assume your code lives under `C:\codes\…`.
 
 ## Folder Structure
 pipeline_project/ 
+
 ├── train_pipeline.py
 
 ├── rag_pipeline.py
