@@ -1,10 +1,10 @@
+# neo_ingest_abstracts.py
 """
-neo_ingest_abstracts.py
-Builds a simplified Neo4j graph from abstracts_only.db:
+Build simplified Neo4j graph from abstracts_only.db:
   (Paper {doi, title, year})
   (Source {name})
   (Year {value})
-Relationships:
+Rels:
   (Source)-[:PUBLISHED]->(Paper)
   (Year)-[:CONTAINS]->(Paper)
 """
@@ -13,7 +13,7 @@ import sqlite3
 from neo4j import GraphDatabase
 import config_full as config
 
-DB_PATH = r"C:\codes\t5-db\abstracts_only.db"
+DB_PATH = config.SQLITE_DB_ABSTRACTS  # C:\codes\t5-db\abstracts_only.db
 
 driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASS))
 
@@ -62,8 +62,7 @@ def main():
     rows = read_rows()
     print(f"Rows prepared: {len(rows)}")
     if not rows:
-        print("No rows found in abstracts_only.db")
-        return
+        print("No rows found in abstracts_only.db"); return
     ensure_schema()
     ingest(rows)
     print("✅ Done ingesting abstracts into Neo4j.")

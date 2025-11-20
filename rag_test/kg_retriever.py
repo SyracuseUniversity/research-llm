@@ -1,3 +1,4 @@
+#kg_retriever.py
 from typing import List, Dict
 import re
 from neo4j import GraphDatabase
@@ -16,18 +17,12 @@ def _keywords(q: str, min_len: int = 3, max_kw: int = 6) -> List[str]:
     seen, out = set(), []
     for t in toks:
         if len(t) >= min_len and t not in seen:
-            seen.add(t)
-            out.append(t)
-        if len(out) >= max_kw:
-            break
+            seen.add(t); out.append(t)
+        if len(out) >= max_kw: break
     return out or ([_norm(q).lower()] if q else [])
 
 def _score_row(row: Dict, kws: List[str]) -> int:
-    hay = " ".join([
-        str(row.get("title") or ""),
-        " ".join(row.get("authors") or []),
-        str(row.get("researcher") or "")
-    ]).lower()
+    hay = " ".join([str(row.get("title") or ""), " ".join(row.get("authors") or []), str(row.get("researcher") or "")]).lower()
     return sum(1 for kw in kws if kw in hay)
 
 def _run_query(cypher: str, **params) -> List[Dict]:
@@ -60,27 +55,3 @@ def query_graph(question: str, k: int = 10) -> List[Dict]:
         r["_score"] = _score_row(r, kws)
     rows.sort(key=lambda x: (-x["_score"], x.get("year") or -9999, x.get("title","")))
     return rows[:k]
-
-CY_BY_AUTHOR = """
-MATCH (a:Author {name: $name})-[:AUTHORED]->(p:Paper)
-OPTIONAL MATCH (p)-[:HAS_RESEARCHER]->(r:Researcher)
-RETURN p.paper_id AS paper_id, p.title AS title, p.year AS year,
-       p.doi_link AS doi_link, collect(DISTINCT a.name) AS authors, r.name AS researcher
-ORDER BY coalesce(p.year, -9999) DESC
-LIMIT $k
-"""
-
-def get_papers_by_author(name: str, k: int = 25) -> List[Dict]:
-    return _run_query(CY_BY_AUTHOR, name=name, k=k)
-
-CY_BY_RESEARCHER = """
-MATCH (r:Researcher {name: $name})-[:WROTE]->(p:Paper)
-OPTIONAL MATCH (p)<-[:HAS_AUTHOR]-(a:Author)
-RETURN p.paper_id AS paper_id, p.title AS title, p.year AS year,
-       p.doi_link AS doi_link, collect(DISTINCT a.name) AS authors, r.name AS researcher
-ORDER BY coalesce(p.year, -9999) DESC
-LIMIT $k
-"""
-
-def get_papers_by_researcher(name: str, k: int = 25) -> List[Dict]:
-    return _run_query(CY_BY_RESEARCHER, name=name, k=k)

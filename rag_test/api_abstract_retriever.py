@@ -1,5 +1,6 @@
+#api_abstract_retriever.py
 """
-api_abstract_retriever.py – Build abstracts_only.db via official APIs (no scraping)
+Build abstracts_only.db via official APIs (no scraping)
 
 Sources used (in order of preference):
   1. Crossref  – https://api.crossref.org/works/{doi}
@@ -7,13 +8,10 @@ Sources used (in order of preference):
   3. arXiv     – http://export.arxiv.org/api/query?search_query=id:{arxiv_id}
 """
 
-import os, re, time, html, json, requests, sqlite3
+import os, re, time, html, requests, sqlite3
 import pandas as pd
 import xml.etree.ElementTree as ET
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
 CSV_PATHS = [
     r"C:\Users\arapte\Downloads\Application\author_works.csv",
     r"C:\Users\arapte\Downloads\Application\cleaned_author_works.csv",
@@ -22,13 +20,9 @@ CSV_PATHS = [
     r"C:\Users\arapte\Downloads\Application\syracuse_university_orcid_data.csv",
 ]
 DB_OUT = r"C:\codes\t5-db\abstracts_only.db"
-EMAIL_FOR_UNPAYWALL = "your_email@domain.com"   # required by Crossref policy
+EMAIL_FOR_UNPAYWALL = "your_email@domain.com"   # Crossref UA policy
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
-ARXIV_RE = re.compile(r"10\.48550/arXiv\.[\w\-\.]+", re.I)
 
 def clean_abs(a: str) -> str:
     if not a: return ""
@@ -59,13 +53,13 @@ def safe_commit(cur, data):
         VALUES (?,?,?,?,?,datetime('now'))
     """, data)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API FETCHERS
-# ─────────────────────────────────────────────────────────────────────────────
 def get_crossref(doi):
     try:
-        r = requests.get(f"https://api.crossref.org/works/{doi}",
-                         headers={"User-Agent": f"mailto:{EMAIL_FOR_UNPAYWALL}"}, timeout=15)
+        r = requests.get(
+            f"https://api.crossref.org/works/{doi}",
+            headers={"User-Agent": f"mailto:{EMAIL_FOR_UNPAYWALL}"},
+            timeout=15
+        )
         if r.status_code != 200: return None
         msg = r.json().get("message", {})
         abs_text = clean_abs(msg.get("abstract"))
@@ -73,7 +67,8 @@ def get_crossref(doi):
             title = (msg.get("title") or [""])[0]
             year = str(msg.get("issued", {}).get("date-parts", [[None]])[0][0] or "")
             return {"title": title, "abstract": abs_text, "source": "crossref", "year": year}
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
 def get_openalex(doi):
@@ -86,7 +81,8 @@ def get_openalex(doi):
             title = msg.get("display_name", "")
             year = str(msg.get("publication_year") or "")
             return {"title": title, "abstract": abs_text.strip(), "source": "openalex", "year": year}
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
 def get_arxiv(doi):
@@ -104,12 +100,10 @@ def get_arxiv(doi):
             year = year_el.text[:4] if year_el is not None else ""
             return {"title": title.text.strip(), "abstract": summary.text.strip(),
                     "source": "arxiv", "year": year}
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN PIPELINE
-# ─────────────────────────────────────────────────────────────────────────────
 def extract_dois(csv_paths):
     all_dois = set()
     for path in csv_paths:

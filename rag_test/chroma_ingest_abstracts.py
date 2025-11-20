@@ -1,38 +1,32 @@
+#chroma_ingest_abstracts.py
 """
-chroma_ingest_abstracts.py
 Builds a ChromaDB collection 'abstracts_all' from abstracts_only.db.
 Each abstract becomes a vector document with DOI, title, source, and year metadata.
 """
 
-import os
-import sqlite3
-import time
+import os, sqlite3, time
 from tqdm import tqdm
 import chromadb
 from chromadb.utils import embedding_functions
 import config_full as config
 
-DB_PATH = r"C:\codes\t5-db\abstracts_only.db"
-CHROMA_DIR = config.CHROMA_DIR
+DB_PATH     = config.SQLITE_DB_ABSTRACTS       # C:\codes\t5-db\abstracts_only.db
+CHROMA_DIR  = config.CHROMA_DIR_ABSTRACTS
 COLLECTION_NAME = "abstracts_all"
-BATCH_SIZE = 500
+BATCH_SIZE  = 500
 
-# ------------------ Helpers ------------------
 def safe_str(v):
-    if v is None:
-        return ""
+    if v is None: return ""
     return str(v).strip()
 
-# ------------------ Main ------------------
 def main():
     os.makedirs(CHROMA_DIR, exist_ok=True)
     client = chromadb.PersistentClient(path=CHROMA_DIR)
 
     embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="intfloat/e5-base-v2"
+        model_name=config.SENTENCE_TFORMER
     )
 
-    # Recreate clean collection
     try:
         client.delete_collection(COLLECTION_NAME)
         print(f"🗑️ Old '{COLLECTION_NAME}' collection removed.")

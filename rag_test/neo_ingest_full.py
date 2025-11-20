@@ -1,33 +1,20 @@
-# neo_ingest_full.py
+#neo_ingest_full.py
 """
-Neo4j Community Edition ingest (no vector indexes, no APOC required).
-
-- Reads rows from SQLite (researchers_fixed.db) via config_full.SQLITE_DB
-- Creates a compact paper/author/researcher graph
-- Safe to re-run: uses MERGE and uniqueness constraints
-- No hardcoded paths; all config comes from config_full.py
+Neo4j CE ingest from researchers_fixed.db (no APOC).
 
 Nodes:
   (Paper {paper_id, title, title_short, info, year, doi_link})
   (Author {name})
   (Researcher {name})
-
 Rels:
   (Author)-[:AUTHORED]->(Paper)
   (Paper)-[:HAS_AUTHOR]->(Author)
   (Researcher)-[:WROTE]->(Paper)
   (Paper)-[:HAS_RESEARCHER]->(Researcher)
-  (Author)-[:COAUTHORED_WITH]-(Author)  # undirected (stored once)
-
-Run:
-  python neo_ingest_full.py
+  (Author)-[:COAUTHORED_WITH]-(Author)  # undirected
 """
 
-import json
-import math
-import os
-import re
-import sqlite3
+import json, math, re, sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -36,41 +23,29 @@ from neo4j.exceptions import ClientError
 
 import config_full as config
 
-# --------------------------- regex helpers ------------------------------------
-
 DATE_RE    = re.compile(r"\b(19|20)\d{2}\b")
 PUBDATE_RE = re.compile(r"\b(?:Publication\s*Date|Date)\s*:\s*([0-9]{4})", re.I)
 DOI_RE     = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I)
 URL_RE     = re.compile(r"https?://\S+")
 SEP_RX     = re.compile(r"\s*(?:;|,|\band\b|&|\|)\s*", re.I)
 
-# --------------------------- neo4j connection ---------------------------------
-
 driver = GraphDatabase.driver(config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASS))
 
-# --------------------------- small utils --------------------------------------
-
 def safe_str(x: Any) -> str:
-    if x is None:
-        return ""
+    if x is None: return ""
     if isinstance(x, float):
         try:
-            if math.isnan(x):
-                return ""
-        except Exception:
-            return ""
+            if math.isnan(x): return ""
+        except Exception: return ""
     return str(x).strip()
 
 def extract_year(info: str) -> Optional[int]:
     s = safe_str(info)
-    if not s:
-        return None
+    if not s: return None
     m = PUBDATE_RE.search(s)
     if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
+        try: return int(m.group(1))
+        except Exception: pass
     m2 = DATE_RE.search(s)
     return int(m2.group(0)) if m2 else None
 
@@ -79,11 +54,9 @@ def extract_doi_link(info: str, doi: str) -> Optional[str]:
     if doi:
         return f"https://doi.org/{doi}" if doi.lower().startswith("10.") else doi
     s = safe_str(info)
-    if not s:
-        return None
+    if not s: return None
     m = DOI_RE.search(s)
-    if m:
-        return f"https://doi.org/{m.group(0)}"
+    if m: return f"https://doi.org/{m.group(0)}"
     m2 = URL_RE.search(s)
     return m2.group(0) if m2 else None
 
@@ -92,29 +65,24 @@ def _dedupe(items: List[str]) -> List[str]:
     for it in items:
         k = it.lower()
         if k and k not in seen:
-            seen.add(k)
-            out.append(it)
+            seen.add(k); out.append(it)
     return out
 
 def parse_authors(cell: Any) -> List[str]:
     s = safe_str(cell)
-    if not s:
-        return []
+    if not s: return []
     try:
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
             v = json.loads(s)
-            if isinstance(v, list):
-                return _dedupe([safe_str(x) for x in v if safe_str(x)])
+            if isinstance(v, list): return _dedupe([safe_str(x) for x in v if safe_str(x)])
             if isinstance(v, dict) and isinstance(v.get("authors"), list):
                 return _dedupe([safe_str(x) for x in v["authors"] if safe_str(x)])
     except Exception:
         pass
     return _dedupe([p for p in SEP_RX.split(s) if p])
 
-# --------------------------- read rows from sqlite ----------------------------
-
 def read_rows() -> List[Dict[str, Any]]:
-    db_path = config.SQLITE_DB
+    db_path = config.SQLITE_DB_FULL
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
@@ -133,8 +101,7 @@ def read_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for pid, rname, title, authors, info, doi, pubdate in raw:
         title = safe_str(title)
-        if not title:
-            continue
+        if not title: continue
         authors_list = parse_authors(authors)
         primary = safe_str(rname) or (authors_list[0] if authors_list else "")
         title_short = title[:2048]
@@ -151,15 +118,11 @@ def read_rows() -> List[Dict[str, Any]]:
         })
     return rows
 
-# --------------------------- schema (CE-safe) ---------------------------------
-
 def ensure_schema():
     with driver.session(database=config.NEO4J_DB) as s:
         s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paper) REQUIRE p.paper_id IS UNIQUE")
         s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:Author) REQUIRE a.name IS UNIQUE")
         s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (r:Researcher) REQUIRE r.name IS UNIQUE")
-
-# --------------------------- cypher upserts -----------------------------------
 
 UPSERT = """
 UNWIND $rows AS row
@@ -195,8 +158,6 @@ WHERE id(a1) < id(a2)
 MERGE (a1)-[:COAUTHORED_WITH]-(a2)
 """
 
-# --------------------------- ingest runners -----------------------------------
-
 def ingest(rows: List[Dict[str, Any]], batch_size: int = 200, workers: int = 8):
     batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
 
@@ -217,25 +178,21 @@ def build_coauthor_edges():
         s.run(COAUTHORS)
     print("Co-author edges built.")
 
-# --------------------------- main ---------------------------------------------
-
 if __name__ == "__main__":
     print("— Neo4j CE Ingest —")
-    print(f"SQLite : {config.SQLITE_DB}")
+    print(f"SQLite : {config.SQLITE_DB_FULL}")
     print(f"Neo4j  : {config.NEO4J_URI} / db={config.NEO4J_DB}")
 
     try:
         ensure_schema()
     except ClientError as e:
-        print("Schema setup failed:", e)
-        raise
+        print("Schema setup failed:", e); raise
 
     rows = read_rows()
     print(f"Rows prepared: {len(rows)}")
-
     if not rows:
         print("No rows found. Check your SQLite database and table names.")
     else:
-        ingest(rows, batch_size=int(getattr(config, "BATCH_SIZE", 200)), workers=int(getattr(config, "PARALLEL_JOBS", 4)))
+        ingest(rows, batch_size=200, workers=8)
         build_coauthor_edges()
-        print("✅ Done ingesting into Neo4j Community Edition.")
+        print("✅ Done ingesting into Neo4j CE.")

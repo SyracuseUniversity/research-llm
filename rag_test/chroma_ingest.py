@@ -1,31 +1,22 @@
 #chroma_ingest.py
-import os
-import sqlite3
-import time
+import os, sqlite3, time
 from tqdm import tqdm
 import chromadb
 from chromadb.utils import embedding_functions
 import config_full as config
 
-DB_PATH = config.SQLITE_DB
-CHROMA_DIR = config.CHROMA_DIR
+DB_PATH    = config.SQLITE_DB_FULL                  # ingestion only
+CHROMA_DIR = config.CHROMA_DIR_FULL
 BATCH_SIZE = 500
 
-# -------------------- helpers --------------------
-
 def safe_meta(val, default="N/A"):
-    """Ensure metadata is a primitive Chroma accepts."""
-    if val is None:
-        return default
-    if isinstance(val, (int, float, bool)):
-        return val
+    if val is None: return default
+    if isinstance(val, (int, float, bool)): return val
     s = str(val).strip()
     return s if s else default
 
 def split_into_halves(text: str):
-    """Split long text into 2 chunks, avoids overly large embeddings."""
-    if not text:
-        return []
+    if not text: return []
     mid = len(text) // 2
     return [text[:mid], text[mid:]]
 
@@ -37,11 +28,7 @@ def build_doc(row):
     )
     """
     rid, researcher, title, authors, info, doi, pub_date, file_name, summary, fulltext = row
-
-    # Skip useless rows — require at least some meaningful content
-    if not (title or summary or fulltext):
-        return None
-
+    if not (title or summary or fulltext): return None
     text = (
         f"Researcher: {safe_meta(researcher, 'Unknown')}\n"
         f"Title: {safe_meta(title, 'Untitled')}\n"
@@ -53,23 +40,19 @@ def build_doc(row):
         f"Summary: {safe_meta(summary)}\n\n"
         f"Fulltext:\n{safe_meta(fulltext)}"
     )
-
     return rid, text, researcher, title, authors, doi, pub_date, file_name
-
-# -------------------- main ingest --------------------
 
 def main():
     os.makedirs(CHROMA_DIR, exist_ok=True)
     client = chromadb.PersistentClient(path=CHROMA_DIR)
 
     embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="intfloat/e5-base-v2"
+        model_name=config.SENTENCE_TFORMER
     )
 
-    # Start fresh each run
     try:
         client.delete_collection("papers_all")
-        print("🗑️ Old collection removed.")
+        print("🗑️ Old 'papers_all' collection removed.")
     except Exception:
         pass
 
@@ -78,7 +61,6 @@ def main():
         embedding_function=embedder
     )
 
-    # Read SQLite rows
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -91,8 +73,6 @@ def main():
     conn.close()
 
     print(f"🔎 Found {len(rows)} combined rows to ingest (before filtering).")
-
-    # Filter useless rows
     rows = [r for r in rows if (r[2] or r[8] or r[9])]
     print(f"📌 After filtering: {len(rows)} rows kept for ingestion.")
 
@@ -103,8 +83,7 @@ def main():
 
         for row in batch:
             built = build_doc(row)
-            if not built:
-                continue
+            if not built: continue
             rid, text, researcher, title, authors, doi, pub_date, file_name = built
             chunks = split_into_halves(text)
             for i, chunk in enumerate(chunks, start=1):
@@ -116,7 +95,7 @@ def main():
                     "title": safe_meta(title, "Untitled"),
                     "authors": safe_meta(authors),
                     "doi": safe_meta(doi),
-                    "publication_date": safe_meta(pub_date),
+                    "year": safe_meta(pub_date),
                     "file_name": safe_meta(file_name),
                     "chunk": i,
                 })
