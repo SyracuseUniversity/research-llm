@@ -12,5 +12,5 @@ NEO4J_PASS = "OSPOlol@1234"
 NEO4J_DB = "syr-rag"   # used for both full + abstracts for simplicity
 
 # --- LLMs ---
-LLAMA_1B = r"C:\codes\llama32\Llama-3.2-1B-Instruct"
-LLAMA_3B = r"C:\codes\llama32\Llama-3.2-3B-Instruct"
+LLAMA_1B = r"D:\OSPO\Llama-3.2-1B-Instruct"
+LLAMA_3B = r"D:\OSPO\Llama-3.2-3B-Instruct"
