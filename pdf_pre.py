@@ -1,10 +1,9 @@
 """
-pdf_pre.py  –  Extract text & simple metadata from PDF files (no emojis).
+pdf_pre.py  –  Extract text and simple metadata from PDF files.
 """
 
 import os
 import re
-import gc
 from PyPDF2 import PdfReader
 
 
@@ -46,12 +45,12 @@ def clean_text(text: str) -> str:
 def extract_research_info_from_pdf(file_path: str) -> dict | None:
     """
     Extract simple metadata from a PDF:
-      • work_title: first nonempty line
-      • authors: text after 'Author(s):' or fallback 'By <name>'
-      • researcher_name: first comma‐separated author
-      • info: first 1000 chars of cleaned full text
+      work_title: first nonempty line
+      authors: text after 'Author(s):' or fallback 'By <name>'
+      researcher_name: first comma-separated author
+      info: first 1000 chars of cleaned full text
 
-    Returns dict with keys {researcher_name, work_title, authors, info, full_text}, 
+    Returns dict with keys {researcher_name, work_title, authors, info, full_text},
     or None if extraction fails.
     """
     try:
@@ -64,14 +63,12 @@ def extract_research_info_from_pdf(file_path: str) -> dict | None:
         return None
 
     raw_lines = [ln.strip() for ln in raw_text.splitlines()]
-    # Title: first nonempty line
     work_title = ""
     for ln in raw_lines:
         if ln:
             work_title = ln
             break
 
-    # Authors / researcher
     authors = ""
     researcher_name = ""
     snippet_for_author_search = "\n".join(raw_lines[:20])
@@ -101,6 +98,6 @@ def extract_research_info_from_pdf(file_path: str) -> dict | None:
             "work_title": work_title,
             "authors": authors,
             "info": info,
-            "full_text": cleaned_full
+            "full_text": cleaned_full,
         }
     return None
