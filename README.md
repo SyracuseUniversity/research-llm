@@ -1,262 +1,476 @@
-# Pipeline Overview
+#
 
-This project implements a full RAG‑style research assistant:
+## System Architecture Overview
 
-1. **`train_pipeline.py`** — end‑to‑end training:  
-   - PDF ingestion  
-   - SQLite staging  
-   - T5 summarization & fine‑tuning  
-   - “Lite” dataset creation  
-   - LLaMA fine‑tuning  
+This codebase implements a deterministic, resumable, single source of truth research ingestion and enrichment pipeline built around SQLite. The system ingests PDFs and CSV metadata, normalizes and repairs paper identity, enriches missing metadata using deterministic parsing and external APIs, assigns OpenAlex topics, and finally summarizes full text for downstream retrieval and model training.
 
-2. **`rag_pipeline.py`** — interactive RAG chatbot:  
-   - ChromaDB vector store  
-   - LangChain RetrieverQA  
-   - Fine‑tuned LLaMA generation  
+### Core Architectural Principles
 
-3. **`test_rag.py`** — automated test suite for your RAG chatbot.
+**SQLite as the canonical source of truth**
 
-All scripts assume your code lives under `C:\codes\…`.
+The SQLite database `syr_research_all.db` is the only authoritative data store. No metadata exists only in memory, vector stores, or model artifacts. All downstream systems must be derived from SQLite and can be rebuilt at any time.
 
----
+**Paper centric data model**
 
-## Folder Structure
-pipeline_project/ 
+`paper_id` is the stable identity key. All tables reference `paper_id`. This allows metadata to be merged from PDFs, CSVs, parsing, and APIs without duplicating logical papers.
 
-├── train_pipeline.py
+**Non destructive enrichment**
 
-├── rag_pipeline.py
+All enrichment steps are additive. Existing non empty values are never overwritten unless explicitly forced. This ensures that higher quality or manually curated data is never destroyed by automated steps.
 
-├── test_rag.py
+**Multi phase repair and enrichment**
 
-├── migrate_sqlite_to_chromadb.py
+Instead of a single monolithic repair pass, enrichment is staged into phases with increasing cost and uncertainty.
 
-├── pdfs.py
+Phase A deterministic table to table copying
 
-├── pdf_pre.py
+Phase B deterministic full text parsing
 
-├── model.py
+Phase C external API enrichment
 
-├── llama_model.py
+Phase D optional LLM based extraction
 
-├── database_handler.py
+**Separation of concerns**
 
-├── data_pre.py
+Each script has a single responsibility and can be run independently. `run_pipeline.py` only orchestrates ordering and does not contain business logic.
 
-└── (optional helper scripts)
+## Data Model and Table Responsibilities
 
+### papers
 
-- **`train_pipeline.py`**  
-  Orchestrates data ingestion, summarization, and model fine‑tuning in one shot.
+Represents paper identity. One row per logical paper.
 
-- **`rag_pipeline.py`**  
-  Loads ChromaDB + LangChain + LLaMA to serve an interactive chatbot.
+**Fields**
 
-- **`test_rag.py`**  
-  Runs a list of test questions through your RAG chain and logs outputs.
+`paper_id` primary key
 
-- **`migrate_sqlite_to_chromadb.py`**  
-  One‑time migration of all SQLite data into ChromaDB.
+`title` canonical title
 
-- **`pdfs.py`** / **`pdf_pre.py`**  
-  Download, extract, and clean PDF text.
+`authors` canonical author list
 
-- **`model.py`**  
-  T5 summarization & fine‑tuning utilities.
+`publication_date` year or date string
 
-- **`llama_model.py`**  
-  LLaMA fine‑tuning utilities.
+`doi` canonical DOI normalized
 
-- **`database_handler.py`**  
-  SQLite schema & CRUD helpers.
+`arxiv_id` canonical arXiv identifier
 
-- **`data_pre.py`**  
-  Text‑to‑T5 preprocessing helper.
+**Invariant**
 
----
+`papers` should never contain duplicate DOI or arXiv identifiers across rows.
 
-# Detailed File and Function Documentation
+### works
 
-## 1. train_pipeline.py
+Represents physical documents and text content.
 
-### Purpose  
-Runs the full data → model training loop:
+**Fields**
 
-1. **Download PDFs** (from your merged CSV)  
-2. **Extract & ingest** into SQLite  
-3. **Summarize** with T5 and update DB  
-4. **Fine‑tune T5** on `(full_text → summary)`  
-5. **Create lite DB/pickle/CSV**  
-6. **Fine‑tune LLaMA** on `(input_text → target_text)`
+`id` primary key
 
-### Key Functions  
-- **`download_pdfs()`**  
-- **`process_pdfs_into_sqlite()`**  
-- **`generate_summaries_and_finetune_t5()`**  
-- **`create_lite_and_finetune_llama()`**
+`paper_id` foreign key to papers
 
-Each step is checkpoint‑aware and resumes from the latest checkpoint.
+`file_name` PDF filename
 
----
+`full_text` extracted and cleaned text
 
-## 2. rag_pipeline.py
+`summary` T5 generated summary
 
-### Purpose  
-Serves an interactive Retrieval‑Augmented Generation chatbot:
+`summary_status` unsummarized or summarized
 
-1. Loads ChromaDB (persisted vector store)  
-2. Uses Sentence‑Transformers embeddings  
-3. Instantiates a LangChain `RetrievalQA` chain  
-4. Wraps your fine‑tuned LLaMA in a HuggingFacePipeline  
-5. Provides a REPL chat loop
+`progress` integer used as simple state flag
 
-### Key Sections  
-- **Configuration** (paths, model names, device)  
-- **Retriever instantiation**  
-- **LLM loading & pipeline**  
-- **`RetrievalQA.from_chain_type(...)`**  
-- **`chat()`** loop
+**Invariant**
 
----
+`works` is the only table allowed to store full text. One paper may have multiple works rows in theory, but the pipeline assumes one dominant PDF per paper.
 
-## 3. test_rag.py
+### research_info
 
-### Purpose  
-Executes a predefined list of questions against your RAG pipeline and logs results:
+Represents presentation and enrichment metadata.
 
-- **`TEST_QUESTIONS`** array  
-- **`log_entry()`** writes to CSV  
-- **`if __name__ == "__main__":`** iterates, runs `qa.run(...)`, logs
+**Fields**
 
----
+`paper_id` primary key
 
-## 4. migrate_sqlite_to_chromadb.py
+`work_title` display title
 
-### Purpose  
-One‑time migration of your SQLite tables into ChromaDB:
+`authors` display authors
 
-- Fetches `works` and `research_info`  
-- Chunks long texts with `RecursiveCharacterTextSplitter`  
-- Embeds with Sentence‑Transformers (`all-MiniLM-L6-v2`)  
-- Adds documents to Chroma collection and persists
+`doi` display DOI
 
----
+`publication_date` display date
 
-## 5. pdfs.py & pdf_pre.py
+`researcher_name` primary researcher inferred
 
-- **`pdfs.py`**: Downloads PDFs from a CSV.  
-- **`pdf_pre.py`**:  
-  - `extract_text_from_pdf(file_path)`  
-  - `clean_text(text)`  
-  - `extract_research_info_from_pdf(file_path)`
+`info` free form concatenated metadata
 
----
+`topics_status` untagged or tagged
 
-## 6. model.py
+`topics_json` full OpenAlex topic output
 
-### Purpose  
-T5 summarization & fine‑tuning helpers:
+`primary_topic` primary topic name only
 
-- `summarize_text(text, idx=None, total=None)`  
-- `fine_tune_t5_on_papers(dataset, output_dir)`
+`subject` coarse one word subject
 
-Supports resuming from the latest checkpoint.
+**Invariant**
 
----
+`research_info` mirrors `papers` where possible but may include derived or user facing fields not appropriate for `papers`.
 
-## 7. llama_model.py
+## Pipeline Execution Flow
 
-### Purpose  
-LLaMA fine‑tuning helpers:
+### Canonical Execution Order
 
-- `fine_tune_llama_on_papers(dataset, output_dir)`  
-  - Masks prompt tokens, computes loss only on summary tokens  
-  - Resumes from checkpoint
+1 ingest_pdf_fulltext.py
 
-- `clear_memory()`
+2 csv_handler.py
 
----
+3 db_repair_enrich.py
 
-## 8. database_handler.py
+4 topic_tag_openalex.py
 
-CRUD operations for SQLite:
+5 summarize_works.py
 
-- `setup_database()`, `setup_research_info_table()`  
-- `insert_work(...)`, `remove_duplicates()`, `fetch_unsummarized_works()`  
-- `update_summary(work_id, summary)`  
-- `insert_research_info(...)`, `fetch_research_info()`  
-- `count_entries_in_table()`, `check_missing_files_in_db(...)`
+`run_pipeline.py` enforces this order and passes optional limits and flags.
 
----
+## File by File and Function Level Documentation
 
-## 9. data_pre.py
+## run_pipeline.py
 
-- `preprocess_text_for_t5(text, model_name="t5-small")`
+**Purpose**
 
----
+Acts as the orchestration layer. It enforces ordering, validates database existence, and delegates real work to other modules.
 
-# Dependency Diagram
+**Functions**
 
+`_assert_db_exists` checks that the SQLite database file exists before running any step and prevents silent creation of a new empty database.
 
-- **`train_pipeline.py`**  
-  Orchestrates data ingestion, summarization, and model fine‑tuning in one shot.
+`_quick_db_ping` opens a connection and runs a trivial query to verify the database is readable and not corrupted.
 
-- **`rag_pipeline.py`**  
-  Loads ChromaDB + LangChain + LLaMA to serve an interactive chatbot.
+`main` parses CLI arguments and executes each pipeline stage conditionally.
 
-- **`test_rag.py`**  
-  Runs a list of test questions through your RAG chain and logs outputs.
+**Execution Logic**
 
-- **`migrate_sqlite_to_chromadb.py`**  
-  One‑time migration of all SQLite data into ChromaDB.
+Step 1 always runs ingest_pdf_fulltext
 
-- **`pdfs.py`** / **`pdf_pre.py`**  
-  Download, extract, and clean PDF text.
+Step 2 runs csv_handler unless skipped
 
-- **`model.py`**  
-  T5 summarization & fine‑tuning utilities.
+Step 3 runs db_repair_enrich as a subprocess to isolate memory heavy operations
 
-- **`llama_model.py`**  
-  LLaMA fine‑tuning utilities.
+Step 4 runs topic_tag_openalex as a subprocess
 
-- **`database_handler.py`**  
-  SQLite schema & CRUD helpers.
+Step 5 runs summarize_works unless skipped
 
-- **`data_pre.py`**  
-  Text‑to‑T5 preprocessing helper.
+**Design Rationale**
 
----
+db_repair_enrich and topic_tag_openalex are executed via subprocess to ensure GPU memory and model state are fully released between steps.
 
-# Dependency & Pipeline Flowchart
+## ingest_pdf_fulltext.py
+
+**Purpose**
+
+Transforms downloaded PDFs into structured rows in works and creates placeholder identity rows in papers and research_info.
+
+**Key Functions**
+
+`_ensure_pragmas` enables WAL mode and relaxed sync for faster bulk inserts.
+
+`_work_exists` checks if a PDF file_name already exists in works and prevents duplicate ingestion.
+
+`_create_paper` inserts a minimal empty row into papers and returns paper_id to establish identity early.
+
+`_insert_work` inserts a works row with full_text and unsummarized status.
+
+`_has_column` detects schema differences safely.
+
+`_try_insert_research_info_stub` optionally inserts a stub research_info row early for join consistency.
+
+`main` iterates over all PDFs, extracts and cleans text, creates papers and works rows, and optionally inserts research_info stubs.
+
+**Failure Handling**
+
+Extraction and insertion failures are isolated per file so one bad PDF does not halt the pipeline.
+
+## pdf_pre.py
+
+**Purpose**
+
+Low level PDF extraction and cleaning utilities.
+
+**Functions**
+
+`extract_raw_text_from_pdf` reads each page using PyPDF2 and returns concatenated text.
+
+`clean_text` normalizes whitespace and removes unstable punctuation while preserving technical content.
+
+`extract_research_info_from_pdf` heuristic extractor for title and authors, currently experimental.
+
+## csv_handler.py
+
+**Purpose**
+
+Ingests external CSV metadata and enriches papers and research_info without overwriting existing data.
+
+**Key Concepts**
+
+CSV schemas are heterogeneous and unreliable. All inputs are normalized into a common internal representation before touching the database.
+
+**Functions**
+
+`_norm` normalizes strings
+
+`_norm_doi` extracts and canonicalizes DOI strings
+
+`_safe_str` converts pandas values safely
+
+`combine_csvs` normalizes schemas and concatenates all CSV inputs
+
+`_find_paper_id` matches papers by DOI then exact title
+
+`_create_paper` creates a new papers row if no match exists
+
+`_ensure_research_info_row` guarantees research_info presence
+
+`_fill_papers_missing` fills missing canonical fields using COALESCE logic
+
+`_fill_research_info_missing` fills missing presentation fields and builds info strings
+
+`populate_research_info_from_csv` is the main orchestration entry point
+
+**Architectural Role**
+
+This module bridges external curated metadata into the canonical SQLite dataset.
+
+## database_handler.py
+
+**Purpose**
+
+Minimal helper functions for summarization workflows.
+
+**Functions**
+
+`fetch_unsummarized_works` returns works rows ready for summarization
+
+`update_summary` writes summary text and status
+
+`close_connection` retained for backward compatibility
+
+## summarize_works.py
+
+**Purpose**
+
+Runs T5 summarization over works.full_text.
+
+**Behavior**
+
+Summarization is sequential and conservative to avoid GPU memory spikes and ensure deterministic progress tracking.
+
+## model.py
+
+**Purpose**
+
+Encapsulates all T5 model logic.
+
+**Functions**
+
+`load_t5_model` loads t5 small and tokenizer
+
+`clear_memory` releases CUDA memory
+
+`summarize_text` truncates input and generates summaries
+
+`fine_tune_t5_on_papers` fine tunes T5 on paper data
+
+## db_audit.py
+
+**Purpose**
+
+Audits database health and schema consistency.
+
+**Functions**
+
+Includes table listing, column inspection, NULL counts, empty string checks, sampling, and cross table integrity checks.
+
+**Architectural Role**
+
+Diagnostic and validation tool only, not part of pipeline execution.
+
+## db_repair_enrich.py
+
+**Purpose**
+
+Central repair and enrichment engine implementing layered trust.
+
+**Phase A**
+
+Copies best available values across tables, extracts arXiv IDs from filenames, and enforces identifier uniqueness.
+
+**Phase B**
+
+Deterministic full text parsing to extract title, authors, year, DOI, arXiv ID, researcher name, and info.
+
+**Phase C**
+
+External enrichment using Crossref and arXiv APIs.
+
+**Phase D**
+
+Optional Flan T5 extraction for remaining title, authors, and year only.
+
+**Safeguards**
+
+Strict JSON parsing, year validation, dummy title rejection, and email detection in author strings.
+
+## topic_tag_openalex.py
+
+**Purpose**
+
+Assigns research topics using an OpenAlex trained classifier.
+
+**Behavior**
+
+Writes topics_json, primary_topic name only, topics_status, and subject into research_info.
+
+## fine_tune_llama_rag.py
+
+**Purpose**
+
+Fine tunes a local LLaMA model using LoRA adapters for downstream RAG usage.
+
+**Architectural Role**
+
+Consumes outputs from the SQLite pipeline and remains decoupled from ingestion.
+
+## llama_data_formatter.py
+
+**Purpose**
+
+Generates QA training data from research_info.
+
+## Pipeline Architecture Flow
 
 ```mermaid
-flowchart LR
-    subgraph Training Pipeline
-      A[train_pipeline.py]
-    end
+flowchart TB
+  subgraph Inputs
+    CSV[CSV metadata sources]
+    PDFS[Downloaded PDFs folder]
+  end
 
-    subgraph RAG Service
-      B[rag_pipeline.py]
-      C[test_rag.py]
-    end
+  subgraph CanonicalStore
+    DB[(SQLite: syr_research_all.db)]
+    PAPERS[(papers)]
+    WORKS[(works)]
+    RI[(research_info)]
+  end
 
-    subgraph Helpers
-      D[migrate_sqlite_to_chromadb.py]
-      E[pdfs.py] & F[pdf_pre.py]
-      G[model.py] & H[llama_model.py]
-      I[database_handler.py] & J[data_pre.py]
-    end
+  subgraph Pipeline
+    P1[ingest_pdf_fulltext.py
+PDF -> cleaned full_text -> works
+creates stub papers and research_info]
+    P2[csv_handler.py
+normalize CSVs
+match by DOI else title
+fill missing fields only]
+    P3[db_repair_enrich.py
+Phase A copy across tables
+Phase B parse full_text
+Phase C Crossref/arXiv
+Phase D optional T5 fill]
+    P4[topic_tag_openalex.py
+OpenAlex topic classifier
+hierarchy fetch
+writes topics_json, primary_topic, subject]
+    P5[summarize_works.py
+T5 summaries
+updates works.summary + status]
+  end
 
-    A --> I
-    A --> E
-    A --> F
-    A --> G
-    A --> H
+  subgraph Downstream
+    QA[llama_data_formatter.py
+QA dataset from research_info]
+    FT[fine_tune_llama_rag.py
+QLoRA LoRA adapters]
+    RAG[Derived RAG layers
+Chroma, Neo4j, Streamlit
+built from SQLite]
+  end
 
-    B --> D
-    B --> G
-    B --> H
+  CSV --> P2
+  PDFS --> P1
 
-    C --> B
+  P1 --> DB
+  P2 --> DB
+  P3 --> DB
+  P4 --> DB
+  P5 --> DB
 
+  DB --> PAPERS
+  DB --> WORKS
+  DB --> RI
 
+  RI --> QA --> FT
+  DB --> RAG
+```
+
+## Folder Structure
+
+```
+pipeline_project/
+
+run_pipeline.py
+ingest_pdf_fulltext.py
+csv_handler.py
+db_repair_enrich.py
+topic_tag_openalex.py
+summarize_works.py
+database_handler.py
+model.py
+pdf_pre.py
+pdfs.py
+llama_data_formatter.py
+fine_tune_llama_rag.py
+db_audit.py
+```
+
+## What Changed From the Previous Approach
+
+### Explicit staged orchestration
+
+The previous approach relied on a monolithic `train_pipeline.py` that attempted to ingest data, repair metadata, summarize text, generate datasets, and fine tune models in a single run. The current design separates ingestion, CSV enrichment, repair, topic tagging, and summarization into explicit scripts coordinated only by `run_pipeline.py`.
+
+This improves resumability, failure isolation, and allows individual stages to be rerun safely without retraining models.
+
+### Canonical dataset before retrieval
+
+Earlier versions treated vector stores and RAG pipelines as first class outputs. The current architecture delays any retrieval layer until the SQLite dataset is fully repaired, enriched, and topic tagged. Chroma, Neo4j, or Streamlit services are now derived artifacts.
+
+This prevents vector stores from becoming accidental sources of truth and guarantees deterministic rebuilds.
+
+### Layered trust enrichment model
+
+Metadata enrichment is now explicitly ordered by trust and cost. Existing values are copied first, deterministic parsing is applied second, authoritative external APIs are queried third, and language models are used only as a last resort.
+
+This minimizes hallucination risk and protects high quality curated metadata.
+
+### Strict non destructive updates
+
+All scripts enforce COALESCE and NULL checks to ensure that non empty values are never overwritten unless explicitly forced. Identifier uniqueness for DOI and arXiv IDs is enforced across the dataset.
+
+This makes the database auditable and stable across repeated pipeline runs.
+
+### Topics as a first class semantic index
+
+Topic tagging has moved from an optional enhancement to a canonical database feature. OpenAlex topics, ranked metadata, and normalized primary topics are stored directly in `research_info`.
+
+This enables semantic routing, grant matching, and structured retrieval without relying solely on embeddings.
+
+### Summarization as a downstream enhancement
+
+Summarization is now executed after identity repair and topic tagging. Summaries are treated as an additional retrieval signal rather than a repair mechanism.
+
+### Decoupled RAG and service layers
+
+Interactive RAG services and tests are no longer coupled to ingestion. The pipeline produces a high quality canonical dataset usable for chatbots, analytics, exports, and institutional matching workflows.
+
+## Summary
+
+This system is a SQLite first research ingestion and enrichment pipeline designed for correctness, reproducibility, and long term maintainability. Every stage is isolated, restartable, and defensive. Metadata flows inward from PDFs, CSVs, deterministic parsing, authoritative APIs, and finally language models. At no point is existing data destroyed or silently replaced.
+
+The result is a stable canonical dataset that can reliably support RAG systems, grant matching, researcher discovery, and future analytical workloads.
