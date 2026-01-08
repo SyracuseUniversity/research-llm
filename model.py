@@ -1,5 +1,5 @@
 """
-model.py  –  T5 summarization and fine-tuning utilities (no emojis).
+model.py  –  T5 summarization and fine-tuning utilities.
 """
 
 import os
@@ -37,7 +37,7 @@ def load_t5_model():
     if t5_model is not None and t5_tokenizer is not None:
         return t5_model, t5_tokenizer, DEVICE
 
-    print("Loading T5 model and tokenizer…")
+    print("Loading T5 model and tokenizer.")
     t5_model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
     t5_tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME)
     if t5_tokenizer.pad_token_id is None:
@@ -57,16 +57,16 @@ def clear_memory():
 def summarize_text(text: str, idx: int = None, total: int = None) -> str:
     """
     Summarize a single piece of text using T5:
-      1) Truncate raw text to first TRUNCATE_TEXT_CHARS chars.
-      2) Prepend "summarize: " so T5 uses its summarization head.
-      3) Generate with beam search, max length 150.
+      1 Truncate raw text to first TRUNCATE_TEXT_CHARS chars
+      2 Prepend "summarize: " so T5 uses its summarization head
+      3 Generate with beam search, max length 150
 
     Returns the generated summary string.
     """
     model, tokenizer, device = load_t5_model()
 
     if idx is not None and total is not None:
-        print(f"Summarizing [{idx}/{total}]…")
+        print(f"Summarizing [{idx}/{total}]")
 
     raw_snippet = text[:TRUNCATE_TEXT_CHARS]
     prompt = "summarize: " + raw_snippet
@@ -110,7 +110,7 @@ def fine_tune_t5_on_papers(
     if missing:
         raise KeyError(f"DataFrame missing column(s): {missing}")
 
-    print("Fine-tuning T5 on provided data…")
+    print("Fine-tuning T5 on provided data.")
 
     def tokenize_fn(batch):
         enc_in = tokenizer(

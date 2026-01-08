@@ -1,6 +1,8 @@
 """
-pdfs.py  –  Download PDFs listed in cleaned_author_works.csv,
-with robust error handling and skipping already‐downloaded files.
+pdfs.py
+
+Download PDFs listed in cleaned_author_works.csv,
+with robust error handling and skipping already downloaded files.
 """
 
 import os
@@ -33,7 +35,6 @@ def main():
         url = url.strip()
         file_name = os.path.join(DOWNLOAD_DIR, f"file_{idx}.pdf")
 
-        # Skip if already exists
         if os.path.isfile(file_name):
             continue
 
@@ -45,8 +46,6 @@ def main():
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-
-            print(f"Downloaded: {file_name}")
 
         except requests.exceptions.Timeout:
             print(f"Timeout while downloading: {url}")

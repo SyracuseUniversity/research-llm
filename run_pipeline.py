@@ -1,101 +1,99 @@
 """
-run_pipeline_after_download.py  –  Execute the pipeline from “ingest full text” onward,
-assuming all PDFs have already been downloaded into download_pdfs/.
+run_pipeline.py
+
+Execute pipeline on syr_research_all.db starting after PDFs are already downloaded.
+
+Order
+1 ingest_pdf_fulltext
+2 csv_handler
+3 db_repair_enrich
+4 topic_tag_openalex
+5 summarize_works
+
+No naming changes, no download changes.
 """
 
 import os
-import glob
+import argparse
 import sqlite3
-import torch
 
-# Paths (same unified DB as before)
-UNIFIED_DB = r"C:\codes\t5-db\researchers_all.db"
-PDF_DOWNLOAD_DIR = r"C:\codes\t5-db\download_pdfs"
+DB_PATH = r"C:\codes\t5-db\syr_research_all.db"
 
-# Ensure the unified DB exists
-if not os.path.exists(UNIFIED_DB):
-    raise FileNotFoundError(f"Unified database not found: {UNIFIED_DB}")
 
-print("Using existing database at:", UNIFIED_DB)
+def _assert_db_exists() -> None:
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(f"Database not found: {DB_PATH}")
 
-# Step 1 (skipped): Download PDFs
 
-print("\n=== Step 2: Ingest full text into 'works' ===")
-from ingest_pdf_fulltext import main as ingest_fulltext
-ingest_fulltext()
+def _quick_db_ping() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1;")
+        cur.fetchone()
+    finally:
+        conn.close()
 
-print("\n=== Step 3: Ingest PDF metadata into 'research_info' ===")
-from pdf_pre import extract_research_info_from_pdf
-def ingest_pdf_metadata():
-    conn = sqlite3.connect(UNIFIED_DB)
-    cur = conn.cursor()
 
-    insert_sql = """
-    INSERT OR IGNORE INTO research_info
-      (researcher_name, work_title, authors, info)
-    VALUES (?, ?, ?, ?);
-    """
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=None, help="Optional limit for heavy steps")
+    ap.add_argument("--skip-csv", action="store_true")
+    ap.add_argument("--skip-repair", action="store_true")
+    ap.add_argument("--skip-topics", action="store_true")
+    ap.add_argument("--skip-summarize", action="store_true")
+    ap.add_argument("--repair-t5", action="store_true", help="Enable Phase D T5 in db_repair_enrich.py")
+    args = ap.parse_args()
 
-    pdf_files = glob.glob(os.path.join(PDF_DOWNLOAD_DIR, "*.pdf"))
-    total = len(pdf_files)
-    print(f"Found {total} PDFs for metadata ingestion.")
+    _assert_db_exists()
+    _quick_db_ping()
 
-    for idx, pdf_path in enumerate(pdf_files, start=1):
-        try:
-            meta = extract_research_info_from_pdf(pdf_path)
-        except Exception as e:
-            print(f"Failed to extract from {pdf_path}: {e}")
-            meta = None
+    print("Using database at:", DB_PATH)
 
-        if not meta:
-            continue
+    print()
+    print("Step 1 ingest full text into works")
+    from ingest_pdf_fulltext import main as ingest_fulltext
+    ingest_fulltext()
 
-        cur.execute(
-            insert_sql,
-            (meta["researcher_name"], meta["work_title"], meta["authors"], meta["info"])
-        )
+    if not args.skip_csv:
+        print()
+        print("Step 2 ingest CSV metadata into papers and research_info")
+        from csv_handler import populate_research_info_from_csv
+        populate_research_info_from_csv()
 
-        if idx % 100 == 0 or idx == total:
-            print(f"  → {idx}/{total} PDF metadata inserted")
+    if not args.skip_repair:
+        print()
+        print("Step 3 repair and enrich database")
+        import subprocess
+        import sys
 
-    conn.commit()
-    conn.close()
-    print("PDF metadata ingestion complete.")
+        cmd = [sys.executable, "db_repair_enrich.py", "--db", DB_PATH]
+        if args.limit is not None:
+            cmd += ["--limit", str(args.limit)]
+        if args.repair_t5:
+            cmd += ["--t5"]
+        subprocess.check_call(cmd)
 
-ingest_pdf_metadata()
+    if not args.skip_topics:
+        print()
+        print("Step 4 tag topics with OpenAlex model")
+        import subprocess
+        import sys
 
-print("\n=== Step 4: Ingest CSV metadata into 'research_info' ===")
-from csv_handler import populate_research_info_from_csv
-populate_research_info_from_csv()
+        cmd = [sys.executable, "topic_tag_openalex.py", "--db", DB_PATH]
+        if args.limit is not None:
+            cmd += ["--limit", str(args.limit)]
+        subprocess.check_call(cmd)
 
-print("\n=== Step 5: Clean & normalize `research_info` ===")
-from clean_db import main as clean_db_main
-clean_db_main()
+    if not args.skip_summarize:
+        print()
+        print("Step 5 summarize works with T5")
+        from summarize_works import main as summarize_main
+        summarize_main(limit=args.limit)
 
-print("\n=== Step 6: Summarize works with T5 ===")
-from summarize_works import main as summarize_works
-summarize_works()
+    print()
+    print("Pipeline complete.")
 
-print("\n=== Step 7: Generate QA pairs for LLaMA ===")
-from llama_data_formatter import generate_qa_pairs
-generate_qa_pairs()
 
-print("\n=== Step 8: Fine-tune LLaMA (QLoRA) ===")
-import pandas as pd
-import fine_tune_llama_rag
-
-QA_PICKLE = r"C:\codes\t5-db\qa_augmented_metadata_training.pkl"
-LLAMA_OUTPUT_DIR = os.path.join(".", "models", "llama_rag_qlora")
-os.makedirs(LLAMA_OUTPUT_DIR, exist_ok=True)
-
-fine_tune_llama_rag.QA_DATASET_PATH = QA_PICKLE
-fine_tune_llama_rag.OUTPUT_PATH = LLAMA_OUTPUT_DIR
-df_qas = pd.read_pickle(QA_PICKLE)
-fine_tune_llama_rag.fine_tune_llama_on_papers(df_qas)
-
-print("\n=== Step 9: Ingest into ChromaDB ===")
-from migrate_to_chromadb import migrate_metadata, migrate_summaries
-migrate_metadata()
-migrate_summaries()
-
-print("\nPipeline complete (starting after PDF downloads).")
+if __name__ == "__main__":
+    main()
