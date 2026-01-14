@@ -473,4 +473,3 @@ Interactive RAG services and tests are no longer coupled to ingestion. The pipel
 
 This system is a SQLite first research ingestion and enrichment pipeline designed for correctness, reproducibility, and long term maintainability. Every stage is isolated, restartable, and defensive. Metadata flows inward from PDFs, CSVs, deterministic parsing, authoritative APIs, and finally language models. At no point is existing data destroyed or silently replaced.
 
-The result is a stable canonical dataset that can reliably support RAG systems, grant matching, researcher discovery, and future analytical workloads.
