@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Chroma / vector databases
+database/chroma_store_full/
+database/chroma_store/
+database/*.sqlite3
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

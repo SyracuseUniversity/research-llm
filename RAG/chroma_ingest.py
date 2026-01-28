@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 import chromadb
 from chromadb.utils import embedding_functions
+from chromadb.errors import NotFoundError
 
 import config_full as config
 
@@ -55,15 +56,21 @@ def _split_text(text: str, max_chars: int = 12000) -> List[str]:
     return parts
 
 
-def _join_nonempty(*parts: Any, sep: str = "\n") -> str:
-    out = []
-    for p in parts:
-        if p is None:
-            continue
-        s = str(p).strip()
-        if s:
-            out.append(s)
-    return sep.join(out)
+def build_paper_text(title: Any, summary: Any, fulltext: Any) -> str:
+    """Combine title, summary, and fulltext into a single text blob for embedding, skipping empty fields."""
+    t = (title or "").strip()
+    s = (summary or "").strip()
+    f = (fulltext or "").strip()
+
+    parts: List[str] = []
+    if t:
+        parts.append(t)
+    if s:
+        parts.append(s)
+    if f:
+        parts.append(f)
+
+    return "\n\n".join(parts).strip()
 
 
 def detect_works_fulltext_column(conn: sqlite3.Connection) -> str:
@@ -76,7 +83,9 @@ def detect_works_fulltext_column(conn: sqlite3.Connection) -> str:
         return "fultext"
     if "fulltext" in cols:
         return "fulltext"
-    raise RuntimeError("Could not find works fulltext column. Expected one of: full_text, fultext, fulltext")
+    raise RuntimeError(
+        "Could not find works fulltext column. Expected one of: full_text, fultext, fulltext"
+    )
 
 
 def fetch_rows(conn: sqlite3.Connection, works_fulltext_col: str) -> List[Tuple[Any, ...]]:
@@ -102,7 +111,9 @@ def fetch_rows(conn: sqlite3.Connection, works_fulltext_col: str) -> List[Tuple[
     return cur.fetchall()
 
 
-def build_paper_document(row: Tuple[Any, ...], works_fulltext_colname: str) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+def build_paper_document(
+    row: Tuple[Any, ...], works_fulltext_colname: str
+) -> Optional[Tuple[str, str, Dict[str, Any]]]:
     (
         paper_id,
         r_id,
@@ -117,38 +128,33 @@ def build_paper_document(row: Tuple[Any, ...], works_fulltext_colname: str) -> O
         fulltext,
     ) = row
 
-    title = (work_title or "").strip()
-    summ = (summary or "").strip()
-    ft = (fulltext or "").strip()
-
-    if not (title or summ or ft):
+    text = build_paper_text(work_title, summary, fulltext)
+    if not text:
         return None
 
     paper_id_s = str(paper_id).strip() if paper_id is not None else ""
     if not paper_id_s:
         return None
 
-    doc = _join_nonempty(
-        f"Paper ID: {safe_meta(paper_id_s, 'Unknown')}",
-        f"Researcher: {safe_meta(researcher_name, 'Unknown')}",
-        f"Title: {safe_meta(title, 'Untitled')}",
-        f"Authors: {safe_meta(authors)}",
-        f"Primary Topic: {safe_meta(primary_topic)}",
-        f"Info: {safe_meta(info)}",
-        f"DOI: {safe_meta(doi)}",
-        f"Publication Date: {safe_meta(publication_date)}",
-        "",
-        f"Summary:\n{safe_meta(summ)}",
-        "",
-        f"Fulltext ({works_fulltext_colname}):\n{safe_meta(ft)}",
-        sep="\n",
+    doc = "\n\n".join(
+        [
+            f"Paper ID: {safe_meta(paper_id_s, 'Unknown')}",
+            f"Researcher: {safe_meta(researcher_name, 'Unknown')}",
+            f"Authors: {safe_meta(authors)}",
+            f"Primary Topic: {safe_meta(primary_topic)}",
+            f"Info: {safe_meta(info)}",
+            f"DOI: {safe_meta(doi)}",
+            f"Publication Date: {safe_meta(publication_date)}",
+            "",
+            text,
+        ]
     ).strip()
 
     meta = {
         "paper_id": safe_meta(paper_id_s),
         "research_info_id": safe_meta(r_id),
         "researcher": safe_meta(researcher_name, "Unknown"),
-        "title": safe_meta(title, "Untitled"),
+        "title": safe_meta(work_title, "Untitled"),
         "authors": safe_meta(authors),
         "doi": safe_meta(doi),
         "year": _pick_year(publication_date),
@@ -163,14 +169,18 @@ def main() -> None:
     os.makedirs(CHROMA_DIR, exist_ok=True)
     client = chromadb.PersistentClient(path=CHROMA_DIR)
 
-    embedder = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+    embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBED_MODEL
+    )
 
     try:
         client.delete_collection(COLLECTION_NAME)
-    except Exception:
+    except (NotFoundError, ValueError):
         pass
 
-    col = client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=embedder)
+    col = client.get_or_create_collection(
+        name=COLLECTION_NAME, embedding_function=embedder
+    )
 
     conn = sqlite3.connect(DB_PATH)
     works_fulltext_col = detect_works_fulltext_column(conn)
@@ -190,7 +200,11 @@ def main() -> None:
     paper_ids = list(by_paper.keys())
     total_start = time.time()
 
-    for batch_idx in tqdm(range(0, len(paper_ids), PAPERS_PER_BATCH), desc="Ingesting papers", unit="batch"):
+    for batch_idx in tqdm(
+        range(0, len(paper_ids), PAPERS_PER_BATCH),
+        desc="Ingesting papers",
+        unit="batch",
+    ):
         ids_batch = paper_ids[batch_idx : batch_idx + PAPERS_PER_BATCH]
 
         docs: List[str] = []
