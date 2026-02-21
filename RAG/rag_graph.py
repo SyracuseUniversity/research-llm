@@ -1,121 +1,135 @@
 # rag_graph.py
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from neo4j import GraphDatabase
-from neo4j.exceptions import AuthError, ClientError
-
-import config_graph as gcfg
+from langchain_core.documents import Document
 
 
-_STOP = {
-    "a","an","the","and","or","of","to","in","on","for","with","by","from","at","as","is","are","was","were",
-    "be","been","being","this","that","these","those","it","its","we","you","i","they","them","their","our",
-    "paper","papers","research","author","authors","researcher","researchers","syracuse","university"
-}
-_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{2,}")
+def _safe_str(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    return s
 
 
-def _tokenize(q: str) -> List[str]:
-    if not q:
+_SPLIT_RE = re.compile(r"\s*(?:,|;|\band\b|\|)\s*", re.IGNORECASE)
+
+
+def _split_authors(s: str, limit: int = 25) -> List[str]:
+    s = _safe_str(s)
+    if not s:
         return []
-    words = [w.lower() for w in _WORD.findall(q)]
+    parts = [p.strip() for p in _SPLIT_RE.split(s) if p.strip()]
     out: List[str] = []
-    for w in words:
-        if w in _STOP:
-            continue
-        if len(w) < 3:
-            continue
-        out.append(w)
-
     seen = set()
-    dedup: List[str] = []
-    for w in out:
-        if w in seen:
+    for p in parts:
+        key = p.lower()
+        if key in seen:
             continue
-        seen.add(w)
-        dedup.append(w)
-    return dedup[:12]
+        seen.add(key)
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
 
 
-CYPHER = """
-WITH $terms AS terms, $k AS k
-
-MATCH (p:Paper)
-WHERE
-  ANY(t IN terms WHERE toLower(p.title) CONTAINS t)
-  OR ANY(t IN terms WHERE toLower(p.primary_topic) CONTAINS t)
-
-OPTIONAL MATCH (p)<-[:WROTE]-(r:Researcher)
-OPTIONAL MATCH (p)<-[:AUTHORED]-(a:Author)
-
-WITH
-  p,
-  collect(DISTINCT r.name)[0..5] AS researchers,
-  collect(DISTINCT a.name)[0..10] AS authors,
-  size([t IN terms WHERE toLower(p.title) CONTAINS t]) +
-  size([t IN terms WHERE toLower(p.primary_topic) CONTAINS t]) AS score
-
-RETURN
-  p.paper_id AS paper_id,
-  p.title AS title,
-  p.year AS year,
-  p.doi AS doi,
-  p.doi_link AS doi_link,
-  p.arxiv_id AS arxiv_id,
-  p.primary_topic AS primary_topic,
-  researchers AS researchers,
-  authors AS authors,
-  score AS score
-ORDER BY score DESC, year DESC
-LIMIT k
-"""
-
-
-def _connect():
-    return GraphDatabase.driver(gcfg.NEO4J_URI, auth=(gcfg.NEO4J_USER, gcfg.NEO4J_PASS))
-
-
-def graph_retrieve(question: str, top_k: int = None) -> Dict[str, Any]:
-    terms = _tokenize(question)
-    k = int(top_k or gcfg.GRAPH_TOP_K)
-    params = {"terms": terms, "k": k}
-
-    if not terms:
-        return {"hits": [], "cypher": CYPHER, "params": params}
-
-    driver = _connect()
-    try:
-        driver.verify_connectivity()
-        with driver.session(database=gcfg.NEO4J_DB) as s:
-            rows = list(s.run(CYPHER, **params))
-    except AuthError as e:
-        return {"hits": [], "cypher": CYPHER, "params": params, "error": f"Neo4j auth failed: {e}"}
-    except ClientError as e:
-        return {"hits": [], "cypher": CYPHER, "params": params, "error": f"Neo4j query failed: {e}"}
-    except Exception as e:
-        return {"hits": [], "cypher": CYPHER, "params": params, "error": str(e)}
-    finally:
-        try:
-            driver.close()
-        except Exception:
-            pass
-
+def paper_docs_to_graph_hits(paper_docs: List[Document], max_papers: int = 40) -> List[Dict[str, Any]]:
     hits: List[Dict[str, Any]] = []
-    for r in rows:
+    seen_pid = set()
+
+    for d in paper_docs:
+        meta = d.metadata or {}
+        pid = _safe_str(meta.get("paper_id"))
+        if not pid:
+            continue
+        if pid in seen_pid:
+            continue
+        seen_pid.add(pid)
+
         hits.append(
             {
-                "paper_id": r.get("paper_id") or "",
-                "title": r.get("title") or "",
-                "year": r.get("year"),
-                "doi": r.get("doi") or "",
-                "doi_link": r.get("doi_link") or "",
-                "arxiv_id": r.get("arxiv_id") or "",
-                "primary_topic": r.get("primary_topic") or "",
-                "researchers": r.get("researchers") or [],
-                "authors": r.get("authors") or [],
-                "score": r.get("score") or 0,
+                "paper_id": pid,
+                "title": _safe_str(meta.get("title")),
+                "researcher": _safe_str(meta.get("researcher")),
+                "authors": _safe_str(meta.get("authors")),
+                "doi": _safe_str(meta.get("doi")),
+                "year": _safe_str(meta.get("year")) or _safe_str(meta.get("publication_date")),
+                "primary_topic": _safe_str(meta.get("primary_topic")),
             }
         )
 
-    return {"hits": hits, "cypher": CYPHER, "params": params}
+        if len(hits) >= max_papers:
+            break
+
+    return hits
+
+
+def build_graph_from_hits(
+    hits: List[Dict[str, Any]],
+    height: int = 650,
+    include_topics: bool = True,
+    include_authors: bool = True,
+    max_authors_per_paper: int = 12,
+) -> Dict[str, Any]:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+
+    def add_node(node_id: str, label: str, ntype: str) -> None:
+        nodes.append({"id": node_id, "label": label, "type": ntype})
+
+    def add_edge(src: str, tgt: str, etype: str) -> None:
+        edges.append({"source": src, "target": tgt, "type": etype})
+
+    seen_nodes = set()
+    seen_edges = set()
+
+    def ensure_node(node_id: str, label: str, ntype: str) -> None:
+        key = (node_id, ntype)
+        if key in seen_nodes:
+            return
+        seen_nodes.add(key)
+        add_node(node_id, label, ntype)
+
+    def ensure_edge(src: str, tgt: str, etype: str) -> None:
+        key = (src, tgt, etype)
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        add_edge(src, tgt, etype)
+
+    for h in hits:
+        pid = _safe_str(h.get("paper_id"))
+        if not pid:
+            continue
+
+        p_title = _safe_str(h.get("title")) or f"paper {pid}"
+        paper_node = f"paper:{pid}"
+        ensure_node(paper_node, p_title, "paper")
+
+        researcher = _safe_str(h.get("researcher"))
+        if researcher:
+            r_node = f"researcher:{researcher.lower()}"
+            ensure_node(r_node, researcher, "researcher")
+            ensure_edge(r_node, paper_node, "WROTE")
+
+        if include_authors:
+            authors = _split_authors(_safe_str(h.get("authors")), limit=max_authors_per_paper)
+            for a in authors:
+                a_node = f"author:{a.lower()}"
+                ensure_node(a_node, a, "author")
+                ensure_edge(a_node, paper_node, "AUTHORED")
+
+        if include_topics:
+            topic = _safe_str(h.get("primary_topic"))
+            if topic and topic.lower() != "n/a":
+                t_node = f"topic:{topic.lower()}"
+                ensure_node(t_node, topic, "topic")
+                ensure_edge(paper_node, t_node, "HAS_TOPIC")
+
+    return {"nodes": nodes, "edges": edges, "height": height}
+
+
+def graph_retrieve_from_paper_docs(paper_docs: List[Document], height: int = 650) -> Dict[str, Any]:
+    hits = paper_docs_to_graph_hits(paper_docs)
+    graph = build_graph_from_hits(hits, height=height)
+    return {"hits": hits, "graph": graph, "error": ""}

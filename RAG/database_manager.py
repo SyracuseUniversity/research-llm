@@ -26,17 +26,8 @@ class DatabaseManager:
             DatabaseConfig(
                 mode="full",
                 chroma_dir=config.CHROMA_DIR_FULL,
-                collection=getattr(config, "CHROMA_COLLECTION_FULL", "papers_all"),
+                collection=getattr(config, "CHROMA_COLLECTION_FULL", getattr(config, "CHROMA_COLLECTION", "papers_all")),
                 description="Full text papers with metadata",
-            ),
-        )
-        self.register_config(
-            "abstracts",
-            DatabaseConfig(
-                mode="abstracts",
-                chroma_dir=getattr(config, "CHROMA_DIR_ABSTRACTS", config.CHROMA_DIR_FULL),
-                collection=getattr(config, "CHROMA_COLLECTION_ABSTRACTS", "abstracts_all"),
-                description="Abstracts only",
             ),
         )
         self.active_config_name = "full"
@@ -44,9 +35,23 @@ class DatabaseManager:
     def register_config(self, name: str, cfg: DatabaseConfig) -> None:
         self.configs[name] = cfg
 
+    def resolve_mode(self, requested_mode: str) -> str:
+        available_modes = self.list_configs()
+        if not available_modes:
+            return ""
+        req = (requested_mode or "").strip()
+        if req in self.configs:
+            return req
+        req_l = req.lower()
+        by_lower = {k.lower(): k for k in self.configs.keys()}
+        if req_l in by_lower:
+            return by_lower[req_l]
+        return available_modes[0]
+
     def switch_config(self, name: str) -> bool:
-        if name in self.configs:
-            self.active_config_name = name
+        target = self.resolve_mode(name)
+        if target:
+            self.active_config_name = target
             return True
         return False
 
