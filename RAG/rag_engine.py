@@ -53,25 +53,6 @@ def _ensure_dir(p: str) -> None:
 
 
 def _make_local_chroma_client(persist_dir: str) -> chromadb.Client:
-    """
-    Create a PersistentClient for the given directory, creating the directory
-    if it does not already exist.
-
-    Args:
-        persist_dir: Path to the Chroma persistence directory.
-
-    Returns:
-        A chromadb.PersistentClient bound to persist_dir.
-
-    Raises:
-        chromadb exceptions if the client cannot be initialised (e.g. corrupt
-        database or incompatible settings from a previous client instance).
-
-    Note:
-        PersistentClient is used consistently across the app to avoid
-        "already exists with different settings" collisions that occur when
-        mixing EphemeralClient and PersistentClient against the same directory.
-    """
     _ensure_dir(persist_dir)
     return chromadb.PersistentClient(path=persist_dir)
 
@@ -282,9 +263,7 @@ def _extract_answer_theme_keywords(answer_text: str, *, max_items: int = 6) -> L
     counts: Dict[str, int] = {}
     for tok in _tokenize_words(cleaned):
         t = tok.lower().strip()
-        if not t or len(t) < 4:
-            continue
-        if t.isdigit():
+        if not t or len(t) < 4 or t.isdigit():
             continue
         if stopset and t in stopset:
             continue
@@ -297,8 +276,7 @@ def _extract_answer_theme_keywords(answer_text: str, *, max_items: int = 6) -> L
             return [first_sentence[:180].rstrip()]
         return []
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    items = [token for token, _ in ranked]
-    return items[: max(1, max_items)]
+    return [token for token, _ in ranked][: max(1, max_items)]
 
 
 def _sanitize_entity_values(values: List[str], *, max_items: int = 8) -> List[str]:
@@ -307,14 +285,10 @@ def _sanitize_entity_values(values: List[str], *, max_items: int = 8) -> List[st
     seen = set()
     for raw in values or []:
         v = re.sub(r"\s+", " ", str(raw or "").strip())
-        if not v:
-            continue
-        if len(v) < 3:
-            continue
-        if re.fullmatch(r"[A-Z][a-z]?$", v):
+        if not v or len(v) < 3 or re.fullmatch(r"[A-Z][a-z]?$", v):
             continue
         toks = _tokenize_words(v)
-        if not toks:
+        if not toks or len(toks) > 8:
             continue
         if len(toks) == 1:
             tok = toks[0]
@@ -322,8 +296,6 @@ def _sanitize_entity_values(values: List[str], *, max_items: int = 8) -> List[st
                 continue
             if _is_generic_query_token(tok):
                 continue
-        if len(toks) > 8:
-            continue
         key = v.lower()
         if key in seen:
             continue
@@ -353,23 +325,19 @@ def build_rolling_summary(
     meta_entities: List[str] = []
     for part in re.split(r"\s*\|\s*", raw_meta):
         item = re.sub(r"\s+", " ", (part or "").strip())
-        if not item or len(item) < 3:
-            continue
-        meta_entities.append(item)
+        if item and len(item) >= 3:
+            meta_entities.append(item)
     if meta_entities:
         existing = [v for v in sections.get("Core entities", []) if v and v.strip() and v.strip() != "(none)"]
-        combined = _dedupe_ci(existing + meta_entities)
         max_items = max(1, int(getattr(settings, "summary_max_items_per_field", 6)))
-        # Keep most recent entities (drop oldest if over the limit).
-        sections["Core entities"] = combined[-max_items:]
+        sections["Core entities"] = _dedupe_ci(existing + meta_entities)[-max_items:]
 
     if a:
         existing_themes = [v for v in sections.get("Key themes", []) if v and v.strip() and v.strip() != "(none)"]
         max_items = max(1, int(getattr(settings, "summary_max_items_per_field", 6)))
         theme_keywords = _extract_answer_theme_keywords(a, max_items=max_items)
         if theme_keywords:
-            combined_themes = _dedupe_ci(existing_themes + theme_keywords)
-            sections["Key themes"] = combined_themes[-max_items:]
+            sections["Key themes"] = _dedupe_ci(existing_themes + theme_keywords)[-max_items:]
 
     if not sections.get("Constraints"):
         sections["Constraints"] = ["Use only retrieved Syracuse corpus context."]
@@ -447,26 +415,20 @@ def _regenerate_rolling_summary(
 
     if prompt_turns:
         try:
-            msgs = SUMMARY_PROMPT.format_messages(
-                old_summary=old_summary,
-                new_turns=prompt_turns,
-            )
+            msgs = SUMMARY_PROMPT.format_messages(old_summary=old_summary, new_turns=prompt_turns)
             candidate = _invoke_with_timeout(
-                llm,
-                msgs[0].content + "\n" + msgs[1].content,
-                timeout_s,
+                llm, msgs[0].content + "\n" + msgs[1].content, timeout_s,
             ).strip()
             if candidate:
                 old_summary = candidate
         except Exception:
             pass
-    summary = build_rolling_summary(
-        old_summary,
-        question,
+
+    return build_rolling_summary(
+        old_summary, question,
         " ".join([source_context or "", ner_line or ""]).strip(),
         answer_snippet,
     )
-    return summary
 
 
 def _tokenize_words(s: str) -> List[str]:
@@ -495,14 +457,9 @@ def _bootstrap_nltk_data() -> None:
         return
     _NLTK_BOOTSTRAP_ATTEMPTED = True
     for pkg in (
-        "punkt",
-        "punkt_tab",
-        "averaged_perceptron_tagger",
-        "averaged_perceptron_tagger_eng",
-        "maxent_ne_chunker",
-        "maxent_ne_chunker_tab",
-        "words",
-        "stopwords",
+        "punkt", "punkt_tab", "averaged_perceptron_tagger",
+        "averaged_perceptron_tagger_eng", "maxent_ne_chunker",
+        "maxent_ne_chunker_tab", "words", "stopwords",
     ):
         try:
             nltk.download(pkg, quiet=True)
@@ -514,7 +471,6 @@ def _get_stopword_set() -> Set[str]:
     global _NLTK_STOPWORDS_CACHE
     if _NLTK_STOPWORDS_CACHE is not None:
         return _NLTK_STOPWORDS_CACHE
-
     stopset: Set[str] = set()
     if nltk_stopwords is not None:
         try:
@@ -527,7 +483,6 @@ def _get_stopword_set() -> Set[str]:
                 stopset = set()
         except Exception:
             stopset = set()
-
     _NLTK_STOPWORDS_CACHE = stopset
     return _NLTK_STOPWORDS_CACHE
 
@@ -581,6 +536,17 @@ def _get_followup_pronoun_pattern() -> Optional[re.Pattern]:
     except re.error:
         _FOLLOWUP_PRONOUN_PATTERN_CACHE = None
     return _FOLLOWUP_PRONOUN_PATTERN_CACHE
+
+
+_ANCHOR_ESCAPE_PATTERN = re.compile(
+    r"\b(who else|what else|other (researchers?|faculty|people|authors?|scientists?)"
+    r"|others|besides|apart from|different (from|researcher|faculty)|not .{0,30} but)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_anchor_escape_question(question: str) -> bool:
+    return bool(_ANCHOR_ESCAPE_PATTERN.search(question or ""))
 
 
 def _is_followup_coref_question(question: str) -> bool:
@@ -692,9 +658,7 @@ def _extract_entities_nltk(raw: str, *, max_items: int = 6) -> Optional[Dict[str
             if not re.fullmatch(r"[A-Za-z][A-Za-z\-']*", tok):
                 continue
             t = tok.lower()
-            if len(t) < 4:
-                continue
-            if t in stopset or t in blocked_tokens:
+            if len(t) < 4 or t in stopset or t in blocked_tokens:
                 continue
             counts[t] = counts.get(t, 0) + 1
 
@@ -723,17 +687,13 @@ def _extract_entities_basic(text: str, *, max_items: int = 6) -> Dict[str, List[
     if not raw.strip():
         return {"people": [], "orgs": [], "entities": [], "topics": []}
     extracted = _extract_entities_nltk(raw, max_items=max_items)
-    if extracted is not None:
-        out = extracted
-    else:
-        out = _extract_entities_regex(raw, max_items=max_items)
-    cleaned: Dict[str, List[str]] = {}
-    cleaned["people"] = _sanitize_entity_values(out.get("people") or [], max_items=max_items)
-    cleaned["orgs"] = _sanitize_entity_values(out.get("orgs") or [], max_items=max_items)
-    cleaned["entities"] = _sanitize_entity_values(out.get("entities") or [], max_items=max_items)
-    topics = [t for t in (out.get("topics") or []) if t and not _is_generic_query_token(t)]
-    cleaned["topics"] = _dedupe_ci(topics)[:max_items]
-    return cleaned
+    out = extracted if extracted is not None else _extract_entities_regex(raw, max_items=max_items)
+    return {
+        "people": _sanitize_entity_values(out.get("people") or [], max_items=max_items),
+        "orgs": _sanitize_entity_values(out.get("orgs") or [], max_items=max_items),
+        "entities": _sanitize_entity_values(out.get("entities") or [], max_items=max_items),
+        "topics": _dedupe_ci([t for t in (out.get("topics") or []) if t and not _is_generic_query_token(t)])[:max_items],
+    }
 
 
 def _build_ner_context_text(docs: List[Document], max_docs: int = 12) -> str:
@@ -768,8 +728,6 @@ def _has_explicit_entity_signal(question: str, ents: Optional[Dict[str, List[str
     data = ents if ents is not None else _extract_entities_basic(q, max_items=4)
     if data.get("people") or data.get("orgs") or data.get("entities"):
         return True
-    # Topic-only extraction can be noisy; require a minimum number of
-    # non-generic terms before treating the query as having an entity signal.
     topic_tokens = [t for t in data.get("topics", []) if not _is_generic_query_token(t)]
     min_terms = int(getattr(settings, "retrieval_topic_min_terms", 2))
     return len(topic_tokens) >= max(1, min_terms)
@@ -797,24 +755,18 @@ def _extract_person_name(question: str) -> str:
 
     def pick(ents: Dict[str, List[str]]) -> str:
         for cand in ents.get("people", []) or []:
-            if not _looks_like_person_candidate(cand):
-                continue
-            if len(cand) < 2:
-                continue
-            return cand
+            if _looks_like_person_candidate(cand) and len(cand) >= 2:
+                return cand
         return ""
 
     ents = _extract_entities_basic(raw, max_items=4)
     name = pick(ents)
     if name:
         return name
-
-    # Try a title-cased variant to handle lower-case queries.
     title_raw = " ".join(
         w.capitalize() if w.islower() else w for w in re.split(r"\s+", raw) if w
     )
-    ents2 = _extract_entities_basic(title_raw, max_items=4)
-    return pick(ents2)
+    return pick(_extract_entities_basic(title_raw, max_items=4))
 
 
 def _strip_prompt_leak(answer: str) -> str:
@@ -822,37 +774,38 @@ def _strip_prompt_leak(answer: str) -> str:
     if not a:
         return a
     leak_markers = [
-        "papers:",
-        "paper context:",
-        "context:",
-        "question:",
-        "system:",
-        "user:",
-        "assistant:",
-        "[paper",
-        "[mem",
-        "[recent",
-        "[summary",
+        "papers:", "paper context:", "context:", "question:",
+        "system:", "user:", "assistant:",
+        "[paper", "[mem", "[recent", "[summary",
     ]
     lower = a.lower()
     if any(m in lower for m in leak_markers):
-        lines = [ln.strip() for ln in a.splitlines()]
-        kept: List[str] = []
-        for ln in lines:
-            lnl = ln.lower()
-            if any(m in lnl for m in leak_markers):
-                continue
-            kept.append(ln)
+        kept = [ln.strip() for ln in a.splitlines() if not any(m in ln.lower() for m in leak_markers)]
         a = "\n".join([k for k in kept if k]).strip()
-    a = re.sub(r"\n{3,}", "\n\n", a).strip()
-    return a
+    return re.sub(r"\n{3,}", "\n\n", a).strip()
+
+
+_DEGENERATE_ANSWER_PATTERNS = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"[\w\s\.\,\-]+ is a researcher[\.\s]*"
+    r"|[\w\s\.\,\-]+ is an? \w+[\.\s]*"
+    r"|I (could not|couldn't|cannot|can't) (find|generate|provide|answer)"
+    r")"
+    r"\s*$",
+    re.IGNORECASE,
+)
 
 
 def _answer_is_bad(answer: str) -> bool:
     a = (answer or "").strip()
     if not a:
         return True
-    return len(_tokenize_words(a)) < 3
+    if len(_tokenize_words(a)) < 20:
+        return True
+    if _DEGENERATE_ANSWER_PATTERNS.match(a):
+        return True
+    return False
 
 
 def _extract_focus_from_question(question: str) -> str:
@@ -879,8 +832,7 @@ def _is_invalid_focus_value(text: str) -> bool:
         return True
     if max((len(t) for t in toks), default=0) < 3:
         return True
-    meaningful = [t for t in toks if not _is_generic_query_token(t)]
-    return not meaningful
+    return not [t for t in toks if not _is_generic_query_token(t)]
 
 
 def _query_is_short_or_pronoun(question: str) -> bool:
@@ -901,18 +853,8 @@ def _is_placeholder_anchor_value(value: str) -> bool:
     if not compact:
         return True
     if compact in {
-        "na",
-        "nslasha",
-        "unknown",
-        "none",
-        "null",
-        "nil",
-        "empty",
-        "unspecified",
-        "notavailable",
-        "notapplicable",
-        "notprovided",
-        "tbd",
+        "na", "nslasha", "unknown", "none", "null", "nil", "empty",
+        "unspecified", "notavailable", "notapplicable", "notprovided", "tbd",
     }:
         return True
     return False
@@ -961,14 +903,11 @@ def _inject_anchor_into_query(question: str, anchor_value: str) -> str:
         r"\b(him|her|them|they|it|this|that|those|these|he|she|his|hers|their|there)\b",
         re.IGNORECASE,
     )
-    replaced = pronoun_re.sub(anchor, q, count=1)
-    replaced = re.sub(r"\s+", " ", replaced).strip()
+    replaced = re.sub(r"\s+", " ", pronoun_re.sub(anchor, q, count=1)).strip()
     if _anchor_in_text(anchor, replaced):
         return replaced
     stem = q.rstrip(" ?")
-    if not stem:
-        return anchor
-    return f"{stem} for {anchor}?"
+    return f"{stem} for {anchor}?" if stem else anchor
 
 
 def _anchor_support_ratio(anchor_value: str, docs: List[Document]) -> float:
@@ -978,11 +917,7 @@ def _anchor_support_ratio(anchor_value: str, docs: List[Document]) -> float:
     hits = 0
     for d in docs:
         meta = d.metadata or {}
-        meta_parts: List[str] = []
-        for v in meta.values():
-            if isinstance(v, (list, dict, tuple, set)):
-                continue
-            meta_parts.append(str(v or ""))
+        meta_parts = [str(v or "") for v in meta.values() if not isinstance(v, (list, dict, tuple, set))]
         hay = " ".join(meta_parts + [str(d.page_content or "")])
         if _anchor_in_text(anchor, hay):
             hits += 1
@@ -1020,7 +955,6 @@ class _DirectGenerationLLM:
         p = str(prompt or "")
         if not p:
             return ""
-
         max_new_tokens = int(self.generation_kwargs.get("max_new_tokens", 256))
         max_ctx = int(
             getattr(self.model.config, "max_position_embeddings", 0)
@@ -1028,12 +962,7 @@ class _DirectGenerationLLM:
             or 4096
         )
         max_input_tokens = max(64, max_ctx - max_new_tokens - 16)
-        enc = self.tokenizer(
-            p,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_input_tokens,
-        )
+        enc = self.tokenizer(p, return_tensors="pt", truncation=True, max_length=max_input_tokens)
         if torch.cuda.is_available():
             enc = {k: v.to("cuda:0") for k, v in enc.items()}
 
@@ -1051,16 +980,13 @@ class _DirectGenerationLLM:
             if top_p is not None:
                 gen_kwargs["top_p"] = float(top_p)
 
-        # Use autocast on GPU for throughput; note that determinism depends
-        # on the CUDA version and hardware architecture.
         ctx = torch.autocast("cuda", dtype=torch.float16) if torch.cuda.is_available() else nullcontext()
         with torch.no_grad():
             with ctx:
                 out = self.model.generate(**enc, **gen_kwargs)
 
         prompt_len = int(enc["input_ids"].shape[1])
-        gen_ids = out[0][prompt_len:]
-        return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        return self.tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
 
 
 class ModelRuntime:
@@ -1077,30 +1003,21 @@ class ModelRuntime:
             raise RuntimeError("CUDA is required but torch.cuda.is_available() is False")
 
         self.model_id_or_path = model_id_or_path
-
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id_or_path,
-            local_files_only=True,
-            use_fast=True,
+            model_id_or_path, local_files_only=True, use_fast=True,
         )
-
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
             dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            local_files_only=True,
-            low_cpu_mem_usage=False,
-            device_map=None,
+            local_files_only=True, low_cpu_mem_usage=False, device_map=None,
         )
-
         if torch.cuda.is_available():
             self.model.to("cuda:0")
         self.model.eval()
 
-        # Keep generation kwargs explicit to avoid ignored-parameter warnings
-        # when sampling is disabled.
         self.generation_kwargs: Dict[str, Any] = {
             "max_new_tokens": int(max_new_tokens),
             "do_sample": bool(do_sample),
@@ -1111,7 +1028,6 @@ class ModelRuntime:
             if top_p is not None:
                 self.generation_kwargs["top_p"] = float(top_p)
 
-        # Some model configs ship sampling params by default; clear them for greedy decode.
         if not do_sample:
             try:
                 self.model.generation_config.temperature = None
@@ -1120,24 +1036,16 @@ class ModelRuntime:
                 pass
 
         self.llm = _DirectGenerationLLM(
-            model=self.model,
-            tokenizer=self.tokenizer,
+            model=self.model, tokenizer=self.tokenizer,
             generation_kwargs=self.generation_kwargs,
         )
 
     def close(self) -> None:
-        try:
-            del self.llm
-        except Exception:
-            pass
-        try:
-            del self.model
-        except Exception:
-            pass
-        try:
-            del self.tokenizer
-        except Exception:
-            pass
+        for attr in ("llm", "model", "tokenizer"):
+            try:
+                delattr(self, attr)
+            except Exception:
+                pass
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1167,41 +1075,46 @@ def _truncate_text(text: str, limit: int) -> str:
     return cut + "." if cut else text[:limit].strip()
 
 
+def _clean_snippet(meta: Dict[str, Any], text: str, *, limit: int) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    title = str((meta or {}).get("title", "") or "").strip()
+    authors = str((meta or {}).get("authors", "") or "").strip()
+    lowered = raw.lower()
+    for value in (title, authors):
+        v = str(value or "").strip()
+        if not v:
+            continue
+        if lowered.startswith(v.lower()):
+            raw = raw[len(v):].lstrip(" \n\t:-|")
+            lowered = raw.lower()
+    first_line = raw.splitlines()[0].strip() if raw.splitlines() else ""
+    if first_line.count(",") >= 6 and len(first_line) <= 240:
+        raw = "\n".join(raw.splitlines()[1:]).strip()
+    return _truncate_text(re.sub(r"\s+", " ", raw).strip(), limit)
+
+
 def format_docs_compact(docs: List[Document], *, max_docs: int, text_limit: int) -> str:
     blocks: List[str] = []
     for d in docs[:max_docs]:
         meta = d.metadata or {}
-        title = meta.get("title", "")
-        authors = meta.get("authors", "")
-        year = meta.get("year", meta.get("publication_date", ""))
-        text = _truncate_text(d.page_content or "", text_limit)
-        blocks.append(
-            "\n".join(
-                [
-                    f"Title: {title}",
-                    f"Authors: {authors}",
-                    f"Year: {year}",
-                    f"Snippet: {text}",
-                ]
-            )
-        )
+        text = _clean_snippet(meta, d.page_content or "", limit=text_limit)
+        blocks.append("\n".join([
+            f"Title: {meta.get('title', '')}",
+            f"Authors: {meta.get('authors', '')}",
+            f"Year: {meta.get('year', meta.get('publication_date', ''))}",
+            f"Snippet: {text}",
+        ]))
     return "\n\n".join(blocks)
 
 
 class _TransformerMeanEmbeddings:
     def __init__(self, model_name: str, device: str) -> None:
         self.model_name = model_name
-        self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            local_files_only=True,
-            use_fast=True,
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
         self.model = AutoModel.from_pretrained(
-            model_name,
-            local_files_only=True,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=False,
+            model_name, local_files_only=True, torch_dtype=torch.float32, low_cpu_mem_usage=False,
         )
         if device == "cuda" and torch.cuda.is_available():
             self.model.to("cuda:0")
@@ -1215,30 +1128,17 @@ class _TransformerMeanEmbeddings:
         if not texts:
             return []
         out: List[List[float]] = []
-        batch_size = 32
-        for i in range(0, len(texts), batch_size):
-            batch = [str(t or "") for t in texts[i : i + batch_size]]
-            enc = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            if self.device == "cuda":
-                enc = {k: v.to("cuda:0") for k, v in enc.items()}
-            else:
-                enc = {k: v.to("cpu") for k, v in enc.items()}
-
+        for i in range(0, len(texts), 32):
+            batch = [str(t or "") for t in texts[i: i + 32]]
+            enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+            dev = "cuda:0" if self.device == "cuda" else "cpu"
+            enc = {k: v.to(dev) for k, v in enc.items()}
             with torch.no_grad():
                 hidden = self.model(**enc).last_hidden_state
                 mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
                 summed = (hidden * mask).sum(dim=1)
-                denom = mask.sum(dim=1).clamp_min(1e-9)
-                pooled = summed / denom
-                pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-                vectors = pooled.detach().cpu().tolist()
-                out.extend(vectors)
+                pooled = torch.nn.functional.normalize(summed / mask.sum(dim=1).clamp_min(1e-9), p=2, dim=1)
+                out.extend(pooled.detach().cpu().tolist())
         return out
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -1256,13 +1156,8 @@ def build_embeddings() -> Any:
         return HuggingFaceEmbeddings(
             model_name=config.EMBED_MODEL,
             model_kwargs={
-                "device": device,
-                "local_files_only": True,
-                "trust_remote_code": False,
-                "model_kwargs": {
-                    "low_cpu_mem_usage": False,
-                    "torch_dtype": torch.float32,
-                },
+                "device": device, "local_files_only": True, "trust_remote_code": False,
+                "model_kwargs": {"low_cpu_mem_usage": False, "torch_dtype": torch.float32},
             },
             encode_kwargs={"normalize_embeddings": True, "batch_size": 128},
         )
@@ -1271,7 +1166,7 @@ def build_embeddings() -> Any:
         return _make(preferred)
     except Exception as exc:
         if preferred != "cuda":
-            _dbg("[EMBED] primary init failed; trying transformer mean-pooling fallback", repr(exc))
+            _dbg("[EMBED] primary init failed; trying fallback", repr(exc))
             try:
                 return _TransformerMeanEmbeddings(config.EMBED_MODEL, "cpu")
             except Exception:
@@ -1280,7 +1175,7 @@ def build_embeddings() -> Any:
         try:
             return _make("cpu")
         except Exception as cpu_exc:
-            _dbg("[EMBED] cpu sentence-transformers init failed; trying transformer mean-pooling fallback", repr(cpu_exc))
+            _dbg("[EMBED] cpu init failed; trying fallback", repr(cpu_exc))
             return _TransformerMeanEmbeddings(config.EMBED_MODEL, "cpu")
 
 
@@ -1301,74 +1196,73 @@ def _resolve_llm_path(llm_model_key: str) -> str:
     return config.LLAMA_3B
 
 
-MEMORY_EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Return JSON only with keys facts, decisions, preferences, tasks. "
-            "Each value is a list of {\"text\": str, \"salience\": 1-5}. "
-            "No extra keys. No prose.",
-        ),
-        ("human", "User:\n{user}\n\nAssistant:\n{assistant}"),
-    ]
-)
+MEMORY_EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "Return JSON only with keys facts, decisions, preferences, tasks. "
+        "Each value is a list of {\"text\": str, \"salience\": 1-5}. "
+        "No extra keys. No prose.",
+    ),
+    ("human", "User:\n{user}\n\nAssistant:\n{assistant}"),
+])
 
-SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Update the running conversation summary.\n"
-            "Return ONLY this template and keep it concise:\n"
-            "Current focus:\n- ...\n"
-            "Core entities:\n- ...\n"
-            "Key themes:\n- ...\n"
-            "Constraints:\n- ...\n"
-            "Open questions:\n- ...\n"
-            "Use factual statements only from user question, retrieved metadata, and final answer. "
-            "Do not include raw copied blocks or partial NER fragments.",
-        ),
-        ("human", "Summary so far:\n{old_summary}\n\nNew turns:\n{new_turns}"),
-    ]
-)
+SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "Update the running conversation summary.\n"
+        "Return ONLY this template and keep it concise:\n"
+        "Current focus:\n- ...\n"
+        "Core entities:\n- ...\n"
+        "Key themes:\n- ...\n"
+        "Constraints:\n- ...\n"
+        "Open questions:\n- ...\n"
+        "Use factual statements only from user question, retrieved metadata, and final answer. "
+        "Do not include raw copied blocks or partial NER fragments.",
+    ),
+    ("human", "Summary so far:\n{old_summary}\n\nNew turns:\n{new_turns}"),
+])
 
-REWRITE_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Rewrite the user question into a standalone question for retrieval.\n"
-            "Use rolling summary and recent turns to resolve pronouns and omitted context.\n"
-            "If anchor_value is provided, use it to resolve referential language.\n"
-            "Keep concrete entities, dates, venues, paper ids, and constraints.\n"
-            "Do not answer the question.\n"
-            "Return JSON only with key: standalone_question.\n"
-            "If no rewrite is needed, standalone_question should equal the user question.\n"
-            "For pronoun or referential follow-ups, standalone_question must include anchor_value when available.\n"
-            "Example: \"what field does he study\" -> "
-            "{\"standalone_question\":\"What field does William Gearty study based on the retrieved papers\"}",
-        ),
-        (
-            "human",
-            "Anchor value:\n{anchor_value}\n\nRolling summary:\n{rolling_summary}\n\nRecent turns:\n{recent_turns}\n\nUser question:\n{question}",
-        ),
-    ]
-)
+REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "Rewrite the user question into a standalone question for retrieval.\n"
+        "Use rolling summary and recent turns to resolve pronouns and omitted context.\n"
+        "If anchor_value is provided, use it to resolve referential language.\n"
+        "Keep concrete entities, dates, venues, paper ids, and constraints.\n"
+        "Do not answer the question.\n"
+        "Return JSON only with key: standalone_question.\n"
+        "If no rewrite is needed, standalone_question should equal the user question.\n"
+        "For pronoun or referential follow-ups, standalone_question must include anchor_value when available.\n"
+        "Example: \"what field does he study\" -> "
+        "{\"standalone_question\":\"What field does William Gearty study based on the retrieved papers\"}",
+    ),
+    (
+        "human",
+        "Anchor value:\n{anchor_value}\n\nRolling summary:\n{rolling_summary}\n\n"
+        "Recent turns:\n{recent_turns}\n\nUser question:\n{question}",
+    ),
+])
 
-ANSWER_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Answer only using the provided Syracuse corpus papers text.\n"
-            "Do not suggest external websites, databases, or sources.\n"
-            "Every major claim must be anchored to at least one retrieved paper title.\n"
-            "Do not answer with only a list of titles. Synthesize first.\n"
-            "If papers were retrieved, produce the best-supported answer. "
-            "Use insufficient-information refusal only when zero relevant papers are retrieved.\n"
-            "If field or role is not explicitly stated, infer it from repeated terms in titles/summaries and mark it as inferred.\n"
-            "Choose output structure by detected intent category (default, comparison, list, time_range).",
-        ),
-        ("human", "Papers:\n{papers}\n\nQuestion:\n{question}"),
-    ]
-)
+ANSWER_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "Answer only using the provided Syracuse corpus papers text.\n"
+        "Each paper record may contain a pre-written abstract or summary — treat these as "
+        "authoritative and report their content faithfully rather than paraphrasing loosely.\n"
+        "Do not suggest external websites, databases, or sources.\n"
+        "Every major claim must be anchored to at least one retrieved paper title.\n"
+        "Do not answer with only a list of titles. Synthesize first.\n"
+        "IMPORTANT: You must produce a substantive answer of at least 3-5 sentences.\n"
+        "Never respond with only a single sentence such as '[Name] is a researcher.' — "
+        "always describe the specific research topics, methods, or findings shown in the papers.\n"
+        "If papers were retrieved, produce the best-supported answer. "
+        "Use insufficient-information refusal only when zero relevant papers are retrieved.\n"
+        "If field or role is not explicitly stated, infer it from repeated terms in titles/summaries and mark it as inferred.\n"
+        "When identifying a person, list their key research themes with paper evidence.\n"
+        "Choose output structure by detected intent category (default, comparison, list, time_range).",
+    ),
+    ("human", "Papers:\n{papers}\n\nQuestion:\n{question}"),
+])
 
 
 @dataclass
@@ -1388,25 +1282,16 @@ class UtilityJob:
 
 
 class UtilityWorker:
-    def __init__(
-        self,
-        *,
-        store: SessionStore,
-        memory_vs: Chroma,
-        runtime: ModelRuntime,
-        answer_generation_lock: Optional[threading.Lock] = None,
-    ):
+    def __init__(self, *, store: SessionStore, memory_vs: Chroma, runtime: ModelRuntime):
         self.store = store
         self.memory_vs = memory_vs
         self.runtime = runtime
-        self.answer_generation_lock = answer_generation_lock
-
+        self._utility_lock = threading.Lock()
         self.q: "queue.Queue[UtilityJob]" = queue.Queue(
             maxsize=int(getattr(settings, "utility_queue_max", 2000))
         )
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="utility-worker", daemon=True)
-
         self._io_lock = threading.Lock()
         self._memory_add_counter = 0
 
@@ -1468,44 +1353,27 @@ class UtilityWorker:
         metas: List[Dict[str, Any]] = []
         seen_text = set()
 
-        def _compact_memory_text(text: str, limit: int = 220) -> str:
-            compact = re.sub(r"\s+", " ", str(text or "").strip())
-            if len(compact) <= limit:
-                return compact
-            return compact[:limit].rsplit(" ", 1)[0].strip()
+        def _compact(text: str, limit: int = 220) -> str:
+            c = re.sub(r"\s+", " ", str(text or "").strip())
+            return c if len(c) <= limit else c[:limit].rsplit(" ", 1)[0].strip()
 
         def add(key: str) -> None:
-            items = data.get(key, [])
-            if not isinstance(items, list):
-                return
-            for obj in items[:20]:
+            for obj in (data.get(key, []) or [])[:20]:
                 if not isinstance(obj, dict):
                     continue
-                text = _compact_memory_text(obj.get("text") or "")
-                if not text:
+                text = _compact(obj.get("text") or "")
+                if not text or text.lower() in seen_text:
                     continue
-                text_key = text.lower()
-                if text_key in seen_text:
-                    continue
-                seen_text.add(text_key)
+                seen_text.add(text.lower())
                 try:
-                    sal = int(obj.get("salience") or 3)
+                    sal = max(1, min(5, int(obj.get("salience") or 3)))
                 except Exception:
                     sal = 3
-                sal = max(1, min(5, sal))
                 texts.append(text)
-                metas.append(
-                    {
-                        "type": key,
-                        "salience": sal,
-                        "session_id": session_id,
-                    }
-                )
+                metas.append({"type": key, "salience": sal, "session_id": session_id})
 
-        add("facts")
-        add("decisions")
-        add("preferences")
-        add("tasks")
+        for k in ("facts", "decisions", "preferences", "tasks"):
+            add(k)
 
         if not texts:
             return
@@ -1541,12 +1409,9 @@ class UtilityWorker:
         turns = state.get("turns", []) or []
         if bool(getattr(settings, "enable_llm_summary_regen", False)):
             rolling_summary = _regenerate_rolling_summary(
-                llm=self.runtime.llm,
-                old_summary=old_summary,
-                new_turns_text=new_turns_text,
-                question=question,
-                ner_line=ner_line,
-                source_context=retrieval_meta_text,
+                llm=self.runtime.llm, old_summary=old_summary,
+                new_turns_text=new_turns_text, question=question,
+                ner_line=ner_line, source_context=retrieval_meta_text,
                 no_results=no_results,
                 timeout_s=int(getattr(settings, "llm_timeout_s", 40)),
             )
@@ -1558,12 +1423,10 @@ class UtilityWorker:
             if not answer_snippet:
                 answer_snippet = re.sub(r"\s+", " ", new_turns_text or "").strip()
             rolling_summary = build_rolling_summary(
-                old_summary,
-                question,
+                old_summary, question,
                 " ".join([retrieval_meta_text or "", ner_line or ""]).strip(),
                 assistant_answer=answer_snippet,
             )
-
         self.store.save(session_id, rolling_summary, turns)
 
     def _append_turns_locked(
@@ -1579,43 +1442,28 @@ class UtilityWorker:
         turns = state.get("turns", []) or []
         turns.append({"role": "user", "text": user_text})
         turns.append({"role": "assistant", "text": assistant_text})
-        extra = None
-        if last_focus is not None or last_topic is not None:
-            extra = {}
-            if last_focus is not None:
-                extra["last_focus"] = last_focus
-            if last_topic is not None:
-                extra["last_topic"] = last_topic
-        if extra is None:
-            extra = {}
+        extra: Dict[str, Any] = {}
+        if last_focus is not None:
+            extra["last_focus"] = last_focus
+        if last_topic is not None:
+            extra["last_topic"] = last_topic
         self.store.save(session_id, rolling_summary, turns, extra_state=extra)
 
     def _process(self, job: UtilityJob) -> None:
-        lock_ctx = nullcontext()
-        if self.answer_generation_lock is not None and not bool(
-            getattr(settings, "allow_utility_concurrency", False)
-        ):
-            lock_ctx = self.answer_generation_lock
-        with lock_ctx:
+        with self._utility_lock:
             with self._io_lock:
                 if not job.turns_already_persisted:
                     self._append_turns_locked(
-                        job.session_id,
-                        job.user_text,
-                        job.assistant_text,
-                        job.last_focus,
-                        job.last_topic,
+                        job.session_id, job.user_text, job.assistant_text,
+                        job.last_focus, job.last_topic,
                     )
                 if job.run_memory_extract:
                     self._extract_memory_locked(job.session_id, job.user_text, job.assistant_text)
                 if job.run_summary:
                     self._update_summary_locked(
-                        job.session_id,
-                        job.new_turns_text,
-                        no_results=job.no_results,
-                        question=job.user_text,
-                        ner_line=job.ner_line,
-                        retrieval_meta_text=job.retrieval_meta_text,
+                        job.session_id, job.new_turns_text,
+                        no_results=job.no_results, question=job.user_text,
+                        ner_line=job.ner_line, retrieval_meta_text=job.retrieval_meta_text,
                     )
 
 
@@ -1657,6 +1505,7 @@ class Engine:
         self.last_answer_llm_calls = 0
         self.last_utility_llm_calls = 0
         self.turns: List[Turn] = []
+
         if not self.stateless:
             state = self.store.load(session_id)
             self.last_focus = (state.get("last_focus", "") or "").strip()
@@ -1680,8 +1529,7 @@ class Engine:
             return ""
         rows: List[str] = []
         for t in self.turns[-max_turns:]:
-            role = "User" if t.role == "user" else "Assistant"
-            rows.append(f"{role}: {t.text}")
+            rows.append(f"{'User' if t.role == 'user' else 'Assistant'}: {t.text}")
         return "\n".join(rows).strip()
 
     def _last_user_turn_text(self) -> str:
@@ -1692,14 +1540,10 @@ class Engine:
 
     def _rewrite_query_structured(self, question: str, *, anchor_value: str = "") -> Dict[str, Any]:
         q = (question or "").strip()
-        max_recent = int(getattr(settings, "rewrite_max_recent_turns", 3))
-        max_recent = max(1, min(3, max_recent))
+        max_recent = max(1, min(3, int(getattr(settings, "rewrite_max_recent_turns", 3))))
         timeout_s = int(getattr(settings, "rewrite_timeout_s", 10))
         max_chars = int(getattr(settings, "rewrite_max_chars", 220))
-        recent_turns = self._recent_turns_text(max_recent)
-        fallback = {
-            "standalone_question": q,
-        }
+        fallback = {"standalone_question": q}
         if not bool(getattr(settings, "rewrite_enable", True)):
             return fallback
         runtime = self.utility_runtime
@@ -1708,15 +1552,11 @@ class Engine:
         try:
             msgs = REWRITE_PROMPT.format_messages(
                 rolling_summary=self.rolling_summary or "",
-                recent_turns=recent_turns or "",
+                recent_turns=self._recent_turns_text(max_recent) or "",
                 question=question,
                 anchor_value=anchor_value or "(none)",
             )
-            raw = _invoke_with_timeout(
-                runtime.llm,
-                msgs[0].content + "\n" + msgs[1].content,
-                timeout_s,
-            )
+            raw = _invoke_with_timeout(runtime.llm, msgs[0].content + "\n" + msgs[1].content, timeout_s)
             self.last_utility_llm_calls += 1
             txt = str(raw or "").strip()
             m = re.search(r"\{.*\}", txt, re.DOTALL)
@@ -1740,17 +1580,36 @@ class Engine:
         if not q:
             return q
 
+        # Explicit topic-shift / broadening phrases — never inject anchor.
+        if _is_anchor_escape_question(q):
+            return q
+
+        word_count = len(_tokenize_words(q))
         max_words = max(1, int(getattr(settings, "followup_query_max_words", 8)))
-        is_short = len(_tokenize_words(q)) < max_words
+        is_short = word_count < max_words
         pronoun_pat = _get_followup_pronoun_pattern()
         has_pronoun = pronoun_pat is not None and pronoun_pat.search(q) is not None
         lowered = q.lower()
         has_followup_phrase = any(p and p in lowered for p in _get_followup_phrases())
         is_referential = bool(has_pronoun or has_followup_phrase)
-        self.last_rewrite_referential = is_referential
+
+        # An explicit acronym, named topic, or "about X" phrase signals a new
+        # topic — but only skip rewriting when the query is also long enough to
+        # be self-contained. Short queries like "tell me more about LIGO"
+        # (5 words, below max_words=8) still need the anchor injected so the
+        # retrieval stays scoped to the current researcher.
+        explicit_acronym = re.search(r"\b[A-Z]{2,}\b", q) is not None
+        explicit_about = bool(re.search(r"\babout\s+\w+", q, flags=re.IGNORECASE))
+        explicit_named_topic = bool(re.search(r"\b(paleontology|ligo|virgo|kagra)\b", q, flags=re.IGNORECASE))
+        is_long_enough_to_bypass = word_count >= max_words
+
+        if is_long_enough_to_bypass and (explicit_acronym or explicit_named_topic or explicit_about):
+            return q
 
         if not (is_short or has_pronoun or has_followup_phrase):
             return q
+
+        self.last_rewrite_referential = is_referential
 
         anchor_data = _normalize_anchor(self.anchor)
         anchor_value = str(anchor_data.get("value", "") or "").strip() if _anchor_is_stable(anchor_data) else ""
@@ -1764,7 +1623,9 @@ class Engine:
 
     def _log_retrieval_state(self, *, where_filter: Optional[Dict[str, Any]]) -> None:
         collection = getattr(self.papers_vs, "_collection", None)
-        collection_name = str(getattr(collection, "name", "") or getattr(collection, "_name", "") or "").strip()
+        collection_name = str(
+            getattr(collection, "name", "") or getattr(collection, "_name", "") or ""
+        ).strip()
         collection_count = -1
         if collection is not None:
             try:
@@ -1774,18 +1635,13 @@ class Engine:
         filter_json = json.dumps(where_filter, ensure_ascii=False) if where_filter else "{}"
         print(f"[RETRIEVE] collection={collection_name or '(unknown)'} count={collection_count} filter={filter_json}")
         if collection_count == 0:
-            print(
-                "[RETRIEVE] WARNING: collection count is zero. "
-                "Check persist directory, collection name, and ingestion/retrieval embedding match."
-            )
+            print("[RETRIEVE] WARNING: collection count is zero.")
 
     def _embed_query_vector(self, query: str) -> Optional[List[float]]:
         q = (query or "").strip()
         if not q:
             return None
-        ef = getattr(self.papers_vs, "_embedding_function", None)
-        if ef is None:
-            ef = getattr(self.papers_vs, "embedding_function", None)
+        ef = getattr(self.papers_vs, "_embedding_function", None) or getattr(self.papers_vs, "embedding_function", None)
         try:
             if hasattr(ef, "embed_query"):
                 vec = ef.embed_query(q)
@@ -1821,9 +1677,9 @@ class Engine:
             ]
             if where_filter:
                 for base in list(variants):
-                    with_filter = dict(base)
-                    with_filter["filter"] = where_filter
-                    variants.insert(0, with_filter)
+                    wf = dict(base)
+                    wf["filter"] = where_filter
+                    variants.insert(0, wf)
             for kwargs in variants:
                 try:
                     got = method(**kwargs)
@@ -1840,9 +1696,9 @@ class Engine:
             ]
             if where_filter:
                 for base in list(variants):
-                    with_filter = dict(base)
-                    with_filter["filter"] = where_filter
-                    variants.insert(0, with_filter)
+                    wf = dict(base)
+                    wf["filter"] = where_filter
+                    variants.insert(0, wf)
             for kwargs in variants:
                 try:
                     got = method(**kwargs)
@@ -1878,8 +1734,7 @@ class Engine:
                     total = int(col.count())
                 except Exception:
                     total = 0
-            if total <= 0:
-                total = max(k, fk, 10000)
+            total = total or max(k, fk, 10000)
             if k <= 0:
                 k = total
             if fk <= 0:
@@ -1888,29 +1743,17 @@ class Engine:
             fk = max(fk, 2 * k)
         lm = float(lambda_mult if lambda_mult is not None else getattr(settings, "mmr_lambda", 0.4))
         lm = max(0.3, min(0.5, lm))
-        search_kwargs: Dict[str, Any] = {
-            "k": k,
-            "fetch_k": fk,
-            "lambda_mult": lm,
-        }
+        search_kwargs: Dict[str, Any] = {"k": k, "fetch_k": fk, "lambda_mult": lm}
         if query_embedding:
             vect_docs = self._vector_retrieve_docs(
-                self.papers_vs,
-                query_embedding=query_embedding,
-                k=k,
-                fetch_k=fk,
-                lambda_mult=lm,
-                where_filter=where_filter,
-                prefer_mmr=True,
+                self.papers_vs, query_embedding=query_embedding, k=k, fetch_k=fk,
+                lambda_mult=lm, where_filter=where_filter, prefer_mmr=True,
             )
             if isinstance(vect_docs, list):
                 return vect_docs
         if where_filter:
             search_kwargs["filter"] = where_filter
-        retriever = self.papers_vs.as_retriever(
-            search_type="mmr",
-            search_kwargs=search_kwargs,
-        )
+        retriever = self.papers_vs.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
         return retriever.invoke(query)
 
     def _merge_unique_docs(self, docs_a: List[Document], docs_b: List[Document]) -> List[Document]:
@@ -1928,17 +1771,11 @@ class Engine:
         return merged
 
     def _rerank_papers_with_llm(self, query: str, docs: List[Document]) -> List[Document]:
-        if not bool(getattr(settings, "rerank_enable", True)):
+        if not bool(getattr(settings, "rerank_enable", True)) or self.utility_runtime is None or not docs:
             return docs
-        if self.utility_runtime is None:
-            return docs
-        if not docs:
-            return docs
-
         cand_k = max(1, int(getattr(settings, "rerank_candidate_k", 30)))
         final_k = max(1, int(getattr(settings, "rerank_final_k", 12)))
         timeout_s = max(1, int(getattr(settings, "rerank_timeout_s", 12)))
-
         candidates = list(docs[:cand_k])
         if len(candidates) <= final_k:
             return candidates
@@ -1946,21 +1783,14 @@ class Engine:
         rows: List[str] = []
         for idx, d in enumerate(candidates):
             meta = d.metadata or {}
-            title = str(meta.get("title", "") or "")
-            researcher = str(meta.get("researcher", "") or "")
-            year = str(meta.get("year", meta.get("publication_date", "")) or "")
-            snippet = re.sub(r"\s+", " ", str(d.page_content or "")).strip()
-            if len(snippet) > 260:
-                snippet = snippet[:260].rstrip() + "..."
+            snippet = re.sub(r"\s+", " ", str(d.page_content or "")).strip()[:260]
             rows.append(
-                f"{idx}. title={title} | researcher={researcher} | year={year} | snippet={snippet}"
+                f"{idx}. title={meta.get('title','')} | researcher={meta.get('researcher','')} "
+                f"| year={meta.get('year','')} | snippet={snippet}"
             )
-
         prompt = (
-            "Select the most relevant chunks for answering the query.\n"
-            "Return JSON only as {\"keep\":[idx,...]} with at most "
-            f"{final_k} indices.\n"
-            "Prioritize direct topical relevance and useful evidence coverage.\n\n"
+            f"Select the most relevant chunks for answering the query.\n"
+            f"Return JSON only as {{\"keep\":[idx,...]}} with at most {final_k} indices.\n\n"
             f"Query:\n{query}\n\nCandidates:\n" + "\n".join(rows)
         )
         raw = _invoke_with_timeout(self.utility_runtime.llm, prompt, timeout_s)
@@ -1969,21 +1799,15 @@ class Engine:
         m = re.search(r"\{.*\}", txt, re.DOTALL)
         if m:
             txt = m.group(0)
-
         keep_idx: List[int] = []
         try:
             parsed = json.loads(txt)
-            raw_keep = parsed.get("keep", [])
-            if isinstance(raw_keep, list):
-                for v in raw_keep:
-                    try:
-                        i = int(v)
-                    except Exception:
-                        continue
-                    if i < 0 or i >= len(candidates):
-                        continue
-                    if i in keep_idx:
-                        continue
+            for v in (parsed.get("keep", []) or []):
+                try:
+                    i = int(v)
+                except Exception:
+                    continue
+                if 0 <= i < len(candidates) and i not in keep_idx:
                     keep_idx.append(i)
         except Exception:
             keep_idx = []
@@ -1992,43 +1816,27 @@ class Engine:
         if len(selected) < final_k:
             have = {id(d) for d in selected}
             for d in candidates:
-                if id(d) in have:
-                    continue
-                selected.append(d)
-                have.add(id(d))
+                if id(d) not in have:
+                    selected.append(d)
+                    have.add(id(d))
                 if len(selected) >= final_k:
                     break
         return selected[:final_k]
 
     def _explicit_topic_shift(self, question: str) -> bool:
         q = (question or "").strip().lower()
-        if not q:
-            return False
-        cues = (
-            "switch topic",
-            "different topic",
-            "new topic",
-            "unrelated",
-            "change subject",
-            "another area",
-            "instead let's discuss",
-        )
-        return any(c in q for c in cues)
+        return any(c in q for c in (
+            "switch topic", "different topic", "new topic", "unrelated",
+            "change subject", "another area", "instead let's discuss",
+        ))
 
-    def _post_filter_retrieved_docs(
-        self,
-        docs: List[Document],
-        *,
-        query: str,
-    ) -> List[Document]:
+    def _post_filter_retrieved_docs(self, docs: List[Document], *, query: str) -> List[Document]:
         if not docs:
             return docs
-
         unique = self._merge_unique_docs(docs, [])
         q_tokens = [t for t in _tokenize_words(query) if not _is_generic_query_token(t)]
         if not q_tokens:
             return unique
-
         pruned: List[Document] = []
         for d in unique:
             meta = d.metadata or {}
@@ -2055,16 +1863,10 @@ class Engine:
             return []
         self._log_retrieval_state(where_filter=where_filter)
         docs = self._retrieve_once(
-            q,
-            query_embedding=query_embedding,
-            search_k=search_k,
-            fetch_k=fetch_k,
-            lambda_mult=lambda_mult,
-            where_filter=where_filter,
+            q, query_embedding=query_embedding, search_k=search_k,
+            fetch_k=fetch_k, lambda_mult=lambda_mult, where_filter=where_filter,
         )
-        q2 = ""
 
-        # Dual-query retrieval only for short/coreferential follow-ups.
         is_followup_like = _query_is_short_or_pronoun(raw_question or q)
         anchor_value = str((self.anchor or {}).get("value", "") or "").strip()
         anchor_ratio = _anchor_support_ratio(anchor_value, docs) if anchor_value else 0.0
@@ -2089,20 +1891,12 @@ class Engine:
                 q2 = f"{q} {summary_q}".strip()
                 if q2 and q2 != q:
                     docs2 = self._retrieve_once(
-                        q2,
-                        query_embedding=query_embedding,
-                        search_k=search_k,
-                        fetch_k=fetch_k,
-                        lambda_mult=lambda_mult,
-                        where_filter=where_filter,
+                        q2, query_embedding=query_embedding, search_k=search_k,
+                        fetch_k=fetch_k, lambda_mult=lambda_mult, where_filter=where_filter,
                     )
                     docs = self._merge_unique_docs(docs, docs2)
 
-        docs = self._post_filter_retrieved_docs(
-            docs,
-            query=q,
-        )
-
+        docs = self._post_filter_retrieved_docs(docs, query=q)
         if budget_papers <= 0:
             return docs
         return pack_docs(docs, budget_papers, self.answer_runtime.count_tokens)
@@ -2117,38 +1911,28 @@ class Engine:
         docs: List[Document] = []
         if query_embedding:
             vect_docs = self._vector_retrieve_docs(
-                self.memory_vs,
-                query_embedding=query_embedding,
-                k=12,
-                fetch_k=24,
-                lambda_mult=0.4,
-                where_filter={"session_id": self.session_id},
-                prefer_mmr=False,
+                self.memory_vs, query_embedding=query_embedding, k=12, fetch_k=24,
+                lambda_mult=0.4, where_filter={"session_id": self.session_id}, prefer_mmr=False,
             )
             if isinstance(vect_docs, list):
                 docs = vect_docs
         if not docs:
             retriever = self.memory_vs.as_retriever(
-                search_kwargs={
-                    "k": 12,
-                    "filter": {"session_id": self.session_id},
-                }
+                search_kwargs={"k": 12, "filter": {"session_id": self.session_id}}
             )
             docs = retriever.invoke(query)
         return pack_docs(docs, budget_memory, self.answer_runtime.count_tokens)
 
-    def _rewrite_query_if_needed(
-        self,
-        raw_q: str,
-    ) -> Tuple[str, List[Document], str]:
+    def _rewrite_query_if_needed(self, raw_q: str) -> Tuple[str, List[Document], str]:
         q = (raw_q or "").strip()
         mem_docs: List[Document] = []
         if not q:
             return q, mem_docs, "default"
 
-        t0_rewrite = time.perf_counter()
+        t0 = time.perf_counter()
         query_for_retrieval = self.maybe_rewrite_query(q)
-        self.last_rewrite_time_ms = (time.perf_counter() - t0_rewrite) * 1000.0
+        self.last_rewrite_time_ms = (time.perf_counter() - t0) * 1000.0
+
         anchor_data = _normalize_anchor(self.anchor)
         anchor_value = str(anchor_data.get("value", "") or "").strip() if _anchor_is_stable(anchor_data) else ""
         referential = _is_followup_coref_question(q)
@@ -2167,18 +1951,20 @@ class Engine:
         detected_intent = _classify_generic_intent(query_for_retrieval or q)
         return query_for_retrieval, mem_docs, detected_intent
 
-    def _persist_light_state(self, *, last_focus: str, last_topic: str) -> None:
+    def _persist_light_state(
+        self,
+        *,
+        last_focus: str,
+        last_topic: str,
+        extra_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
         state = self.store.load(self.session_id)
         rolling_summary = state.get("rolling_summary", "") or ""
         turns_json = state.get("turns", []) or []
-        state["last_focus"] = last_focus
-        state["last_topic"] = last_topic
-        self.store.save(
-            self.session_id,
-            rolling_summary,
-            turns_json,
-            extra_state={"last_focus": last_focus, "last_topic": last_topic},
-        )
+        extra = {"last_focus": last_focus, "last_topic": last_topic}
+        if isinstance(extra_state, dict):
+            extra.update({k: v for k, v in extra_state.items() if k})
+        self.store.save(self.session_id, rolling_summary, turns_json, extra_state=extra)
 
     def prepare_context(self, question: str, *, stateless: bool = False) -> EngineContext:
         self.last_answer_llm_calls = 0
@@ -2187,78 +1973,58 @@ class Engine:
         budget_memory = budgets["BUDGET_MEMORY"]
         budget_papers = budgets["BUDGET_PAPERS"]
         raw_q = (question or "").strip()
+
         if (not stateless) and self._explicit_topic_shift(raw_q):
             self.last_focus = ""
             self.last_topic = ""
             try:
-                self._persist_light_state(last_focus="", last_topic="")
+                self._persist_light_state(
+                    last_focus="", last_topic="",
+                    extra_state={"anchor": {}, "anchor_last_action": "topic_shift"},
+                )
             except Exception:
                 pass
+
         user_turns = self._user_turn_count()
         allow_prev_context = (user_turns > 0) and (not stateless)
-        # Allow using/updating the rolling summary for this turn
-        # (disabled in stateless mode for stable multi-turn continuity).
         allow_summary = not stateless
 
         rewritten_q, focus_mem_docs, detected_intent = self._rewrite_query_if_needed(raw_q)
 
-        search_k = None
-        fetch_k = None
+        search_k = fetch_k = None
         if _query_is_short_or_pronoun(raw_q):
             base_k = int(getattr(settings, "search_k", 30))
             base_fk = int(getattr(settings, "search_fetch_k", 140))
-            k_mult = float(
-                getattr(
-                    settings,
-                    "followup_k_mult",
-                    2.0,
-                )
-            )
-            fk_mult = float(
-                getattr(
-                    settings,
-                    "followup_fetch_k_mult",
-                    2.0,
-                )
-            )
-            search_k = max(base_k, int(base_k * k_mult))
-            fetch_k = max(base_fk, int(base_fk * fk_mult))
+            search_k = max(base_k, int(base_k * float(getattr(settings, "followup_k_mult", 2.0))))
+            fetch_k = max(base_fk, int(base_fk * float(getattr(settings, "followup_fetch_k_mult", 2.0))))
 
-        paper_docs: List[Document]
         query_embedding: Optional[List[float]] = None
-        can_reuse_embedding = bool(
+        can_reuse = bool(
             hasattr(self.papers_vs, "max_marginal_relevance_search_by_vector")
             or hasattr(self.papers_vs, "similarity_search_by_vector")
             or (allow_prev_context and hasattr(self.memory_vs, "similarity_search_by_vector"))
         )
-        if rewritten_q.strip() and can_reuse_embedding:
+        if rewritten_q.strip() and can_reuse:
             query_embedding = self._embed_query_vector(rewritten_q)
+
         if rewritten_q.strip():
-            t0_retrieval = time.perf_counter()
+            t0 = time.perf_counter()
             paper_docs = self.retrieve_papers(
-                rewritten_q,
-                budget_papers,
-                query_embedding=query_embedding,
-                search_k=search_k,
-                fetch_k=fetch_k,
+                rewritten_q, budget_papers,
+                query_embedding=query_embedding, search_k=search_k, fetch_k=fetch_k,
                 raw_question=raw_q,
             )
-            self.last_retrieval_time_ms = (time.perf_counter() - t0_retrieval) * 1000.0
+            self.last_retrieval_time_ms = (time.perf_counter() - t0) * 1000.0
         else:
             paper_docs = []
             self.last_retrieval_time_ms = 0.0
+
+        mem_docs: List[Document] = []
         if allow_prev_context:
             mem_docs = focus_mem_docs or (
-                self.retrieve_memory(
-                    rewritten_q,
-                    budget_memory,
-                    query_embedding=query_embedding,
-                )
-                if rewritten_q.strip()
-                else []
+                self.retrieve_memory(rewritten_q, budget_memory, query_embedding=query_embedding)
+                if rewritten_q.strip() else []
             )
-        else:
-            mem_docs = []
 
         return EngineContext(
             raw_question=raw_q,
@@ -2279,59 +2045,44 @@ class Engine:
         name = _extract_person_name(q)
         if name and not _is_invalid_focus_value(name):
             return name
-
         focus_from_question = _extract_focus_from_question(q)
         if focus_from_question and not _is_invalid_focus_value(focus_from_question):
             return focus_from_question
-
         counts: Dict[str, int] = {}
         for d in paper_docs:
-            meta = d.metadata or {}
-            r = (meta.get("researcher") or "").strip()
+            r = (d.metadata or {}).get("researcher", "").strip()
             if r and not _is_invalid_focus_value(r):
                 counts[r] = counts.get(r, 0) + 1
-
         if counts:
-            top = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
-            return top
-
+            return sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
         return ""
 
     def _choose_last_topic_from_question(self, question: str) -> str:
         q = (question or "").strip()
-        if not q:
-            return ""
-        if _extract_person_name(q):
+        if not q or _extract_person_name(q):
             return ""
         topic = _extract_focus_from_question(q)
-        if topic and not _is_invalid_focus_value(topic):
-            return topic
-        return ""
+        return topic if topic and not _is_invalid_focus_value(topic) else ""
 
-    def finalize_turn(
-        self,
-        context: EngineContext,
-        answer: str,
-        *,
-        no_results: bool = False,
-    ) -> None:
+    def finalize_turn(self, context: EngineContext, answer: str, *, no_results: bool = False) -> None:
         if context.stateless:
             return
-        new_focus = self._choose_last_focus_from_answer(
-            context.rewritten_question,
-            context.paper_docs,
-        )
-        if new_focus:
-            self.last_focus = new_focus
-        new_topic = self._choose_last_topic_from_question(context.rewritten_question)
-        if new_topic:
-            self.last_topic = new_topic
+
+        prior_state = self.store.load(self.session_id)
+        prior_last_focus = str(prior_state.get("last_focus", "") or "")
+        prior_last_topic = str(prior_state.get("last_topic", "") or "")
+        prior_anchor = prior_state.get("anchor", {}) if isinstance(prior_state.get("anchor", {}), dict) else {}
+        prior_anchor_last_action = str(prior_state.get("anchor_last_action", "") or "")
+
+        new_focus_candidate = self._choose_last_focus_from_answer(context.rewritten_question, context.paper_docs)
+        new_topic_candidate = self._choose_last_topic_from_question(context.rewritten_question)
         new_turns_text = f"USER: {context.raw_question}\nASSISTANT: {answer}\n"
-        ner_line = ""
+
         max_docs = int(getattr(settings, "ner_context_max_docs", 12))
         if self.last_retrieval_confidence in {"weak", "inconsistent"}:
             max_docs = min(max_docs, max(2, int(getattr(settings, "low_conf_ner_context_max_docs", 6))))
         retrieval_meta_text = _build_ner_context_text(context.paper_docs, max_docs=max_docs)
+
         anchor_value = str((self.anchor or {}).get("value", "") or "").strip()
         min_docs_for_conf = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
         min_anchor_ratio = float(getattr(settings, "anchor_consistency_min_ratio", 0.45))
@@ -2339,15 +2090,21 @@ class Engine:
         anchor_consistent = (not anchor_value) or (anchor_ratio >= min_anchor_ratio)
         anchor_high_quality = (not anchor_value) or _anchor_is_stable(self.anchor)
         retrieval_weak = len(context.paper_docs) < min_docs_for_conf
+        anchor_fully_absent = bool(anchor_value) and anchor_ratio == 0.0
+
+        if no_results or retrieval_weak or anchor_fully_absent:
+            self.last_focus = re.sub(r"\s+", " ", (context.raw_question or "").strip())[:220]
+            self.last_topic = ""
+            self.anchor = {}
+            self.anchor_last_action = "cleared_weak_retrieval"
+
         summary_should_update = bool(
-            context.allow_summary
-            and (not no_results)
-            and (not retrieval_weak)
-            and anchor_consistent
-            and anchor_high_quality
+            context.allow_summary and (not no_results) and (not retrieval_weak)
+            and anchor_consistent and anchor_high_quality
         )
         self.last_summary_updated = summary_should_update
         self.last_anchor_support_ratio = float(anchor_ratio)
+
         if not context.paper_docs:
             self.last_retrieval_confidence = "weak"
         elif anchor_value and not anchor_consistent:
@@ -2358,72 +2115,84 @@ class Engine:
             self.last_retrieval_confidence = "medium"
         else:
             self.last_retrieval_confidence = "low"
+
+        safe_to_update = (
+            (not no_results) and (not retrieval_weak)
+            and (self.last_retrieval_confidence in {"medium", "high"})
+            and anchor_consistent and anchor_high_quality
+        )
+
+        if safe_to_update:
+            if new_focus_candidate:
+                self.last_focus = new_focus_candidate
+            if new_topic_candidate:
+                self.last_topic = new_topic_candidate
+            anchor_to_save = _normalize_anchor(self.anchor)
+            anchor_last_action_to_save = self.anchor_last_action
+        elif no_results or retrieval_weak or anchor_fully_absent:
+            anchor_to_save = _normalize_anchor(self.anchor)  # {} after clear
+            anchor_last_action_to_save = self.anchor_last_action
+        else:
+            self.last_focus = prior_last_focus
+            self.last_topic = prior_last_topic
+            self.anchor = _normalize_anchor(prior_anchor)
+            self.anchor_last_action = prior_anchor_last_action
+            anchor_to_save = _normalize_anchor(prior_anchor)
+            anchor_last_action_to_save = prior_anchor_last_action
+
         retrieval_meta_for_summary = retrieval_meta_text if summary_should_update else ""
         llm_summary_regen = bool(getattr(settings, "enable_llm_summary_regen", False))
         memory_extract_allowed = (
-            (not no_results)
-            and anchor_consistent
+            (not no_results) and anchor_consistent
             and (self.last_retrieval_confidence in {"medium", "high"})
         )
         run_memory_extract = bool(
             memory_extract_allowed
-            and (
-                bool(getattr(settings, "memory_extract_first_turn", True))
-                or context.allow_prev_context
-            )
+            and (bool(getattr(settings, "memory_extract_first_turn", True)) or context.allow_prev_context)
         )
 
-        if self.utility_worker is not None and int(
-            getattr(settings, "enable_utility_background", 1)
-        ) == 1:
-            # Persist lightweight context immediately so the next turn can use
-            # it even if the background worker has not processed this job yet.
+        extra_state = {
+            "last_focus": self.last_focus,
+            "last_topic": self.last_topic,
+            "anchor": anchor_to_save,  # {} when cleared — SessionStore will write it
+            "anchor_last_action": anchor_last_action_to_save,
+            "summary_updated": self.last_summary_updated,
+            "retrieval_confidence": self.last_retrieval_confidence,
+            "anchor_support_ratio": self.last_anchor_support_ratio,
+            "rewrite_anchor_valid": self.last_rewrite_anchor_valid,
+            "rewrite_blocked": self.last_rewrite_blocked,
+        }
+
+        if self.utility_worker is not None and int(getattr(settings, "enable_utility_background", 1)) == 1:
             state = self.store.load(self.session_id)
             rolling_summary = state.get("rolling_summary", "") or ""
             if summary_should_update:
                 rolling_summary = build_rolling_summary(
-                    rolling_summary,
-                    context.raw_question,
-                    retrieval_meta_for_summary,
-                    answer,
+                    rolling_summary, context.raw_question, retrieval_meta_for_summary, answer,
                 )
             turns = state.get("turns", []) or []
             turns.append({"role": "user", "text": context.raw_question})
             turns.append({"role": "assistant", "text": answer})
-            extra_state = {
-                "last_focus": self.last_focus,
-                "last_topic": self.last_topic,
-                "anchor": _normalize_anchor(self.anchor),
-                "anchor_last_action": self.anchor_last_action,
-                "summary_updated": self.last_summary_updated,
-                "retrieval_confidence": self.last_retrieval_confidence,
-                "anchor_support_ratio": self.last_anchor_support_ratio,
-                "rewrite_anchor_valid": self.last_rewrite_anchor_valid,
-                "rewrite_blocked": self.last_rewrite_blocked,
-            }
             self.store.save(self.session_id, rolling_summary, turns, extra_state=extra_state)
-
-            job = UtilityJob(
+            self.utility_worker.submit(UtilityJob(
                 session_id=self.session_id,
                 user_text=context.raw_question,
                 assistant_text=answer,
                 new_turns_text=new_turns_text,
                 run_summary=bool(summary_should_update and llm_summary_regen),
                 run_memory_extract=run_memory_extract,
-                last_focus=self.last_focus if new_focus else None,
-                last_topic=self.last_topic if new_topic else None,
+                last_focus=self.last_focus if new_focus_candidate else None,
+                last_topic=self.last_topic if new_topic_candidate else None,
                 no_results=no_results,
-                ner_line=ner_line,
+                ner_line="",
                 retrieval_meta_text=retrieval_meta_for_summary,
                 turns_already_persisted=True,
-            )
-            self.utility_worker.submit(job)
+            ))
             return
 
-        # Synchronous fallback keeps state consistent when the worker is disabled.
+        # Synchronous fallback
         state = self.store.load(self.session_id)
         rolling_summary = state.get("rolling_summary", "") or ""
-        old_summary = rolling_summary
         turns = state.get("turns", []) or []
         turns.append({"role": "user", "text": context.raw_question})
         turns.append({"role": "assistant", "text": answer})
@@ -2431,44 +2200,26 @@ class Engine:
         if summary_should_update:
             if llm_summary_regen and self.utility_runtime is not None:
                 rolling_summary = _regenerate_rolling_summary(
-                    llm=self.utility_runtime.llm,
-                    old_summary=old_summary,
-                    new_turns_text=new_turns_text,
-                    question=context.raw_question,
-                    ner_line=ner_line,
-                    source_context=retrieval_meta_for_summary,
+                    llm=self.utility_runtime.llm, old_summary=rolling_summary,
+                    new_turns_text=new_turns_text, question=context.raw_question,
+                    ner_line="", source_context=retrieval_meta_for_summary,
                     no_results=no_results,
                     timeout_s=int(getattr(settings, "llm_timeout_s", 40)),
                 )
                 self.last_utility_llm_calls += 1
             else:
                 rolling_summary = build_rolling_summary(
-                    old_summary,
-                    context.raw_question,
-                    retrieval_meta_for_summary,
-                    answer,
+                    rolling_summary, context.raw_question, retrieval_meta_for_summary, answer,
                 )
 
-        extra = {
-            "last_focus": self.last_focus,
-            "last_topic": self.last_topic,
-            "anchor": _normalize_anchor(self.anchor),
-            "anchor_last_action": self.anchor_last_action,
-            "summary_updated": self.last_summary_updated,
-            "retrieval_confidence": self.last_retrieval_confidence,
-            "anchor_support_ratio": self.last_anchor_support_ratio,
-            "rewrite_anchor_valid": self.last_rewrite_anchor_valid,
-            "rewrite_blocked": self.last_rewrite_blocked,
-        }
-        self.store.save(self.session_id, rolling_summary, turns, extra_state=extra)
+        self.store.save(self.session_id, rolling_summary, turns, extra_state=extra_state)
 
     def ask(self, question: str) -> Tuple[str, List[Document], List[Document]]:
         context = self.prepare_context(question, stateless=False)
         raw_q = context.raw_question
         pap_docs = list(context.paper_docs)
-        budgets = context.budgets
-        trigger = budgets["TRIGGER"]
-        budget_papers = budgets["BUDGET_PAPERS"]
+        trigger = context.budgets["TRIGGER"]
+        budget_papers = context.budgets["BUDGET_PAPERS"]
 
         _dbg("[RAG] raw_question", raw_q)
         _dbg("[RAG] rewritten_question", context.rewritten_question)
@@ -2480,32 +2231,16 @@ class Engine:
 
         max_docs = int(getattr(settings, "prompt_max_docs", 24))
         text_limit = int(getattr(settings, "prompt_doc_text_limit", 800))
-        papers_ctx = format_docs_compact(
-            pap_docs,
-            max_docs=max_docs,
-            text_limit=text_limit,
-        )
-
+        papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
         msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx, question=context.rewritten_question)
         full_prompt = "\n\n".join(m.content for m in msgs)
 
         tok = self.answer_runtime.count_tokens(full_prompt)
         _dbg("[LLM] token_count", str(tok))
         if tok > trigger:
-            pap_docs = pack_docs(
-                pap_docs,
-                max(600, int(budget_papers * 0.7)),
-                self.answer_runtime.count_tokens,
-            )
-            papers_ctx = format_docs_compact(
-                pap_docs,
-                max_docs=max_docs,
-                text_limit=text_limit,
-            )
-            msgs = ANSWER_PROMPT.format_messages(
-                papers=papers_ctx,
-                question=context.rewritten_question,
-            )
+            pap_docs = pack_docs(pap_docs, max(600, int(budget_papers * 0.7)), self.answer_runtime.count_tokens)
+            papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
+            msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx, question=context.rewritten_question)
             full_prompt = "\n\n".join(m.content for m in msgs)
 
         try:
@@ -2515,16 +2250,11 @@ class Engine:
             raw_answer = ""
 
         answer = _strip_prompt_leak(str(raw_answer)).strip()
-
         if _answer_is_bad(answer):
             focus = self._choose_last_focus_from_answer(context.rewritten_question, pap_docs)
-            if focus:
-                answer = focus
-            else:
-                answer = "I found related papers, but the answer could not be cleanly extracted."
+            answer = focus if focus else "I found related papers, but the answer could not be cleanly extracted."
 
         self.finalize_turn(context, answer)
-
         return answer, context.paper_docs, []
 
 
@@ -2535,7 +2265,6 @@ class EngineManager:
 
         self.dbm = DatabaseManager()
         self.dbm.ensure_dirs_exist()
-
         self.store = SessionStore(STATE_DB)
         self.embeddings = build_embeddings()
 
@@ -2556,8 +2285,8 @@ class EngineManager:
         self.utility_runtime: Optional[ModelRuntime] = None
         self.active_answer_model_key: str = ""
         self.active_utility_model_key: str = ""
+        self.active_answer_max_new_tokens: int = 0
         self.answer_generation_lock = threading.Lock()
-
         self.utility_worker: Optional[UtilityWorker] = None
 
     def get_papers_vs(self, mode: str) -> Chroma:
@@ -2587,26 +2316,21 @@ class EngineManager:
 
     def switch_answer_model(self, llm_model_key: str) -> None:
         key = (llm_model_key or "").strip().lower()
-        if key == self.active_answer_model_key and self.answer_runtime is not None:
+        desired_max = int(getattr(settings, "answer_max_new_tokens", 768))
+        if key == self.active_answer_model_key and self.answer_runtime is not None and self.active_answer_max_new_tokens == desired_max:
             return
-
         if self.answer_runtime is not None:
             try:
                 self.answer_runtime.close()
             except Exception:
                 pass
             self.answer_runtime = None
-
         clear_runtime_cache()
-
-        model_path = _resolve_llm_path(key)
         self.answer_runtime = ModelRuntime(
-            model_path,
-            max_new_tokens=int(getattr(settings, "answer_max_new_tokens", 256)),
-            do_sample=False,
-            temperature=0.0,
+            _resolve_llm_path(key), max_new_tokens=desired_max, do_sample=False, temperature=0.0,
         )
         self.active_answer_model_key = key
+        self.active_answer_max_new_tokens = desired_max
 
     def switch_model(self, llm_model_key: str) -> None:
         self.switch_answer_model(llm_model_key)
@@ -2615,53 +2339,38 @@ class EngineManager:
         key = (llm_model_key or "").strip().lower()
         if key == self.active_utility_model_key and self.utility_runtime is not None:
             return
-
         if self.utility_runtime is not None:
             try:
                 self.utility_runtime.close()
             except Exception:
                 pass
             self.utility_runtime = None
-
         clear_runtime_cache()
-
-        model_path = _resolve_llm_path(key)
         self.utility_runtime = ModelRuntime(
-            model_path,
+            _resolve_llm_path(key),
             max_new_tokens=int(getattr(settings, "utility_max_new_tokens", 256)),
-            do_sample=False,
-            temperature=0.0,
+            do_sample=False, temperature=0.0,
         )
         self.active_utility_model_key = key
 
     def _ensure_utility_worker(self) -> None:
         if self.utility_worker is not None:
             return
-
-        util_key = getattr(settings, "utility_model_key", "llama-3.2-1b")
-        self.switch_utility_model(util_key)
-
+        self.switch_utility_model(getattr(settings, "utility_model_key", "llama-3.2-1b"))
         if self.utility_runtime is None:
             return
-
         self.utility_worker = UtilityWorker(
-            store=self.store,
-            memory_vs=self.memory_vs,
-            runtime=self.utility_runtime,
-            answer_generation_lock=self.answer_generation_lock,
+            store=self.store, memory_vs=self.memory_vs, runtime=self.utility_runtime,
         )
         self.utility_worker.start()
 
     def get_engine(self, session_id: str, mode: str, *, stateless: bool = False) -> Engine:
         if self.answer_runtime is None:
             self.switch_answer_model(getattr(settings, "answer_model_key", "llama-3.2-3b"))
-
         if self.utility_runtime is None:
             self.switch_utility_model(getattr(settings, "utility_model_key", "llama-3.2-1b"))
-
         if int(getattr(settings, "enable_utility_background", 1)) == 1:
             self._ensure_utility_worker()
-
         papers_vs = self.get_papers_vs(mode)
         return Engine(
             answer_runtime=self.answer_runtime,
@@ -2695,10 +2404,13 @@ class EngineManager:
 
 
 _GLOBAL_MANAGER: Optional[EngineManager] = None
+_GLOBAL_MANAGER_LOCK = threading.Lock()
 
 
 def get_global_manager() -> EngineManager:
     global _GLOBAL_MANAGER
     if _GLOBAL_MANAGER is None:
-        _GLOBAL_MANAGER = EngineManager()
+        with _GLOBAL_MANAGER_LOCK:
+            if _GLOBAL_MANAGER is None:
+                _GLOBAL_MANAGER = EngineManager()
     return _GLOBAL_MANAGER

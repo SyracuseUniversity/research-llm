@@ -1,3 +1,4 @@
+# session_store.py
 import json
 import sqlite3
 import threading
@@ -87,48 +88,78 @@ def _sanitize_extra_state(extra_state: Dict[str, Any]) -> Dict[str, Any]:
     if "rewrite_blocked" in extra_state:
         out["rewrite_blocked"] = bool(extra_state.get("rewrite_blocked"))
 
+    # Always write the anchor key — even when empty — so an explicit clear
+    # (anchor={}) actually overwrites the previous value in the DB merge.
     anchor = _sanitize_anchor(extra_state.get("anchor"))
-    if anchor:
-        out["anchor"] = anchor
+    out["anchor"] = anchor  # {} when cleared, populated dict when set
     return out
 
 
 class SessionStore:
+    """
+    SQLite-backed session store.
+
+    Uses threading.local() so each thread gets its own connection.
+    Schema migration runs exactly once across all threads.
+    """
+
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._conn.execute("PRAGMA temp_store=MEMORY;")
-        self._init_db()
+        self._local = threading.local()
+        self._init_lock = threading.Lock()
+        self._schema_done = False
+        self._ensure_connection()
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=True)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            self._local.conn = conn
+        return conn
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        return self._ensure_connection()
 
     def _init_db(self) -> None:
-        with self._lock:
+        if self._schema_done:
+            return
+        with self._init_lock:
+            if self._schema_done:
+                return
             conn = self._conn
             conn.execute(SCHEMA_SQL)
             conn.commit()
             try:
-                cols = [row[1] for row in conn.execute("PRAGMA table_info(chat_state);").fetchall()]
+                cols = [
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(chat_state);").fetchall()
+                ]
                 if "extra_state_json" not in cols:
-                    conn.execute("ALTER TABLE chat_state ADD COLUMN extra_state_json TEXT NOT NULL DEFAULT '{}';")
+                    conn.execute(
+                        "ALTER TABLE chat_state ADD COLUMN extra_state_json TEXT NOT NULL DEFAULT '{}';"
+                    )
                     conn.commit()
             except Exception:
                 pass
+            self._schema_done = True
 
     def load(self, session_id: str) -> Dict[str, Any]:
-        with self._lock:
-            conn = self._conn
-            try:
-                row = conn.execute(
-                    "SELECT rolling_summary, turns_json, extra_state_json FROM chat_state WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-            except sqlite3.OperationalError:
-                row = conn.execute(
-                    "SELECT rolling_summary, turns_json FROM chat_state WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
+        self._init_db()
+        conn = self._conn
+        try:
+            row = conn.execute(
+                "SELECT rolling_summary, turns_json, extra_state_json FROM chat_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = conn.execute(
+                "SELECT rolling_summary, turns_json FROM chat_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
 
         if not row:
             return {"rolling_summary": _DEFAULT_ROLLING_SUMMARY, "turns": []}
@@ -149,18 +180,16 @@ class SessionStore:
         state: Dict[str, Any] = {"rolling_summary": summary_value, "turns": turns}
         if extra_state:
             state["extra_state"] = extra_state
-            if "last_focus" in extra_state:
-                state["last_focus"] = extra_state.get("last_focus") or ""
-            if "last_topic" in extra_state:
-                state["last_topic"] = extra_state.get("last_topic") or ""
-            if "anchor" in extra_state and isinstance(extra_state.get("anchor"), dict):
-                state["anchor"] = extra_state.get("anchor") or {}
-            if "anchor_last_action" in extra_state:
-                state["anchor_last_action"] = extra_state.get("anchor_last_action") or ""
-            if "summary_updated" in extra_state:
-                state["summary_updated"] = bool(extra_state.get("summary_updated"))
-            if "retrieval_confidence" in extra_state:
-                state["retrieval_confidence"] = str(extra_state.get("retrieval_confidence") or "")
+            for key in (
+                "last_focus", "last_topic", "anchor_last_action",
+                "summary_updated", "retrieval_confidence",
+            ):
+                if key in extra_state:
+                    state[key] = extra_state[key]
+            # Only promote a non-empty anchor into top-level state.
+            if "anchor" in extra_state:
+                anchor_val = extra_state.get("anchor")
+                state["anchor"] = anchor_val if isinstance(anchor_val, dict) and anchor_val else {}
         return state
 
     def save(
@@ -170,53 +199,60 @@ class SessionStore:
         turns: List[Dict[str, str]],
         extra_state: Optional[Dict[str, Any]] = None,
     ) -> None:
+        self._init_db()
         turns_payload = _trim_turns(turns or [])
         payload = json.dumps(turns_payload, ensure_ascii=False)
+        conn = self._conn
 
-        with self._lock:
-            conn = self._conn
-            existing = conn.execute(
-                "SELECT rolling_summary, extra_state_json FROM chat_state WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
+        existing = conn.execute(
+            "SELECT rolling_summary, extra_state_json FROM chat_state WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
 
-            base_summary = str(existing[0] or "") if existing else ""
-            base_extra = _safe_json_loads(existing[1], {}) if existing and len(existing) > 1 else {}
-            base_extra = _sanitize_extra_state(base_extra)
+        base_summary = str(existing[0] or "") if existing else ""
+        base_extra = _safe_json_loads(existing[1], {}) if existing and len(existing) > 1 else {}
+        base_extra = _sanitize_extra_state(base_extra)
 
-            if isinstance(extra_state, dict):
-                base_extra.update(_sanitize_extra_state(extra_state))
-            extra_payload = json.dumps(base_extra or {}, ensure_ascii=False)
+        if isinstance(extra_state, dict):
+            sanitized_new = _sanitize_extra_state(extra_state)
+            # Explicit per-key assignment so that an empty anchor ({}) correctly
+            # overwrites a previously stored non-empty anchor value.
+            for k, v in sanitized_new.items():
+                base_extra[k] = v
 
-            summary_payload = str(rolling_summary or "")
-            if not summary_payload.strip():
-                summary_payload = base_summary if base_summary.strip() else _DEFAULT_ROLLING_SUMMARY
+        extra_payload = json.dumps(base_extra or {}, ensure_ascii=False)
 
-            conn.execute(
-                """
-                INSERT INTO chat_state(session_id, rolling_summary, turns_json, extra_state_json)
-                VALUES(?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                  rolling_summary=excluded.rolling_summary,
-                  turns_json=excluded.turns_json,
-                  extra_state_json=excluded.extra_state_json
-                """,
-                (session_id, summary_payload, payload, extra_payload),
-            )
-            conn.commit()
+        summary_payload = str(rolling_summary or "")
+        if not summary_payload.strip():
+            summary_payload = base_summary if base_summary.strip() else _DEFAULT_ROLLING_SUMMARY
+
+        conn.execute(
+            """
+            INSERT INTO chat_state(session_id, rolling_summary, turns_json, extra_state_json)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+              rolling_summary=excluded.rolling_summary,
+              turns_json=excluded.turns_json,
+              extra_state_json=excluded.extra_state_json
+            """,
+            (session_id, summary_payload, payload, extra_payload),
+        )
+        conn.commit()
 
     def reset(self, session_id: str) -> None:
-        with self._lock:
-            conn = self._conn
-            conn.execute("DELETE FROM chat_state WHERE session_id = ?", (session_id,))
-            conn.commit()
+        self._init_db()
+        conn = self._conn
+        conn.execute("DELETE FROM chat_state WHERE session_id = ?", (session_id,))
+        conn.commit()
 
     def close(self) -> None:
-        with self._lock:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
             try:
-                self._conn.close()
+                conn.close()
             except Exception:
                 pass
+            self._local.conn = None
 
     def __del__(self) -> None:
         try:

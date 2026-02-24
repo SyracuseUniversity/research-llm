@@ -3,7 +3,8 @@ import gc
 import hashlib
 import os
 import shutil
-from typing import Any, Dict, Iterable, List
+import time
+from typing import Any, Dict, Iterable, List, Optional
 
 CACHE_DIR = os.getenv("RAG_CACHE_DIR", "cache")
 CACHE_KEY_VERSION = os.getenv("RAG_CACHE_VERSION", "v3")
@@ -93,18 +94,100 @@ def retrieval_cache_summary(
     }
 
 
-def clear_cache() -> None:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
+def _gpu_release() -> None:
+    """Release GPU memory if torch/CUDA is available."""
     gc.collect()
     try:
         import torch
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
 
+
+def _entry_age_seconds(path: str) -> float:
+    """Return seconds since the file/dir was last modified, or 0 on error."""
+    try:
+        return time.time() - os.path.getmtime(path)
+    except Exception:
+        return 0.0
+
+
+def clear_cache(
+    *,
+    user_key: Optional[str] = None,
+    mode: Optional[str] = None,
+    older_than_seconds: Optional[float] = None,
+    version: Optional[str] = None,
+) -> Dict[str, int]:
+    """
+    Targeted cache invalidation.
+
+    Parameters
+    ----------
+    user_key : str, optional
+        Delete only entries whose filename contains this user key hash.
+    mode : str, optional
+        Delete only entries whose filename contains this mode string.
+    older_than_seconds : float, optional
+        Delete only entries older than this many seconds.
+    version : str, optional
+        Delete only entries whose filename starts with this version prefix.
+        When no filters are provided at all, defaults to removing entries from
+        older versions only (files that do NOT start with CACHE_KEY_VERSION).
+
+    Returns
+    -------
+    dict with "deleted" and "skipped" counts.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    _gpu_release()
+
+    filters = []
+
+    if user_key is not None:
+        h = short_hash(user_key, length=12)
+        filters.append(lambda name, _p, h=h: h in name)
+
+    if mode is not None:
+        m = _norm_text(mode).lower()
+        filters.append(lambda name, _p, m=m: m in name)
+
+    if older_than_seconds is not None:
+        limit = float(older_than_seconds)
+        filters.append(lambda _n, p, limit=limit: _entry_age_seconds(p) > limit)
+
+    if version is not None:
+        v = str(version)
+        filters.append(lambda name, _p, v=v: name.startswith(v))
+    elif not filters:
+        cur = CACHE_KEY_VERSION
+        filters.append(lambda name, _p, cur=cur: not name.startswith(cur))
+
+    deleted = skipped = 0
+    for name in os.listdir(CACHE_DIR):
+        p = os.path.join(CACHE_DIR, name)
+        if all(f(name, p) for f in filters):
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                deleted += 1
+            except Exception:
+                skipped += 1
+        else:
+            skipped += 1
+
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def clear_cache_all() -> Dict[str, int]:
+    """Unconditionally remove every entry in the cache directory."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    _gpu_release()
+
+    deleted = skipped = 0
     for name in os.listdir(CACHE_DIR):
         p = os.path.join(CACHE_DIR, name)
         try:
@@ -112,5 +195,7 @@ def clear_cache() -> None:
                 shutil.rmtree(p, ignore_errors=True)
             else:
                 os.remove(p)
+            deleted += 1
         except Exception:
-            pass
+            skipped += 1
+    return {"deleted": deleted, "skipped": skipped}

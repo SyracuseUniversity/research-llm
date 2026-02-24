@@ -3,34 +3,37 @@ import os
 import html
 import uuid
 import streamlit as st
-
 from streamlit_agraph import agraph, Node, Edge, Config
 
-# ---------------------------------------------------------------------------
-# Embedding model path: read from environment variables instead of hardcoding
-# platform-specific paths. Set EMBED_MODEL_PATH in your .env or shell to point
-# to a local model directory; if unset the app falls back to HuggingFace Hub
-# download behaviour.
-# ---------------------------------------------------------------------------
-_LOCAL_EMBED_PATH = os.getenv("EMBED_MODEL_PATH", "").strip()
-if _LOCAL_EMBED_PATH and os.path.isdir(_LOCAL_EMBED_PATH):
+_LOCAL_EMBED_PATH = r"C:\codes\models\all-MiniLM-L6-v2"
+if os.path.isdir(_LOCAL_EMBED_PATH):
     os.environ.setdefault("EMBED_MODEL", _LOCAL_EMBED_PATH)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HOME", r"C:\codes\hf_cache")
 
-os.environ.setdefault("HF_HUB_OFFLINE", os.getenv("HF_HUB_OFFLINE", "1"))
-os.environ.setdefault("TRANSFORMERS_OFFLINE", os.getenv("TRANSFORMERS_OFFLINE", "1"))
+# Force embeddings to CPU so they don't contend with the LLM for VRAM
+os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
 
-_default_hf_home = os.getenv("HF_HOME") or os.path.join(
-    os.path.expanduser("~"), ".cache", "huggingface"
-)
-os.environ.setdefault("HF_HOME", _default_hf_home)
+# Prevent tokenizer parallelism deadlock on Windows
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-from rag_pipeline import answer_question
+# Raise LLM timeout to handle complex/long queries
+os.environ.setdefault("RAG_LLM_TIMEOUT_S", "120")
+
+from rag_pipeline import answer_question, sanitize_answer_for_display
 from runtime_settings import settings
 from rag_engine import get_global_manager
-
 from conversation_memory import hard_reset_memory, clear_qa_cache
 from cache_manager import clear_cache as clear_rag_cache
 
+import psutil
+import torch
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _safe_call(fn, *args, **kwargs):
     try:
@@ -39,9 +42,154 @@ def _safe_call(fn, *args, **kwargs):
         return None
 
 
-def _sanitize_for_display(value: object) -> str:
+def _esc(value: object) -> str:
     return html.escape(str(value or ""))
 
+
+def _esc_answer(value: object) -> str:
+    return html.escape(sanitize_answer_for_display(str(value or "")))
+
+
+def _ram_stats() -> dict:
+    vm = psutil.virtual_memory()
+    return {
+        "used_gb": vm.used / (1024 ** 3),
+        "total_gb": vm.total / (1024 ** 3),
+        "pct": vm.percent,
+    }
+
+
+def _vram_stats() -> dict | None:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free_b, total_b = torch.cuda.mem_get_info()
+        used_b = total_b - free_b
+        return {
+            "used_gb": used_b / (1024 ** 3),
+            "total_gb": total_b / (1024 ** 3),
+            "pct": (used_b / total_b * 100) if total_b else 0.0,
+        }
+    except Exception:
+        return None
+
+
+def _session_metrics(user_key: str) -> dict:
+    state = ENGINE_MANAGER.store.load(user_key)
+    return {
+        "session_id": user_key,
+        "turn_count": len(state.get("turns", []) or []),
+        "summary_len": len(state.get("rolling_summary", "") or ""),
+        "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),
+    }
+
+
+def _render_graph(g: dict, graph_key: str) -> None:
+    nodes_raw = g.get("nodes", []) or []
+    edges_raw = g.get("edges", []) or []
+    if not nodes_raw or not edges_raw:
+        return
+
+    # ── Toggle state ──────────────────────────────────────────────────────────
+    toggle_key = f"graph_open_{graph_key}"
+    if toggle_key not in st.session_state:
+        st.session_state[toggle_key] = True  # shown by default
+
+    if st.button(
+        "▼ Hide Graph" if st.session_state[toggle_key] else "▶ Show Graph",
+        key=f"graph_btn_{graph_key}",
+    ):
+        st.session_state[toggle_key] = not st.session_state[toggle_key]
+
+    if not st.session_state[toggle_key]:
+        return
+
+    # ── Node styling by type ──────────────────────────────────────────────────
+    TYPE_CONFIG = {
+        "paper":      {"size": 18, "color": "#4A90D9"},
+        "researcher": {"size": 28, "color": "#E87B3A"},
+        "topic":      {"size": 20, "color": "#5BAD72"},
+        "author":     {"size": 14, "color": "#9B6BBE"},
+    }
+    DEFAULT_CFG = {"size": 16, "color": "#888888"}
+
+    def _truncate(label: str, max_len: int = 48) -> str:
+        return label if len(label) <= max_len else label[:max_len - 1].rstrip() + "…"
+
+    nodes, edges = [], []
+
+    for n in nodes_raw:
+        nid   = str(n.get("id", "")).strip()
+        label = _truncate(str(n.get("label", "")).strip() or nid)
+        ntype = str(n.get("type", "")).strip().lower()
+        cfg   = TYPE_CONFIG.get(ntype, DEFAULT_CFG)
+        nodes.append(Node(
+            id=nid,
+            label=label,
+            size=cfg["size"],
+            color=cfg["color"],
+            font={
+                "size": 11,
+                "color": "#1a1a1a",
+                "background": "rgba(255,255,255,0.85)",
+                "strokeWidth": 2,
+                "strokeColor": "#ffffff",
+            },
+            borderWidth=2,
+            borderWidthSelected=3,
+        ))
+
+    for e in edges_raw:
+        src = str(e.get("source", "")).strip()
+        tgt = str(e.get("target", "")).strip()
+        if src and tgt:
+            edges.append(Edge(
+                source=src,
+                target=tgt,
+                label=str(e.get("type", "")),
+                color={"color": "#aaaaaa", "opacity": 0.7},
+                width=1.5,
+                font={"size": 9, "color": "#555555",
+                      "background": "rgba(255,255,255,0.75)"},
+                smooth={"type": "curvedCW", "roundness": 0.1},
+            ))
+
+    config = Config(
+        width="100%",
+        height=520,
+        directed=True,
+        physics=True,
+        hierarchical=False,
+        fit=True,
+        stabilization={
+            "enabled": True,
+            "iterations": 300,
+            "updateInterval": 25,
+            "fit": True,
+        },
+        solver="forceAtlas2Based",
+        forceAtlas2Based={
+            "gravitationalConstant": -50,
+            "centralGravity": 0.01,
+            "springLength": 120,
+            "springConstant": 0.08,
+            "damping": 0.9,
+            "avoidOverlap": 0.8,
+        },
+        zoomView=True,
+        dragNodes=True,
+        dragView=True,
+        navigationButtons=True,
+        keyboard=True,
+    )
+
+    # Render directly in page — NOT inside st.expander (causes zero-height mount)
+    agraph(nodes=nodes, edges=edges, config=config)
+
+
+# ---------------------------------------------------------------------------
+# App bootstrap
+# ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="Syracuse Research Assistant", layout="wide")
 st.title("Syracuse Research Assistant")
@@ -54,186 +202,162 @@ if "engine_manager" not in st.session_state:
     st.session_state["engine_manager"] = get_global_manager()
 ENGINE_MANAGER = st.session_state["engine_manager"]
 
+# Always-on settings
+settings.debug_rag = True
+settings.use_graph = True
 
-def _session_metrics(user_key: str):
-    store = ENGINE_MANAGER.store
-    state = store.load(user_key)
-    turns = state.get("turns", []) or []
-    summary = state.get("rolling_summary", "") or ""
-    return {
-        "session_id": user_key,
-        "turn_count": len(turns),
-        "summary_len": len(summary),
-        "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),
-    }
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.subheader("Settings")
+    st.subheader("System Memory")
+    ram_caption_placeholder  = st.empty()
+    ram_bar_placeholder      = st.empty()
+    vram_caption_placeholder = st.empty()
+    vram_bar_placeholder     = st.empty()
 
-    _dbm = ENGINE_MANAGER.dbm
-    _available_modes = _dbm.list_configs()
-    if not _available_modes:
-        st.error("No retrieval modes are configured.")
-        st.stop()
-    _requested_mode = str(getattr(settings, "active_mode", "") or "")
-    _default_mode = _dbm.resolve_mode(_requested_mode)
-    _default_index = _available_modes.index(_default_mode) if _default_mode in _available_modes else 0
-    settings.active_mode = st.selectbox(
-        "Chroma Database",
-        _available_modes,
-        index=_default_index,
-    )
-
-    selected_answer_model = st.selectbox(
-        "Answer Model",
-        ["llama-3.2-1b", "llama-3.2-3b"],
-        index=1 if str(getattr(settings, "answer_model_key", "llama-3.2-3b")).strip().lower() == "llama-3.2-3b" else 0,
-    )
-    settings.answer_model_key = selected_answer_model
-    settings.llm_model = selected_answer_model
-
-    utility_path = str(getattr(settings, "llama_1b_path", "") or "").strip() or "(unset)"
-    st.caption(f"Utility model path (LLAMA_1B): {utility_path}")
-
-    settings.use_graph = st.checkbox("Enable Graph Retrieval", value=False)
-    stateless_turn = st.checkbox("Stateless Turn", value=False)
-    settings.debug_rag = st.checkbox("Debug RAG in terminal", value=False)
-
-    st.subheader("Memory and Cache")
+    st.divider()
+    st.subheader("Session")
 
     if st.button("Clear Cache"):
         _safe_call(clear_qa_cache, USER_KEY)
         _safe_call(clear_rag_cache)
-        st.success("Cache cleared for this session.")
+        st.success("Cache cleared.")
 
     if st.button("Reset Memory"):
         _safe_call(hard_reset_memory, USER_KEY)
-        st.success("Persistent memory cleared for this session.")
+        st.success("Memory cleared.")
 
     if st.button("Restart Conversation"):
         st.session_state["messages"] = []
         _safe_call(hard_reset_memory, USER_KEY)
         st.success("Conversation restarted.")
 
-    show_sources = st.checkbox("Show retrieved sources", value=True)
-    show_graph_query = st.checkbox("Show graph data", value=False)
-    show_session_diag = st.checkbox("Show session diagnostics", value=True)
+    st.divider()
+    st.subheader("Session Diagnostics")
+    diagnostics_placeholder = st.empty()
 
-# Auto clear QA cache when settings change
-sig = f"{settings.active_mode}|{settings.llm_model}"
-if "settings_sig" not in st.session_state:
-    st.session_state["settings_sig"] = sig
-else:
-    if st.session_state["settings_sig"] != sig:
-        _safe_call(clear_qa_cache, USER_KEY)
-        st.session_state["settings_sig"] = sig
+
+def _refresh_sidebar(user_key: str) -> None:
+    """Write current stats into sidebar placeholders — no rerun needed."""
+    ram = _ram_stats()
+    ram_caption_placeholder.caption(
+        f"**RAM** {ram['used_gb']:.1f} / {ram['total_gb']:.1f} GB  ({ram['pct']:.0f}%)"
+    )
+    ram_bar_placeholder.progress(int(ram["pct"]))
+
+    vram = _vram_stats()
+    if vram:
+        vram_caption_placeholder.caption(
+            f"**VRAM** {vram['used_gb']:.1f} / {vram['total_gb']:.1f} GB  ({vram['pct']:.0f}%)"
+        )
+        vram_bar_placeholder.progress(int(vram["pct"]))
+    else:
+        vram_caption_placeholder.caption("**VRAM** — GPU not available")
+        vram_bar_placeholder.empty()
+
+    metrics = _session_metrics(user_key)
+    diagnostics_placeholder.json({
+        "session_id":           metrics["session_id"],
+        "turn_count":           metrics["turn_count"],
+        "summary_len":          metrics["summary_len"],
+        "retrieval_confidence": metrics["retrieval_confidence"],
+    })
+
+
+# Initial population on every page load
+_refresh_sidebar(USER_KEY)
+
+# ---------------------------------------------------------------------------
+# Chat history
+# ---------------------------------------------------------------------------
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
-for msg in st.session_state["messages"]:
-    with st.chat_message(msg["role"]):
-        st.write(_sanitize_for_display(msg["content"]))
+for idx, msg in enumerate(st.session_state["messages"]):
+    role = msg["role"]
+    with st.chat_message(role):
+        if role == "assistant":
+            content = msg.get("content", "")
+            st.write(_esc_answer(content))
+
+            timing_caption = msg.get("timing_caption", "")
+            if timing_caption:
+                st.caption(timing_caption)
+
+            sources = msg.get("sources", [])
+            if sources:
+                with st.expander("Retrieved Sources", expanded=False):
+                    for s in sources:
+                        st.write(_esc_answer(s))
+
+            graph_error = msg.get("graph_error", "")
+            if graph_error:
+                st.warning(graph_error)
+            _render_graph(msg.get("graph", {}) or {}, graph_key=f"history_{idx}")
+        else:
+            st.write(_esc(msg.get("content", "")))
+
+# ---------------------------------------------------------------------------
+# Chat input
+# ---------------------------------------------------------------------------
 
 prompt = st.chat_input("Ask about Syracuse research...")
 
 if prompt:
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.write(_sanitize_for_display(prompt))
+        st.write(_esc(prompt))
 
     with st.chat_message("assistant"):
         with st.spinner("Retrieving context and generating answer..."):
             out = answer_question(
                 prompt,
                 user_key=USER_KEY,
-                use_graph=settings.use_graph,
-                stateless=stateless_turn,
+                use_graph=True,
+                stateless=False,
             )
 
-            answer_text = (out.get("answer") or "").strip()
-            if answer_text:
-                st.write(_sanitize_for_display(answer_text))
-            else:
-                st.write("I could not generate an answer, but the retrieved sources are shown below.")
+        answer_text = (out.get("answer") or "").strip()
+        if answer_text:
+            st.write(_esc_answer(answer_text))
+        else:
+            answer_text = "I could not generate an answer, but the retrieved sources are shown below."
+            st.write(answer_text)
 
-            llm_calls = out.get("llm_calls", {}) if isinstance(out.get("llm_calls"), dict) else {}
-            answer_calls = int(llm_calls.get("answer_llm_calls", 0) or 0)
-            utility_calls = int(llm_calls.get("utility_llm_calls", 0) or 0)
-            st.caption(f"LLM calls this turn: answer={answer_calls} | utility={utility_calls}")
+        llm_calls = out.get("llm_calls", {}) if isinstance(out.get("llm_calls"), dict) else {}
+        timing    = out.get("timing_ms", {})  if isinstance(out.get("timing_ms"),  dict) else {}
+        timing_caption = (
+            f"LLM calls — answer: {llm_calls.get('answer_llm_calls', 0)} | "
+            f"utility: {llm_calls.get('utility_llm_calls', 0)} | "
+            f"total: {timing.get('total_ms', 0):.0f} ms"
+        )
+        st.caption(timing_caption)
 
-            if show_sources and out.get("sources"):
-                with st.expander("Retrieved Sources", expanded=False):
-                    for s in out["sources"]:
-                        st.write(_sanitize_for_display(s))
+        sources = list(out.get("sources", []) or [])
+        if sources:
+            with st.expander("Retrieved Sources", expanded=False):
+                for s in sources:
+                    st.write(_esc_answer(s))
 
-            if settings.use_graph:
-                if out.get("graph_error"):
-                    st.warning(out["graph_error"])
+        graph_error = str(out.get("graph_error", "") or "")
+        if graph_error:
+            st.warning(graph_error)
+        g = dict(out.get("graph_graph", {}) or {})
+        new_msg_idx = len(st.session_state["messages"])
+        _render_graph(g, graph_key=f"history_{new_msg_idx}")
 
-                g = out.get("graph_graph", {}) or {}
-                nodes_raw = g.get("nodes", []) or []
-                edges_raw = g.get("edges", []) or []
+    # Persist turn
+    st.session_state["messages"].append({
+        "role":           "assistant",
+        "content":        answer_text,
+        "sources":        sources,
+        "graph":          g,
+        "graph_error":    graph_error,
+        "timing_caption": timing_caption,
+    })
 
-                if nodes_raw and edges_raw:
-                    nodes = []
-                    edges = []
-
-                    for n in nodes_raw:
-                        nid = str(n.get("id", "")).strip()
-                        label = str(n.get("label", "")).strip() or nid
-                        ntype = str(n.get("type", "")).strip() or "node"
-
-                        size = 18
-                        if ntype == "paper":
-                            size = 22
-                        elif ntype == "researcher":
-                            size = 26
-                        elif ntype == "topic":
-                            size = 20
-                        elif ntype == "author":
-                            size = 16
-
-                        nodes.append(Node(id=nid, label=label, size=size))
-
-                    for e in edges_raw:
-                        src = str(e.get("source", "")).strip()
-                        tgt = str(e.get("target", "")).strip()
-                        etype = str(e.get("type", "")).strip() or ""
-                        if src and tgt:
-                            edges.append(Edge(source=src, target=tgt, label=etype))
-
-                    cfg = Config(
-                        width="100%",
-                        height=int(g.get("height", 650)),
-                        directed=True,
-                        physics=True,
-                        hierarchical=False,
-                    )
-
-                    with st.expander("Graph", expanded=True):
-                        agraph(nodes=nodes, edges=edges, config=cfg)
-
-                    if show_graph_query:
-                        with st.expander("Graph Data", expanded=False):
-                            st.json(g)
-                else:
-                    st.caption("No graph data available for visualization.")
-
-            if show_session_diag:
-                with st.expander("Session Diagnostics", expanded=False):
-                    metrics = _session_metrics(USER_KEY)
-                    timing = out.get("timing_ms", {}) if isinstance(out.get("timing_ms"), dict) else {}
-                    st.json(
-                        {
-                            "session_id": metrics.get("session_id", ""),
-                            "turn_count": metrics.get("turn_count", 0),
-                            "summary_len": metrics.get("summary_len", 0),
-                            "retrieval_confidence": metrics.get("retrieval_confidence", ""),
-                            "answer_llm_calls": answer_calls,
-                            "utility_llm_calls": utility_calls,
-                            "timing_ms": timing,
-                        }
-                    )
-
-    st.session_state["messages"].append({"role": "assistant", "content": answer_text})
+    # Refresh sidebar in-place — no rerun, graph stays mounted
+    _refresh_sidebar(USER_KEY)

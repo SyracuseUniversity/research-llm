@@ -2,6 +2,8 @@
 import os
 from dataclasses import dataclass
 
+_SENTINEL = object()
+
 
 def _env(name: str, default: str) -> str:
     v = os.getenv(name)
@@ -31,16 +33,17 @@ def _env_bool(name: str, default: bool) -> bool:
 class RuntimeSettings:
     active_mode: str = _env("RAG_ACTIVE_MODE", "full")
     llm_model: str = _env("RAG_LLM_MODEL", "llama-3.2-3b")
-    use_graph: bool = _env_bool("RAG_USE_GRAPH", False)
+    use_graph: bool = _env_bool("RAG_USE_GRAPH", True)
     stateless_default: bool = _env_bool("RAG_STATELESS_DEFAULT", False)
 
-    debug_rag: bool = _env_bool("RAG_DEBUG", False)
+    debug_rag: bool = _env_bool("RAG_DEBUG", True)
     force_gpu: bool = _env_bool("RAG_FORCE_GPU", True)
     answer_max_new_tokens: int = _env_int(
         "RAG_ANSWER_MAX_NEW_TOKENS",
-        _env_int("RAG_MAX_NEW_TOKENS", 256),
+        _env_int("RAG_MAX_NEW_TOKENS", 768),
     )
-    llm_timeout_s: int = _env_int("RAG_LLM_TIMEOUT_S", 40)
+    # Raised from 40 → 120 to handle complex queries without double-timeout
+    llm_timeout_s: int = _env_int("RAG_LLM_TIMEOUT_S", 120)
 
     prompt_doc_text_limit: int = _env_int("RAG_PROMPT_DOC_TEXT_LIMIT", 1400)
     prompt_max_docs: int = _env_int("RAG_PROMPT_MAX_DOCS", 36)
@@ -88,7 +91,7 @@ class RuntimeSettings:
     followup_fetch_k_mult: float = _env_float("RAG_FOLLOWUP_FETCH_K_MULT", 2.0)
     generic_query_terms: str = _env(
         "RAG_GENERIC_QUERY_TERMS",
-        "about,again,anything,anyone,can,could,does,else,field,give,him,her,it,its,know,me,more,other,others,tell,that,them,they,those,this,what,which,who,whom,why,work",
+        "about,again,also,anything,anyone,can,could,does,else,field,give,help,him,her,it,its,know,me,more,need,other,others,please,tell,that,them,they,those,this,what,which,who,whom,why,work",
     )
     generic_token_min_len: int = _env_int("RAG_GENERIC_TOKEN_MIN_LEN", 3)
 
@@ -118,6 +121,33 @@ class RuntimeSettings:
     enable_llm_summary_regen: bool = _env_bool("RAG_ENABLE_LLM_SUMMARY_REGEN", False)
     allow_utility_concurrency: bool = _env_bool("RAG_ALLOW_UTILITY_CONCURRENCY", False)
     session_turns_keep: int = _env_int("RAG_SESSION_TURNS_KEEP", 24)
+
+    _CACHE_BUSTING_FIELDS: frozenset = frozenset({
+        "generic_query_terms",
+        "generic_token_min_len",
+        "followup_phrases",
+        "followup_pronoun_regex",
+    })
+
+    def __setattr__(self, name: str, value: object) -> None:
+        old = getattr(self, name, _SENTINEL)
+        super().__setattr__(name, value)
+        if old is not _SENTINEL and old != value and name in self._CACHE_BUSTING_FIELDS:
+            self._bust_engine_caches(name)
+
+    @staticmethod
+    def _bust_engine_caches(changed_field: str) -> None:
+        try:
+            import rag_engine as _re
+            if changed_field in {"generic_query_terms", "generic_token_min_len"}:
+                _re._GENERIC_QUERY_TERMS_CACHE = None
+            if changed_field == "followup_phrases":
+                _re._FOLLOWUP_PHRASES_CACHE = None
+            if changed_field == "followup_pronoun_regex":
+                _re._FOLLOWUP_PRONOUN_PATTERN_CACHE = None
+                _re._FOLLOWUP_PRONOUN_PATTERN_READY = False
+        except Exception:
+            pass
 
 
 settings = RuntimeSettings()
