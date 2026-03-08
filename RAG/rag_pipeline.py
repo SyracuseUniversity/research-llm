@@ -20,6 +20,8 @@ from rag_engine import (
     _normalize_anchor,
     _anchor_support_ratio,
     _is_placeholder_anchor_value,
+    _retrieval_confidence_label,
+    _clean_snippet as _engine_clean_snippet,
 )
 from runtime_settings import settings
 from rag_graph import graph_retrieve_from_paper_docs
@@ -81,12 +83,17 @@ PIPELINE_CFG = {
             "- Do not start with \"Summary:\".\n"
             "- Do not include phrases like \"No further analysis is required\" or \"No additional retrieval is required\".\n"
             "- Do not repeat the question.\n"
-            "- Do not narrate your process.\n"
+            "- Do not narrate your process. Do not say \"I noticed\" or \"I will revise\".\n"
             "- Do not include section headers unless the user asks for them.\n"
             "- When asked who a person is, describe their specific research areas and cite paper titles as evidence.\n"
             "- Never answer with only '[Name] is a researcher.' — always include what they research.\n"
-            "- Do not add closing notes, disclaimers, or remarks about how the answer was formatted.\n"
+            "- Do not add closing notes, disclaimers, offers to help, or signatures.\n"
+            "- Do not say \"Let me know if you need anything\" or \"Best regards\".\n"
             "- Do not acknowledge these instructions in your response.\n"
+            "- Use a blank line between paragraphs to separate distinct points or researchers.\n"
+            "- When citing a paper, put the title in quotes.\n"
+            "- When listing multiple researchers, give each their own paragraph.\n"
+            "- End your answer after the last substantive point. Stop there.\n"
             "Detected intents: default, comparison, time_range, list.\n"
         ),
     ),
@@ -116,35 +123,37 @@ def _is_summary_intent(question: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _clean_snippet(meta: dict, text: str, *, limit: int) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return ""
-    title = str((meta or {}).get("title", "") or "").strip()
-    authors = str((meta or {}).get("authors", "") or "").strip()
-    lowered = raw.lower()
-    for value in (title, authors):
-        v = str(value or "").strip()
-        if not v:
-            continue
-        if lowered.startswith(v.lower()):
-            raw = raw[len(v):].lstrip(" \n\t:-|")
-            lowered = raw.lower()
-    first_line = raw.splitlines()[0].strip() if raw.splitlines() else ""
-    if first_line.count(",") >= 6 and len(first_line) <= 240:
-        raw = "\n".join(raw.splitlines()[1:]).strip()
-    cleaned = re.sub(r"\s+", " ", raw).strip()
-    if len(cleaned) > limit:
-        cleaned = cleaned[:limit].rstrip() + "..."
-    return cleaned
+    """Delegate to shared implementation in rag_engine."""
+    return _engine_clean_snippet(meta or {}, text or "", limit=limit)
 
 
 def _doc_to_source_md(d) -> str:
+    """Format a retrieved document as a clean APA-style citation."""
     meta = d.metadata or {}
-    title = meta.get("title", "")
-    authors = meta.get("authors", "")
-    year = meta.get("year", meta.get("publication_date", ""))
-    snippet = _clean_snippet(meta, str(d.page_content or ""), limit=280)
-    return f"title={title} | authors={authors} | year={year}\n{snippet}"
+    authors = re.sub(r"</?[a-zA-Z][^>]*>", "", str(meta.get("authors", "") or "")).strip()
+    title = re.sub(r"</?[a-zA-Z][^>]*>", "", str(meta.get("title", "") or "")).strip()
+    year = str(meta.get("year", meta.get("publication_date", "")) or "").strip()
+    doi = str(meta.get("doi", "") or "").strip()
+
+    # Extract just the year portion if a full date was stored
+    year_match = re.search(r"\b(19|20)\d{2}\b", year)
+    year_short = year_match.group(0) if year_match else ""
+
+    if not title or title.lower() == "untitled":
+        title = "[Untitled]"
+
+    # APA: Author(s). (Year). *Title*. DOI
+    parts: List[str] = []
+    parts.append(f"{authors}." if authors else "[Unknown author].")
+    parts.append(f"({year_short})." if year_short else "(n.d.).")
+    parts.append(f"*{title}*.")
+    if doi:
+        if doi.startswith("10."):
+            doi = f"https://doi.org/{doi}"
+        if doi.startswith("http"):
+            parts.append(doi)
+
+    return " ".join(parts)
 
 
 def _doc_to_json(d, text_limit: Optional[int] = None) -> Dict[str, Any]:
@@ -407,6 +416,12 @@ def _is_assistant_closure_sentence(sentence: str) -> bool:
     lower = re.sub(r"\s+", " ", str(sentence or "").strip().lower())
     if re.match(r"^note:\s.*(format|revised|reformatted|response|answer)", lower):
         return True
+    if re.match(r"^(also,?\s*)?(i can help|let me know|best regards|please let me know)", lower):
+        return True
+    if re.match(r"^(however,?\s*)?i noticed that the response", lower):
+        return True
+    if re.match(r"^i will revise the response", lower):
+        return True
     return any(m in lower for m in (
         "please let me know if you need", "if you need any further assistance",
         "i can help with anything else", "let me know if you need anything else",
@@ -414,6 +429,14 @@ def _is_assistant_closure_sentence(sentence: str) -> bool:
         "i've revised the response", "i made some minor changes",
         "please provide the next question", "i am ready to help",
         "i'm ready to help", "i am ready when you are",
+        "let me know if you would like me to proceed",
+        "let me know if you'd like me to proceed",
+        "i'm here to assist you", "i'm here to help",
+        "best regards", "[assistant]",
+        "i can help with the next question",
+        "i will revise the response to only include",
+        "i noticed that the response contains some extraneous",
+        "to only include information present in the retrieved",
     ))
 
 
@@ -491,6 +514,15 @@ def _sanitize_user_answer(text: str) -> str:
         "to better match the required response format",
         "to match the required response format",
         "reformatted to better match",
+        # Self-revision patterns where LLM critiques then repeats itself
+        "however, i noticed that the response contains",
+        "i will revise the response to only include",
+        "to only include information present in the retrieved",
+        "let me know if you'd like me to proceed",
+        "let me know if you would like me to proceed",
+        "i can help with the next question",
+        "i'm here to assist you", "i'm here to help you",
+        "best regards",
     )
     kept = [
         line for line in raw.splitlines()
@@ -519,7 +551,7 @@ def _sanitize_user_answer(text: str) -> str:
         norm = _normalize_for_similarity(para)
         if not norm:
             continue
-        if any(norm == p or SequenceMatcher(None, norm, p).ratio() >= 0.93 for p in seen_norms):
+        if any(norm == p or SequenceMatcher(None, norm, p).ratio() >= 0.80 for p in seen_norms):
             continue
         seen_norms.append(norm)
         result.append(para)
@@ -539,7 +571,28 @@ def _sanitize_user_answer(text: str) -> str:
 
 
 def sanitize_answer_for_display(text: str) -> str:
-    return _sanitize_user_answer(text)
+    cleaned = _sanitize_user_answer(text)
+    # Strip residual HTML/XML tags from paper metadata (e.g. <scp>, <i>, <b>)
+    cleaned = re.sub(r"</?[a-zA-Z][^>]*>", "", cleaned)
+    # Collapse runs of whitespace but preserve intentional paragraph breaks
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+
+    # Force paragraph breaks between distinct researcher/topic blocks.
+    # LLaMA often writes "...topic A. Name B studies..." as one paragraph.
+    # Insert a break before sentences that start a new person/topic.
+    cleaned = re.sub(
+        r"(?<=[.!?])\s+(?=[A-Z][a-z]+ [A-Z][a-z]+ (?:is |studies |has |works |focuses |explores |investigates |examines |researches ))",
+        "\n\n", cleaned,
+    )
+    # Also break before "Additionally," / "Furthermore," / "Another researcher"
+    cleaned = re.sub(
+        r"(?<=[.!?])\s+(?=(?:Additionally|Furthermore|Moreover|Another researcher|In addition|Separately),?\s)",
+        "\n\n", cleaned,
+    )
+
+    # Normalise paragraph breaks: keep double-newlines, collapse triples+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _build_anchor_from_dominance(dominance: Dict[str, Any]) -> Dict[str, Any]:
@@ -593,24 +646,14 @@ def _choose_anchor_update(
     return anchor_now, "kept_ambiguous_switch_requires_confirmation"
 
 
-def _retrieval_confidence_label(*, docs_count: int, anchor_consistent: bool) -> str:
-    min_docs = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
-    if docs_count < min_docs:
-        return "weak"
-    if not anchor_consistent:
-        return "inconsistent"
-    if docs_count >= max(8, min_docs * 2):
-        return "high"
-    if docs_count >= max(4, min_docs + 1):
-        return "medium"
-    return "low"
-
-
 def _build_compact_context(
     docs: List[Any],
     max_docs: Optional[int] = None,
     text_limit: Optional[int] = None,
 ) -> str:
+    def _strip_tags(s: str) -> str:
+        return re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or ""))
+
     if max_docs is None:
         max_docs = int(getattr(settings, "prompt_max_docs", 24))
     if text_limit is None:
@@ -619,10 +662,10 @@ def _build_compact_context(
     for d in docs[:max_docs]:
         j = _doc_to_json(d, text_limit=text_limit)
         blocks.append("\n".join([
-            f"Title: {j.get('title', '')}",
-            f"Authors: {j.get('authors', '')}",
+            f"Title: {_strip_tags(j.get('title', ''))}",
+            f"Authors: {_strip_tags(j.get('authors', ''))}",
             f"Year: {j.get('year', '')}",
-            f"Snippet: {j.get('text', '')}",
+            f"Snippet: {_strip_tags(j.get('text', ''))}",
         ]))
     return "\n\n".join(blocks)
 
@@ -859,16 +902,16 @@ def _last_user_turn_text_from_state(state: Dict[str, Any]) -> str:
 
 
 def _fallback_retrieval_text(*, user_question: str, resolved_text: str, previous_user_text: str) -> str:
+    """Return the best retrieval query text.
+
+    Previously this prepended the previous user turn for referential queries,
+    but that created garbage composite queries like "now list the faculty
+    Summarize the mechanisms described in their papers".  The rolling summary
+    already captures prior context, so we just use the resolved text or the
+    raw question as-is.
+    """
     q = re.sub(r"\s+", " ", (user_question or "").strip())
     resolved = re.sub(r"\s+", " ", (resolved_text or "").strip())
-    prev = re.sub(r"\s+", " ", (previous_user_text or "").strip())
-    if resolved and resolved != q:
-        return resolved
-    if q and prev and _is_followup_coref_question(q):
-        if _normalize_meta_value(prev) != _normalize_meta_value(q):
-            prev_hint = _clip_sentences(prev, max_sentences=2, max_chars=340)
-            if prev_hint:
-                return f"{prev_hint} {q}".strip()
     return resolved or q or ""
 
 
@@ -987,208 +1030,211 @@ def answer_question(
     mgr.switch_mode(effective_mode)
     mgr.switch_answer_model(answer_model_key)
 
-    eng = mgr.get_engine(user_key, mode=effective_mode, stateless=stateless)
-    context = eng.prepare_context(q, stateless=stateless)
-    context.raw_question = q
 
-    paper_docs_raw = list(context.paper_docs or [])
-    resolved_q = (context.rewritten_question or "").strip()
-    prev_user_text = _last_user_turn_text_from_state(pre_state)
-    resolved_q = _fallback_retrieval_text(
-        user_question=q, resolved_text=resolved_q, previous_user_text=prev_user_text,
-    )
-    summary_intent = _is_summary_intent(q)
-    detected_intent = str(getattr(context, "detected_intent", "") or _classify_generic_intent(q))
-    retrieval_q = resolved_q or q
-    raw_retrieval_count = len(paper_docs_raw)
+    # Acquire the generation lock for the full engine-stateful section
+    # (prepare_context through finalize_turn) to prevent concurrent
+    # requests for the same session from racing on Engine mutable state.
+    engine_lock_ctx = nullcontext()
+    if hasattr(mgr, "answer_generation_lock") and not bool(getattr(settings, "allow_utility_concurrency", False)):
+        engine_lock_ctx = mgr.answer_generation_lock
 
-    first_pass_docs = _filter_noisy_docs(paper_docs_raw, retrieval_q)
-    dominance = _dominant_metadata_filter_from_docs(
-        first_pass_docs, resolved_q or q,
-        majority_ratio=float(getattr(settings, "dominant_majority_ratio", 0.6)),
-        min_count=int(getattr(settings, "dominant_min_count", 3)),
-    )
-    dominant_filter = dict(dominance.get("filter", {}) or {})
-    dominance_conf = float(dominance.get("confidence", 0.0) or 0.0)
-    dominance_ratio = float(dominance.get("ratio", 0.0) or 0.0)
-    replace_conf = float(getattr(settings, "dominant_replace_confidence", 0.82))
-    majority_ratio = float(getattr(settings, "dominant_majority_ratio", 0.6))
-    strong_ratio_floor = min(0.95, max(replace_conf + 0.02, majority_ratio + 0.22))
-    dominant_filter_usable = (
-        bool(dominance.get("dominant")) and bool(dominant_filter)
-        and (dominance_conf >= replace_conf or dominance_ratio >= strong_ratio_floor)
-        and not _is_placeholder_anchor_value(str(dominant_filter.get("value", "") or ""))
-    )
+    with engine_lock_ctx:
+        eng = mgr.get_engine(user_key, mode=effective_mode, stateless=stateless)
+        context = eng.prepare_context(q, stateless=stateless)
+        context.raw_question = q
 
-    paper_docs = list(first_pass_docs)
-    dominant_second_pass_count = 0
-    if dominant_filter_usable:
-        where_filter = {str(dominant_filter.get("key", "")): str(dominant_filter.get("value", ""))}
-        second_pass_docs = eng.retrieve_papers(
-            retrieval_q,
-            int((context.budgets or {}).get("BUDGET_PAPERS", getattr(settings, "budget_papers", 0))),
-            query_embedding=None, where_filter=where_filter, raw_question=q,
+        paper_docs_raw = list(context.paper_docs or [])
+        resolved_q = (context.rewritten_question or "").strip()
+        prev_user_text = _last_user_turn_text_from_state(pre_state)
+        resolved_q = _fallback_retrieval_text(
+            user_question=q, resolved_text=resolved_q, previous_user_text=prev_user_text,
         )
-        second_pass_docs = _filter_noisy_docs(second_pass_docs, retrieval_q)
-        dominant_second_pass_count = len(second_pass_docs)
-        paper_docs = _dedupe_docs(paper_docs + second_pass_docs)
+        summary_intent = _is_summary_intent(q)
+        detected_intent = str(getattr(context, "detected_intent", "") or _classify_generic_intent(q))
+        retrieval_q = resolved_q or q
+        raw_retrieval_count = len(paper_docs_raw)
 
-    post_filter_count = len(paper_docs)
-    mem_docs = context.mem_docs or []
-
-    anchor_before = _normalize_anchor(getattr(context, "anchor", {}) or getattr(eng, "anchor", {}))
-    candidate_anchor = _build_anchor_from_dominance(dominance)
-    anchor_after, anchor_action = _choose_anchor_update(
-        current_anchor=anchor_before, candidate_anchor=candidate_anchor,
-        dominance=dominance, question=q,
-    )
-    eng.anchor = dict(anchor_after or {})
-    eng.anchor_last_action = anchor_action
-    context.anchor = dict(anchor_after or {})
-    context.paper_docs = list(paper_docs)
-
-    anchor_value = str(anchor_after.get("value", "") or "").strip()
-    anchor_support_ratio = _anchor_support_ratio(anchor_value, paper_docs) if anchor_value else 1.0
-    anchor_consistent = (
-        (not anchor_value)
-        or (anchor_support_ratio >= float(getattr(settings, "anchor_consistency_min_ratio", 0.45)))
-    )
-    retrieval_confidence = _retrieval_confidence_label(
-        docs_count=post_filter_count, anchor_consistent=anchor_consistent,
-    )
-    eng.last_retrieval_confidence = retrieval_confidence
-    eng.last_anchor_support_ratio = float(anchor_support_ratio)
-
-    prompt_max_docs = int(getattr(settings, "prompt_max_docs", 24))
-    prompt_text_limit = int(getattr(settings, "prompt_doc_text_limit", 800))
-    if retrieval_confidence in {"weak", "inconsistent"}:
-        prompt_max_docs = min(prompt_max_docs, max(2, int(getattr(settings, "low_conf_prompt_max_docs", 8))))
-        prompt_text_limit = min(prompt_text_limit, max(160, int(getattr(settings, "low_conf_prompt_doc_text_limit", 420))))
-
-    # ── Prompt assembly ────────────────────────────────────────────────────────
-    rolling_summary_text = pre_state.get("rolling_summary", "") or ""
-    pre_turns_count = len(pre_state.get("turns", []) or [])
-    pre_summary_len = len(rolling_summary_text)
-    recent_turns_ctx = _build_recent_turns_context(
-        pre_state, max_turns=min(6, max(2, int(PIPELINE_CFG["recent_turns_in_prompt"]))),
-    )
-
-    prompt_base_sections: List[str] = [PIPELINE_CFG["prompt_prefix"].rstrip()]
-    rolling_summary_prompt = _rolling_summary_for_prompt(rolling_summary_text)
-    if rolling_summary_prompt:
-        prompt_base_sections.append("ROLLING SUMMARY:\n" + rolling_summary_prompt)
-    if recent_turns_ctx:
-        prompt_base_sections.append("RECENT TURNS:\n" + recent_turns_ctx)
-
-    question_for_answer = resolved_q or q
-
-    if summary_intent:
-        style_hint = (
-            "The retrieved context already contains pre-written paper summaries. "
-            "Extract and report the key mechanisms, findings, and methods described "
-            "in those summaries directly — do not invent or paraphrase beyond what "
-            "is stated. Attribute each point to its paper title. "
-            "Write at least one paragraph per relevant paper or research theme."
+        first_pass_docs = _filter_noisy_docs(paper_docs_raw, retrieval_q)
+        dominance = _dominant_metadata_filter_from_docs(
+            first_pass_docs, resolved_q or q,
+            majority_ratio=float(getattr(settings, "dominant_majority_ratio", 0.6)),
+            min_count=int(getattr(settings, "dominant_min_count", 3)),
         )
-    elif detected_intent == "comparison":
-        style_hint = "Compare the relevant items directly and keep claims grounded in retrieved evidence."
-    elif detected_intent == "time_range":
-        style_hint = (
-            "If asked about the studied time period, report it only when explicitly stated in retrieved context. "
-            "If not stated, say that directly and optionally provide publication years as a separate fallback. "
-            "Do not infer studied period from publication years."
-        )
-    elif detected_intent == "list":
-        style_hint = "Provide a concise list with short evidence-backed descriptors."
-    else:
-        style_hint = (
-            "Give a direct evidence-grounded answer in plain prose. "
-            "You MUST write at least 3 full sentences. "
-            "Identify specific research topics, methods, or findings from the papers. "
-            "Never respond with only '[Name] is a researcher' — always elaborate."
+        dominant_filter = dict(dominance.get("filter", {}) or {})
+        dominance_conf = float(dominance.get("confidence", 0.0) or 0.0)
+        dominance_ratio = float(dominance.get("ratio", 0.0) or 0.0)
+        replace_conf = float(getattr(settings, "dominant_replace_confidence", 0.82))
+        majority_ratio = float(getattr(settings, "dominant_majority_ratio", 0.6))
+        strong_ratio_floor = min(0.95, max(replace_conf + 0.02, majority_ratio + 0.22))
+        dominant_filter_usable = (
+            bool(dominance.get("dominant")) and bool(dominant_filter)
+            and (dominance_conf >= replace_conf or dominance_ratio >= strong_ratio_floor)
+            and not _is_placeholder_anchor_value(str(dominant_filter.get("value", "") or ""))
         )
 
-    prompt, used_prompt_docs, used_prompt_text_limit = _fit_prompt_to_budget(
-        runtime=getattr(mgr, "answer_runtime", None),
-        docs=paper_docs, base_sections=prompt_base_sections,
-        style_hint=style_hint, question_for_answer=question_for_answer,
-        max_docs=prompt_max_docs, text_limit=prompt_text_limit,
-        min_docs=1, min_text_limit=120,
-    )
+        paper_docs = list(first_pass_docs)
+        dominant_second_pass_count = 0
+        if dominant_filter_usable:
+            where_filter = {str(dominant_filter.get("key", "")): str(dominant_filter.get("value", ""))}
+            second_pass_docs = eng.retrieve_papers(
+                retrieval_q,
+                int((context.budgets or {}).get("BUDGET_PAPERS", getattr(settings, "budget_papers", 0))),
+                query_embedding=None, where_filter=where_filter, raw_question=q,
+            )
+            second_pass_docs = _filter_noisy_docs(second_pass_docs, retrieval_q)
+            dominant_second_pass_count = len(second_pass_docs)
+            paper_docs = _dedupe_docs(paper_docs + second_pass_docs)
 
-    # ── Answer generation ──────────────────────────────────────────────────────
-    min_docs_to_attempt = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
+        post_filter_count = len(paper_docs)
+        mem_docs = context.mem_docs or []
 
-    if not paper_docs:
-        answer_text = _insufficient_context_answer(q, detected_intent)
-    elif retrieval_confidence == "weak":
-        answer_text = _uncertain_retrieval_answer(q, anchor_value=anchor_value, reason=retrieval_confidence)
-    elif retrieval_confidence == "inconsistent" and len(paper_docs) < min_docs_to_attempt:
-        answer_text = _uncertain_retrieval_answer(q, anchor_value=anchor_value, reason=retrieval_confidence)
-    else:
-        if retrieval_confidence == "inconsistent":
-            prompt_sections_for_call = [s for s in prompt_base_sections if not s.startswith("ROLLING SUMMARY")]
-            prompt, used_prompt_docs, used_prompt_text_limit = _fit_prompt_to_budget(
-                runtime=getattr(mgr, "answer_runtime", None),
-                docs=paper_docs, base_sections=prompt_sections_for_call,
-                style_hint=style_hint, question_for_answer=question_for_answer,
-                max_docs=prompt_max_docs, text_limit=prompt_text_limit,
-                min_docs=1, min_text_limit=120,
+        anchor_before = _normalize_anchor(getattr(context, "anchor", {}) or getattr(eng, "anchor", {}))
+        candidate_anchor = _build_anchor_from_dominance(dominance)
+        anchor_after, anchor_action = _choose_anchor_update(
+            current_anchor=anchor_before, candidate_anchor=candidate_anchor,
+            dominance=dominance, question=q,
+        )
+        eng.anchor = dict(anchor_after or {})
+        eng.anchor_last_action = anchor_action
+        context.anchor = dict(anchor_after or {})
+        context.paper_docs = list(paper_docs)
+
+        anchor_value = str(anchor_after.get("value", "") or "").strip()
+        anchor_support_ratio = _anchor_support_ratio(anchor_value, paper_docs) if anchor_value else 1.0
+        anchor_consistent = (
+            (not anchor_value)
+            or (anchor_support_ratio >= float(getattr(settings, "anchor_consistency_min_ratio", 0.45)))
+        )
+        retrieval_confidence = _retrieval_confidence_label(
+            docs_count=post_filter_count, anchor_consistent=anchor_consistent,
+        )
+        eng.last_retrieval_confidence = retrieval_confidence
+        eng.last_anchor_support_ratio = float(anchor_support_ratio)
+
+        prompt_max_docs = int(getattr(settings, "prompt_max_docs", 24))
+        prompt_text_limit = int(getattr(settings, "prompt_doc_text_limit", 800))
+        if retrieval_confidence in {"weak", "inconsistent"}:
+            prompt_max_docs = min(prompt_max_docs, max(2, int(getattr(settings, "low_conf_prompt_max_docs", 8))))
+            prompt_text_limit = min(prompt_text_limit, max(160, int(getattr(settings, "low_conf_prompt_doc_text_limit", 420))))
+
+        # ── Prompt assembly ────────────────────────────────────────────────────────
+        rolling_summary_text = pre_state.get("rolling_summary", "") or ""
+        pre_turns_count = len(pre_state.get("turns", []) or [])
+        pre_summary_len = len(rolling_summary_text)
+        recent_turns_ctx = _build_recent_turns_context(
+            pre_state, max_turns=min(6, max(2, int(PIPELINE_CFG["recent_turns_in_prompt"]))),
+        )
+
+        prompt_base_sections: List[str] = [PIPELINE_CFG["prompt_prefix"].rstrip()]
+        rolling_summary_prompt = _rolling_summary_for_prompt(rolling_summary_text)
+        if rolling_summary_prompt:
+            prompt_base_sections.append("ROLLING SUMMARY:\n" + rolling_summary_prompt)
+        if recent_turns_ctx:
+            prompt_base_sections.append("RECENT TURNS:\n" + recent_turns_ctx)
+
+        question_for_answer = resolved_q or q
+
+        if summary_intent:
+            style_hint = (
+                "The retrieved context already contains pre-written paper summaries. "
+                "Extract and report the key mechanisms, findings, and methods described "
+                "in those summaries directly — do not invent or paraphrase beyond what "
+                "is stated. Attribute each point to its paper title. "
+                "Write at least one paragraph per relevant paper or research theme."
+            )
+        elif detected_intent == "comparison":
+            style_hint = "Compare the relevant items directly and keep claims grounded in retrieved evidence."
+        elif detected_intent == "time_range":
+            style_hint = (
+                "If asked about the studied time period, report it only when explicitly stated in retrieved context. "
+                "If not stated, say that directly and optionally provide publication years as a separate fallback. "
+                "Do not infer studied period from publication years."
+            )
+        elif detected_intent == "list":
+            style_hint = "Provide a concise list with short evidence-backed descriptors."
+        else:
+            style_hint = (
+                "Give a direct evidence-grounded answer in plain prose. "
+                "You MUST write at least 3 full sentences. "
+                "Identify specific research topics, methods, or findings from the papers. "
+                "Never respond with only '[Name] is a researcher' — always elaborate."
             )
 
-        answer_lock_ctx = nullcontext()
-        if hasattr(mgr, "answer_generation_lock") and not bool(getattr(settings, "allow_utility_concurrency", False)):
-            answer_lock_ctx = mgr.answer_generation_lock
+        prompt, used_prompt_docs, used_prompt_text_limit = _fit_prompt_to_budget(
+            runtime=getattr(mgr, "answer_runtime", None),
+            docs=paper_docs, base_sections=prompt_base_sections,
+            style_hint=style_hint, question_for_answer=question_for_answer,
+            max_docs=prompt_max_docs, text_limit=prompt_text_limit,
+            min_docs=1, min_text_limit=120,
+        )
 
-        t0_gen = time.perf_counter()
-        try:
-            with answer_lock_ctx:
+        # ── Answer generation ──────────────────────────────────────────────────────
+        min_docs_to_attempt = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
+
+        if not paper_docs:
+            answer_text = _insufficient_context_answer(q, detected_intent)
+        elif retrieval_confidence == "weak":
+            answer_text = _uncertain_retrieval_answer(q, anchor_value=anchor_value, reason=retrieval_confidence)
+        elif retrieval_confidence == "inconsistent" and len(paper_docs) < min_docs_to_attempt:
+            answer_text = _uncertain_retrieval_answer(q, anchor_value=anchor_value, reason=retrieval_confidence)
+        else:
+            if retrieval_confidence == "inconsistent":
+                prompt_sections_for_call = [s for s in prompt_base_sections if not s.startswith("ROLLING SUMMARY")]
+                prompt, used_prompt_docs, used_prompt_text_limit = _fit_prompt_to_budget(
+                    runtime=getattr(mgr, "answer_runtime", None),
+                    docs=paper_docs, base_sections=prompt_sections_for_call,
+                    style_hint=style_hint, question_for_answer=question_for_answer,
+                    max_docs=prompt_max_docs, text_limit=prompt_text_limit,
+                    min_docs=1, min_text_limit=120,
+                )
+
+            t0_gen = time.perf_counter()
+            try:
                 answer_llm_calls += 1
                 raw_answer = _invoke_with_timeout(
                     mgr.answer_runtime.llm, prompt, int(getattr(settings, "llm_timeout_s", 40)),
                 )
-        except Exception:
-            raw_answer = ""
-        generation_time_ms = (time.perf_counter() - t0_gen) * 1000.0
-        answer_text = _extract_answer_text(raw_answer)
+            except Exception:
+                raw_answer = ""
+            generation_time_ms = (time.perf_counter() - t0_gen) * 1000.0
+            answer_text = _extract_answer_text(raw_answer)
 
-        if not answer_text:
-            retry_prompt, _rd, _rl = _fit_prompt_to_budget(
-                runtime=getattr(mgr, "answer_runtime", None),
-                docs=paper_docs,
-                base_sections=prompt_sections_for_call if retrieval_confidence == "inconsistent" else prompt_base_sections,
-                style_hint=style_hint, question_for_answer=question_for_answer,
-                max_docs=max(1, min(6, max(1, used_prompt_docs // 2))),
-                text_limit=max(140, min(320, int(max(120, used_prompt_text_limit) * 0.7))),
-                min_docs=1, min_text_limit=96,
-            )
-            t0_retry = time.perf_counter()
-            try:
-                with answer_lock_ctx:
+            if not answer_text:
+                retry_prompt, _rd, _rl = _fit_prompt_to_budget(
+                    runtime=getattr(mgr, "answer_runtime", None),
+                    docs=paper_docs,
+                    base_sections=prompt_sections_for_call if retrieval_confidence == "inconsistent" else prompt_base_sections,
+                    style_hint=style_hint, question_for_answer=question_for_answer,
+                    max_docs=max(1, min(6, max(1, used_prompt_docs // 2))),
+                    text_limit=max(140, min(320, int(max(120, used_prompt_text_limit) * 0.7))),
+                    min_docs=1, min_text_limit=96,
+                )
+                t0_retry = time.perf_counter()
+                try:
                     answer_llm_calls += 1
                     raw_retry = _invoke_with_timeout(
                         mgr.answer_runtime.llm, retry_prompt, int(getattr(settings, "llm_timeout_s", 40)),
                     )
-            except Exception:
-                raw_retry = ""
-            generation_time_ms += (time.perf_counter() - t0_retry) * 1000.0
-            answer_text = _extract_answer_text(raw_retry)
+                except Exception:
+                    raw_retry = ""
+                generation_time_ms += (time.perf_counter() - t0_retry) * 1000.0
+                answer_text = _extract_answer_text(raw_retry)
 
-        if not answer_text:
-            answer_text = PIPELINE_CFG["llm_no_answer"]
+            if not answer_text:
+                answer_text = PIPELINE_CFG["llm_no_answer"]
 
-    if paper_docs and retrieval_confidence not in {"weak", "inconsistent"}:
-        cleaned = (answer_text or "").strip()
-        if not cleaned or cleaned == PIPELINE_CFG["llm_no_answer"] or len(cleaned) < 24:
-            fallback = _structured_general_fallback(q, paper_docs, detected_intent)
-            if not fallback:
-                fallback = _fallback_answer_from_docs(q, paper_docs)
-            if fallback:
-                answer_text = fallback
+        if paper_docs and retrieval_confidence not in {"weak", "inconsistent"}:
+            cleaned = (answer_text or "").strip()
+            if not cleaned or cleaned == PIPELINE_CFG["llm_no_answer"] or len(cleaned) < 24:
+                fallback = _structured_general_fallback(q, paper_docs, detected_intent)
+                if not fallback:
+                    fallback = _fallback_answer_from_docs(q, paper_docs)
+                if fallback:
+                    answer_text = fallback
 
-    answer_text = _sanitize_user_answer(answer_text).strip() or PIPELINE_CFG["llm_no_answer"]
-    eng.last_answer_llm_calls = int(answer_llm_calls)
-    eng.finalize_turn(context, answer_text, no_results=not paper_docs)
+        answer_text = _sanitize_user_answer(answer_text).strip() or PIPELINE_CFG["llm_no_answer"]
+        eng.last_answer_llm_calls = int(answer_llm_calls)
+        eng.finalize_turn(context, answer_text, no_results=not paper_docs)
 
     # ── Post-turn state ────────────────────────────────────────────────────────
     post_state = (
@@ -1233,9 +1279,19 @@ def answer_question(
     }
 
     sources: List[str] = []
+    seen_titles: set = set()
+    source_num = 0
     for d in paper_docs:
         try:
-            sources.append(_doc_to_source_md(d))
+            # Deduplicate by title to avoid showing the same paper twice
+            meta = getattr(d, "metadata", {}) or {}
+            title_key = re.sub(r"\s+", " ", str(meta.get("title", "") or "").strip().lower())
+            if title_key and title_key != "untitled" and title_key in seen_titles:
+                continue
+            if title_key and title_key != "untitled":
+                seen_titles.add(title_key)
+            source_num += 1
+            sources.append(f"[{source_num}] {_doc_to_source_md(d)}")
         except Exception:
             pass
 

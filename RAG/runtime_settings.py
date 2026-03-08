@@ -40,10 +40,10 @@ class RuntimeSettings:
     force_gpu: bool = _env_bool("RAG_FORCE_GPU", True)
     answer_max_new_tokens: int = _env_int(
         "RAG_ANSWER_MAX_NEW_TOKENS",
-        _env_int("RAG_MAX_NEW_TOKENS", 768),
+        _env_int("RAG_MAX_NEW_TOKENS", 1024),
     )
-    # Raised from 40 → 120 to handle complex queries without double-timeout
-    llm_timeout_s: int = _env_int("RAG_LLM_TIMEOUT_S", 120)
+    # 5-minute timeout — long enough for complex queries on constrained hardware
+    llm_timeout_s: int = _env_int("RAG_LLM_TIMEOUT_S", 300)
 
     prompt_doc_text_limit: int = _env_int("RAG_PROMPT_DOC_TEXT_LIMIT", 1400)
     prompt_max_docs: int = _env_int("RAG_PROMPT_MAX_DOCS", 36)
@@ -97,10 +97,10 @@ class RuntimeSettings:
 
     ner_context_max_docs: int = _env_int("RAG_NER_CONTEXT_MAX_DOCS", 18)
 
-    summary_max_chars: int = _env_int("RAG_SUMMARY_MAX_CHARS", 1800)
-    summary_max_items_per_field: int = _env_int("RAG_SUMMARY_MAX_ITEMS_PER_FIELD", 6)
+    summary_max_chars: int = _env_int("RAG_SUMMARY_MAX_CHARS", 800)
+    summary_max_items_per_field: int = _env_int("RAG_SUMMARY_MAX_ITEMS_PER_FIELD", 4)
     summary_recent_turns_keep: int = _env_int("RAG_SUMMARY_RECENT_TURNS_KEEP", 8)
-    recent_turns_in_prompt: int = _env_int("RAG_RECENT_TURNS_IN_PROMPT", 4)
+    recent_turns_in_prompt: int = _env_int("RAG_RECENT_TURNS_IN_PROMPT", 2)
 
     rewrite_enable: bool = _env_bool("RAG_REWRITE_ENABLE", True)
     rewrite_timeout_s: int = _env_int("RAG_REWRITE_TIMEOUT_S", 10)
@@ -121,6 +121,10 @@ class RuntimeSettings:
     enable_llm_summary_regen: bool = _env_bool("RAG_ENABLE_LLM_SUMMARY_REGEN", False)
     allow_utility_concurrency: bool = _env_bool("RAG_ALLOW_UTILITY_CONCURRENCY", False)
     session_turns_keep: int = _env_int("RAG_SESSION_TURNS_KEEP", 24)
+    # Size-based memory management: trim turns when total chars exceed budget
+    session_turns_max_chars: int = _env_int("RAG_SESSION_TURNS_MAX_CHARS", 32000)
+    session_turn_trim_target_chars: int = _env_int("RAG_SESSION_TURN_TRIM_TARGET_CHARS", 24000)
+    summary_compress_threshold_chars: int = _env_int("RAG_SUMMARY_COMPRESS_THRESHOLD_CHARS", 1400)
 
     _CACHE_BUSTING_FIELDS: frozenset = frozenset({
         "generic_query_terms",

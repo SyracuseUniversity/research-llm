@@ -19,7 +19,7 @@ os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Raise LLM timeout to handle complex/long queries
-os.environ.setdefault("RAG_LLM_TIMEOUT_S", "120")
+os.environ.setdefault("RAG_LLM_TIMEOUT_S", "300")
 
 from rag_pipeline import answer_question, sanitize_answer_for_display
 from runtime_settings import settings
@@ -47,7 +47,13 @@ def _esc(value: object) -> str:
 
 
 def _esc_answer(value: object) -> str:
-    return html.escape(sanitize_answer_for_display(str(value or "")))
+    """Sanitise an LLM answer for display.
+
+    We no longer html.escape() here because Streamlit's st.markdown with
+    unsafe_allow_html=False already prevents XSS.  HTML-escaping was causing
+    literal '&amp;' artefacts and preventing markdown rendering.
+    """
+    return sanitize_answer_for_display(str(value or ""))
 
 
 def _ram_stats() -> dict:
@@ -93,7 +99,7 @@ def _render_graph(g: dict, graph_key: str) -> None:
     # ── Toggle state ──────────────────────────────────────────────────────────
     toggle_key = f"graph_open_{graph_key}"
     if toggle_key not in st.session_state:
-        st.session_state[toggle_key] = True  # shown by default
+        st.session_state[toggle_key] = False  # hidden by default
 
     if st.button(
         "▼ Hide Graph" if st.session_state[toggle_key] else "▶ Show Graph",
@@ -281,7 +287,7 @@ for idx, msg in enumerate(st.session_state["messages"]):
     with st.chat_message(role):
         if role == "assistant":
             content = msg.get("content", "")
-            st.write(_esc_answer(content))
+            st.markdown(_esc_answer(content), unsafe_allow_html=False)
 
             timing_caption = msg.get("timing_caption", "")
             if timing_caption:
@@ -289,9 +295,9 @@ for idx, msg in enumerate(st.session_state["messages"]):
 
             sources = msg.get("sources", [])
             if sources:
-                with st.expander("Retrieved Sources", expanded=False):
-                    for s in sources:
-                        st.write(_esc_answer(s))
+                with st.expander(f"Retrieved Sources ({len(sources)})", expanded=False):
+                    for i, s in enumerate(sources, 1):
+                        st.markdown(f"**[{i}]** {s}", unsafe_allow_html=False)
 
             graph_error = msg.get("graph_error", "")
             if graph_error:
@@ -322,10 +328,10 @@ if prompt:
 
         answer_text = (out.get("answer") or "").strip()
         if answer_text:
-            st.write(_esc_answer(answer_text))
+            st.markdown(_esc_answer(answer_text), unsafe_allow_html=False)
         else:
             answer_text = "I could not generate an answer, but the retrieved sources are shown below."
-            st.write(answer_text)
+            st.markdown(answer_text, unsafe_allow_html=False)
 
         llm_calls = out.get("llm_calls", {}) if isinstance(out.get("llm_calls"), dict) else {}
         timing    = out.get("timing_ms", {})  if isinstance(out.get("timing_ms"),  dict) else {}
@@ -338,9 +344,9 @@ if prompt:
 
         sources = list(out.get("sources", []) or [])
         if sources:
-            with st.expander("Retrieved Sources", expanded=False):
-                for s in sources:
-                    st.write(_esc_answer(s))
+            with st.expander(f"Retrieved Sources ({len(sources)})", expanded=False):
+                for i, s in enumerate(sources, 1):
+                    st.markdown(f"**[{i}]** {s}", unsafe_allow_html=False)
 
         graph_error = str(out.get("graph_error", "") or "")
         if graph_error:

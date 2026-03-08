@@ -33,7 +33,19 @@ def _safe_json_loads(raw: Optional[str], default: Any) -> Any:
 
 
 def _trim_turns(turns: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Trim conversation turns based on total character size, with count as a backstop.
+
+    Keeps the most recent turns that fit within the character budget.
+    When the total exceeds ``session_turns_max_chars``, older turns are
+    dropped until the total falls below ``session_turn_trim_target_chars``.
+    The hard count limit ``session_turns_keep`` is still enforced as a
+    ceiling to prevent unbounded growth even if turns are very short.
+    """
     keep_n = max(2, int(getattr(settings, "session_turns_keep", 24)))
+    max_chars = max(2000, int(getattr(settings, "session_turns_max_chars", 32000)))
+    target_chars = max(1000, int(getattr(settings, "session_turn_trim_target_chars", 24000)))
+
+    # First pass: normalise and apply hard count limit
     trimmed = list(turns or [])[-keep_n:]
     out: List[Dict[str, str]] = []
     for obj in trimmed:
@@ -42,6 +54,14 @@ def _trim_turns(turns: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         if role not in {"user", "assistant"} or not text:
             continue
         out.append({"role": role, "text": text})
+
+    # Second pass: trim by total character size (drop oldest first)
+    total_chars = sum(len(t.get("text", "")) for t in out)
+    if total_chars > max_chars:
+        while len(out) > 2 and total_chars > target_chars:
+            removed = out.pop(0)
+            total_chars -= len(removed.get("text", ""))
+
     return out
 
 
@@ -204,40 +224,48 @@ class SessionStore:
         payload = json.dumps(turns_payload, ensure_ascii=False)
         conn = self._conn
 
-        existing = conn.execute(
-            "SELECT rolling_summary, extra_state_json FROM chat_state WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        # Use BEGIN IMMEDIATE to acquire a write lock before reading,
+        # preventing a race between the SELECT and the INSERT/UPDATE
+        # when the utility worker and main thread save concurrently.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT rolling_summary, extra_state_json FROM chat_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
 
-        base_summary = str(existing[0] or "") if existing else ""
-        base_extra = _safe_json_loads(existing[1], {}) if existing and len(existing) > 1 else {}
-        base_extra = _sanitize_extra_state(base_extra)
+            base_summary = str(existing[0] or "") if existing else ""
+            base_extra = _safe_json_loads(existing[1], {}) if existing and len(existing) > 1 else {}
+            base_extra = _sanitize_extra_state(base_extra)
 
-        if isinstance(extra_state, dict):
-            sanitized_new = _sanitize_extra_state(extra_state)
-            # Explicit per-key assignment so that an empty anchor ({}) correctly
-            # overwrites a previously stored non-empty anchor value.
-            for k, v in sanitized_new.items():
-                base_extra[k] = v
+            if isinstance(extra_state, dict):
+                sanitized_new = _sanitize_extra_state(extra_state)
+                # Explicit per-key assignment so that an empty anchor ({}) correctly
+                # overwrites a previously stored non-empty anchor value.
+                for k, v in sanitized_new.items():
+                    base_extra[k] = v
 
-        extra_payload = json.dumps(base_extra or {}, ensure_ascii=False)
+            extra_payload = json.dumps(base_extra or {}, ensure_ascii=False)
 
-        summary_payload = str(rolling_summary or "")
-        if not summary_payload.strip():
-            summary_payload = base_summary if base_summary.strip() else _DEFAULT_ROLLING_SUMMARY
+            summary_payload = str(rolling_summary or "")
+            if not summary_payload.strip():
+                summary_payload = base_summary if base_summary.strip() else _DEFAULT_ROLLING_SUMMARY
 
-        conn.execute(
-            """
-            INSERT INTO chat_state(session_id, rolling_summary, turns_json, extra_state_json)
-            VALUES(?, ?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-              rolling_summary=excluded.rolling_summary,
-              turns_json=excluded.turns_json,
-              extra_state_json=excluded.extra_state_json
-            """,
-            (session_id, summary_payload, payload, extra_payload),
-        )
-        conn.commit()
+            conn.execute(
+                """
+                INSERT INTO chat_state(session_id, rolling_summary, turns_json, extra_state_json)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                  rolling_summary=excluded.rolling_summary,
+                  turns_json=excluded.turns_json,
+                  extra_state_json=excluded.extra_state_json
+                """,
+                (session_id, summary_payload, payload, extra_payload),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
     def reset(self, session_id: str) -> None:
         self._init_db()

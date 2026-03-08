@@ -319,6 +319,15 @@ def build_rolling_summary(
     a = re.sub(r"\s+", " ", (assistant_answer or "").strip())
     raw_meta = re.sub(r"\s+", " ", (retrieval_metadata or "").strip())
 
+    # Adaptive compression: when the previous summary is already large,
+    # keep fewer items per field to control growth.
+    compress_threshold = max(400, int(getattr(settings, "summary_compress_threshold_chars", 1400)))
+    base_max_items = max(1, int(getattr(settings, "summary_max_items_per_field", 6)))
+    if len(base) > compress_threshold:
+        max_items_per_field = max(2, base_max_items - 2)
+    else:
+        max_items_per_field = base_max_items
+
     if q:
         sections["Current focus"] = [q[:220]]
 
@@ -326,18 +335,19 @@ def build_rolling_summary(
     for part in re.split(r"\s*\|\s*", raw_meta):
         item = re.sub(r"\s+", " ", (part or "").strip())
         if item and len(item) >= 3:
+            # Truncate long entity names (e.g. full paper titles) to keep summary compact
+            if len(item) > 80:
+                item = item[:77].rstrip() + "..."
             meta_entities.append(item)
     if meta_entities:
         existing = [v for v in sections.get("Core entities", []) if v and v.strip() and v.strip() != "(none)"]
-        max_items = max(1, int(getattr(settings, "summary_max_items_per_field", 6)))
-        sections["Core entities"] = _dedupe_ci(existing + meta_entities)[-max_items:]
+        sections["Core entities"] = _dedupe_ci(existing + meta_entities)[-max_items_per_field:]
 
     if a:
         existing_themes = [v for v in sections.get("Key themes", []) if v and v.strip() and v.strip() != "(none)"]
-        max_items = max(1, int(getattr(settings, "summary_max_items_per_field", 6)))
-        theme_keywords = _extract_answer_theme_keywords(a, max_items=max_items)
+        theme_keywords = _extract_answer_theme_keywords(a, max_items=max_items_per_field)
         if theme_keywords:
-            sections["Key themes"] = _dedupe_ci(existing_themes + theme_keywords)[-max_items:]
+            sections["Key themes"] = _dedupe_ci(existing_themes + theme_keywords)[-max_items_per_field:]
 
     if not sections.get("Constraints"):
         sections["Constraints"] = ["Use only retrieved Syracuse corpus context."]
@@ -348,8 +358,7 @@ def build_rolling_summary(
         if sec not in sections:
             sections[sec] = []
         vals = [v for v in sections.get(sec, []) if v and v.strip() and v.strip() != "(none)"]
-        max_items = max(1, int(getattr(settings, "summary_max_items_per_field", 6)))
-        sections[sec] = vals[-max_items:]
+        sections[sec] = vals[-max_items_per_field:]
 
     limit = max(1, int(getattr(settings, "summary_max_chars", 1800)))
     summary = _format_summary_sections(sections)
@@ -379,15 +388,27 @@ def build_rolling_summary(
 
 def _invoke_with_timeout(llm: Any, prompt: str, timeout_s: int) -> str:
     if timeout_s <= 0:
-        return str(llm.invoke(prompt) or "")
+        result = str(llm.invoke(prompt) or "")
+        _release_vram_cache()
+        return result
     ex = ThreadPoolExecutor(max_workers=1)
     fut = ex.submit(llm.invoke, prompt)
     try:
-        return str(fut.result(timeout=timeout_s) or "")
+        result = str(fut.result(timeout=timeout_s) or "")
+        _release_vram_cache()
+        return result
     except FuturesTimeout:
+        _release_vram_cache()
         return ""
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
+
+
+def _release_vram_cache() -> None:
+    """Release cached VRAM allocations after LLM generation."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _regenerate_rolling_summary(
@@ -540,7 +561,9 @@ def _get_followup_pronoun_pattern() -> Optional[re.Pattern]:
 
 _ANCHOR_ESCAPE_PATTERN = re.compile(
     r"\b(who else|what else|other (researchers?|faculty|people|authors?|scientists?)"
-    r"|others|besides|apart from|different (from|researcher|faculty)|not .{0,30} but)\b",
+    r"|others|besides|apart from|different (from|researcher|faculty)|not .{0,30} but"
+    r"|also (stud(y|ies)|work|research)|anyone else|somebody else|someone else"
+    r"|studies this (topic|area|field|subject)|works on this)\b",
     re.IGNORECASE,
 )
 
@@ -932,6 +955,20 @@ def _anchor_is_stable(anchor: Dict[str, Any]) -> bool:
     return float(data.get("confidence", 0.0) or 0.0) >= min_conf
 
 
+def _retrieval_confidence_label(*, docs_count: int, anchor_consistent: bool) -> str:
+    """Shared retrieval confidence classification used by both Engine and pipeline."""
+    min_docs = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
+    if docs_count < min_docs:
+        return "weak"
+    if not anchor_consistent:
+        return "inconsistent"
+    if docs_count >= max(8, min_docs * 2):
+        return "high"
+    if docs_count >= max(4, min_docs + 1):
+        return "medium"
+    return "low"
+
+
 def _classify_generic_intent(question: str) -> str:
     q = (question or "").strip().lower()
     if not q:
@@ -971,6 +1008,7 @@ class _DirectGenerationLLM:
             "do_sample": bool(self.generation_kwargs.get("do_sample", False)),
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
+            "repetition_penalty": 1.15,
         }
         if gen_kwargs["do_sample"]:
             temp = self.generation_kwargs.get("temperature")
@@ -986,7 +1024,15 @@ class _DirectGenerationLLM:
                 out = self.model.generate(**enc, **gen_kwargs)
 
         prompt_len = int(enc["input_ids"].shape[1])
-        return self.tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
+        result = self.tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
+
+        # Explicitly free intermediate CUDA tensors to reclaim VRAM.
+        # Without this, enc/out stay allocated until Python GC runs.
+        del enc, out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return result
 
 
 class ModelRuntime:
@@ -1011,7 +1057,7 @@ class ModelRuntime:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id_or_path,
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             local_files_only=True, low_cpu_mem_usage=False, device_map=None,
         )
         if torch.cuda.is_available():
@@ -1072,7 +1118,7 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit].rsplit(".", 1)[0].strip()
-    return cut + "." if cut else text[:limit].strip()
+    return cut + "..." if cut else text[:limit].rstrip() + "..."
 
 
 def _clean_snippet(meta: Dict[str, Any], text: str, *, limit: int) -> str:
@@ -1096,32 +1142,36 @@ def _clean_snippet(meta: Dict[str, Any], text: str, *, limit: int) -> str:
 
 
 def format_docs_compact(docs: List[Document], *, max_docs: int, text_limit: int) -> str:
+    def _strip_tags(s: str) -> str:
+        return re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or ""))
+
     blocks: List[str] = []
     for d in docs[:max_docs]:
         meta = d.metadata or {}
         text = _clean_snippet(meta, d.page_content or "", limit=text_limit)
         blocks.append("\n".join([
-            f"Title: {meta.get('title', '')}",
-            f"Authors: {meta.get('authors', '')}",
+            f"Title: {_strip_tags(meta.get('title', ''))}",
+            f"Authors: {_strip_tags(meta.get('authors', ''))}",
             f"Year: {meta.get('year', meta.get('publication_date', ''))}",
-            f"Snippet: {text}",
+            f"Snippet: {_strip_tags(text)}",
         ]))
     return "\n\n".join(blocks)
 
 
 class _TransformerMeanEmbeddings:
+    """Mean-pooling embeddings — always on CPU to preserve VRAM for LLM models."""
+
     def __init__(self, model_name: str, device: str) -> None:
+        # Ignore requested device — embeddings always run on CPU to keep
+        # VRAM free for the answer and utility LLMs.
+        _ = device
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
         self.model = AutoModel.from_pretrained(
             model_name, local_files_only=True, torch_dtype=torch.float32, low_cpu_mem_usage=False,
         )
-        if device == "cuda" and torch.cuda.is_available():
-            self.model.to("cuda:0")
-            self.device = "cuda"
-        else:
-            self.model.to("cpu")
-            self.device = "cpu"
+        self.model.to("cpu")
+        self.device = "cpu"
         self.model.eval()
 
     def _encode_texts(self, texts: List[str]) -> List[List[float]]:
@@ -1131,14 +1181,14 @@ class _TransformerMeanEmbeddings:
         for i in range(0, len(texts), 32):
             batch = [str(t or "") for t in texts[i: i + 32]]
             enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
-            dev = "cuda:0" if self.device == "cuda" else "cpu"
-            enc = {k: v.to(dev) for k, v in enc.items()}
+            # Always CPU — no VRAM usage for embeddings
+            enc = {k: v.to("cpu") for k, v in enc.items()}
             with torch.no_grad():
                 hidden = self.model(**enc).last_hidden_state
                 mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
                 summed = (hidden * mask).sum(dim=1)
                 pooled = torch.nn.functional.normalize(summed / mask.sum(dim=1).clamp_min(1e-9), p=2, dim=1)
-                out.extend(pooled.detach().cpu().tolist())
+                out.extend(pooled.detach().tolist())
         return out
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -1150,7 +1200,10 @@ class _TransformerMeanEmbeddings:
 
 
 def build_embeddings() -> Any:
-    preferred = _EMBED_DEVICE
+    # Always use CPU for embeddings to preserve VRAM for LLM models.
+    # The _EMBED_DEVICE env var is respected only as a hint; we override
+    # to CPU unconditionally since embeddings are not latency-critical.
+    preferred = "cpu"
 
     def _make(device: str) -> HuggingFaceEmbeddings:
         return HuggingFaceEmbeddings(
@@ -1259,7 +1312,14 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
         "Use insufficient-information refusal only when zero relevant papers are retrieved.\n"
         "If field or role is not explicitly stated, infer it from repeated terms in titles/summaries and mark it as inferred.\n"
         "When identifying a person, list their key research themes with paper evidence.\n"
-        "Choose output structure by detected intent category (default, comparison, list, time_range).",
+        "Choose output structure by detected intent category (default, comparison, list, time_range).\n\n"
+        "FORMATTING RULES:\n"
+        "- Use a blank line between paragraphs to separate distinct points or researchers.\n"
+        "- When citing a paper, put the title in quotes.\n"
+        "- When listing multiple researchers, give each their own paragraph.\n"
+        "- Do NOT add closing remarks, offers to help, or signatures at the end.\n"
+        "- Do NOT say 'I noticed' or 'I will revise' or narrate your own process.\n"
+        "- End your answer after the last substantive point. Stop there.",
     ),
     ("human", "Papers:\n{papers}\n\nQuestion:\n{question}"),
 ])
@@ -1417,7 +1477,7 @@ class UtilityWorker:
             )
         else:
             answer_snippet = ""
-            m = re.search(r"ASSISTANT:\\s*(.+)", new_turns_text or "", re.IGNORECASE | re.DOTALL)
+            m = re.search(r"ASSISTANT:\s*(.+)", new_turns_text or "", re.IGNORECASE | re.DOTALL)
             if m:
                 answer_snippet = re.sub(r"\s+", " ", m.group(1)).strip()
             if not answer_snippet:
@@ -1936,9 +1996,13 @@ class Engine:
         anchor_data = _normalize_anchor(self.anchor)
         anchor_value = str(anchor_data.get("value", "") or "").strip() if _anchor_is_stable(anchor_data) else ""
         referential = _is_followup_coref_question(q)
-        if referential and anchor_value and not _anchor_in_text(anchor_value, query_for_retrieval):
+        # If the query explicitly signals a topic shift ("who else", "others",
+        # "besides", etc.), do NOT inject the current anchor even if the query
+        # also contains pronouns like "this" or "that".
+        anchor_escape = _is_anchor_escape_question(q)
+        if referential and anchor_value and not anchor_escape and not _anchor_in_text(anchor_value, query_for_retrieval):
             query_for_retrieval = _inject_anchor_into_query(query_for_retrieval or q, anchor_value).strip()
-        if referential and (not anchor_value or not _anchor_in_text(anchor_value, query_for_retrieval)):
+        if referential and not anchor_escape and (not anchor_value or not _anchor_in_text(anchor_value, query_for_retrieval)):
             prev_user = self._last_user_turn_text()
             fallback_parts: List[str] = []
             if prev_user and _norm_text(prev_user) != _norm_text(q):
@@ -2107,14 +2171,11 @@ class Engine:
 
         if not context.paper_docs:
             self.last_retrieval_confidence = "weak"
-        elif anchor_value and not anchor_consistent:
-            self.last_retrieval_confidence = "inconsistent"
-        elif len(context.paper_docs) >= max(8, min_docs_for_conf * 2):
-            self.last_retrieval_confidence = "high"
-        elif len(context.paper_docs) >= max(4, min_docs_for_conf + 1):
-            self.last_retrieval_confidence = "medium"
         else:
-            self.last_retrieval_confidence = "low"
+            self.last_retrieval_confidence = _retrieval_confidence_label(
+                docs_count=len(context.paper_docs),
+                anchor_consistent=anchor_consistent,
+            )
 
         safe_to_update = (
             (not no_results) and (not retrieval_weak)
@@ -2245,14 +2306,16 @@ class Engine:
 
         try:
             self.last_answer_llm_calls += 1
-            raw_answer = self.answer_runtime.llm.invoke(full_prompt) or ""
+            raw_answer = _invoke_with_timeout(
+                self.answer_runtime.llm, full_prompt,
+                int(getattr(settings, "llm_timeout_s", 300)),
+            )
         except Exception:
             raw_answer = ""
 
         answer = _strip_prompt_leak(str(raw_answer)).strip()
-        if _answer_is_bad(answer):
-            focus = self._choose_last_focus_from_answer(context.rewritten_question, pap_docs)
-            answer = focus if focus else "I found related papers, but the answer could not be cleanly extracted."
+        if not answer:
+            answer = "I found related papers, but the answer could not be cleanly extracted."
 
         self.finalize_turn(context, answer)
         return answer, context.paper_docs, []
