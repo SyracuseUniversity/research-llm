@@ -155,6 +155,42 @@ def _norm_text(s: str) -> str:
     return s
 
 
+# Terms that appear in user queries but rarely in paper text/metadata.
+# Stripping them before embedding search improves retrieval recall.
+# See also _strip_corpus_noise_terms which handles the actual stripping.
+
+
+# Words that add noise to retrieval because ALL papers are from Syracuse
+# or because they're role/institutional terms not in paper content.
+_CORPUS_NOISE_TERMS = re.compile(
+    r"\b(syracuse|university|faculty|professor|researcher|department|"
+    r"college|school|campus|institute|lab|laboratory|"
+    r"su\b|at su\b|at syracuse)",
+    re.IGNORECASE,
+)
+
+
+
+def _normalize_title_case(s: str) -> str:
+    """Lowercase and strip HTML tags from text before sending to LLM."""
+    cleaned = re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or ""))
+    return cleaned.lower().strip()
+
+
+def _strip_corpus_noise_terms(query: str) -> str:
+    """Remove institutional/role terms that hurt embedding similarity.
+
+    All papers are from Syracuse, so 'at Syracuse University' in a query
+    just pulls the embedding toward irrelevant matches. Faculty/professor
+    etc. rarely appear in paper titles or abstracts.
+    """
+    cleaned = _CORPUS_NOISE_TERMS.sub(" ", query)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # If stripping removed everything meaningful, return original
+    tokens = [t for t in _tokenize_words(cleaned) if not _is_generic_query_token(t)]
+    return cleaned if tokens else (query or "").strip()
+
+
 def _no_results_summary_line(question: str) -> str:
     q = re.sub(r"\s+", " ", (question or "").strip())
     if not q:
@@ -405,10 +441,14 @@ def _invoke_with_timeout(llm: Any, prompt: str, timeout_s: int) -> str:
 
 
 def _release_vram_cache() -> None:
-    """Release cached VRAM allocations after LLM generation."""
+    """Run garbage collection after LLM generation.
+
+    We intentionally do NOT call torch.cuda.empty_cache() here.
+    Calling it after every generation fragments CUDA's memory pool,
+    causing progressively worse allocation performance over many calls.
+    PyTorch's caching allocator reuses freed blocks efficiently on its own.
+    """
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def _regenerate_rolling_summary(
@@ -742,6 +782,33 @@ def _summary_query_from_text(summary: str, *, max_chars: int = 320) -> str:
     return tail
 
 
+def _extract_summary_topic_keywords(summary: str, *, max_chars: int = 180) -> str:
+    """Extract clean topic keywords from the rolling summary for retrieval.
+
+    Pulls from 'Current focus' and 'Key themes' sections, which contain
+    the most relevant retrieval signals. Avoids 'Core entities' which
+    often has noisy paper titles.
+    """
+    if not summary:
+        return ""
+    sections = _extract_summary_sections(summary)
+    parts: List[str] = []
+    # Current focus has the latest question — useful for context
+    focus = sections.get("Current focus", [])
+    if focus:
+        parts.append(focus[0][:120])
+    # Key themes are the extracted topic keywords
+    themes = sections.get("Key themes", [])
+    for t in themes:
+        t = t.strip()
+        if t and t != "(none)" and not _is_generic_query_token(t):
+            parts.append(t)
+    result = " ".join(parts).strip()
+    if len(result) > max_chars:
+        result = result[:max_chars].rstrip()
+    return result
+
+
 def _has_explicit_entity_signal(question: str, ents: Optional[Dict[str, List[str]]] = None) -> bool:
     q = (question or "").strip()
     if not q:
@@ -1009,6 +1076,8 @@ class _DirectGenerationLLM:
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "repetition_penalty": 1.15,
+            "use_cache": True,           # fresh KV cache per call
+            "return_dict_in_generate": False,
         }
         if gen_kwargs["do_sample"]:
             temp = self.generation_kwargs.get("temperature")
@@ -1018,19 +1087,25 @@ class _DirectGenerationLLM:
             if top_p is not None:
                 gen_kwargs["top_p"] = float(top_p)
 
-        ctx = torch.autocast("cuda", dtype=torch.float16) if torch.cuda.is_available() else nullcontext()
+        # Model is already in fp16 (loaded with torch_dtype=float16), so no
+        # autocast needed. Using autocast with generate() can cause dtype
+        # inconsistencies in the internal KV cache across calls.
         with torch.no_grad():
-            with ctx:
-                out = self.model.generate(**enc, **gen_kwargs)
+            out = self.model.generate(**enc, **gen_kwargs)
 
         prompt_len = int(enc["input_ids"].shape[1])
         result = self.tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
 
-        # Explicitly free intermediate CUDA tensors to reclaim VRAM.
-        # Without this, enc/out stay allocated until Python GC runs.
+        # Free intermediate CUDA tensors and clear any cached generation state.
         del enc, out
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Reset any generation_config fields that generate() may have mutated
+        try:
+            if hasattr(self.model, "_cache"):
+                self.model._cache = None
+            if hasattr(self.model.generation_config, "_cache"):
+                self.model.generation_config._cache = None
+        except Exception:
+            pass
 
         return result
 
@@ -1125,6 +1200,20 @@ def _clean_snippet(meta: Dict[str, Any], text: str, *, limit: int) -> str:
     raw = str(text or "").strip()
     if not raw:
         return ""
+    # Strip structured metadata prefix that some corpus chunks start with
+    # (e.g. "Paper ID: 25187 Researcher: C. D. Capano Title: ... Authors: ... Primary Topic: ... Info: DOI: ...")
+    raw = re.sub(
+        r"^Paper\s+ID:\s*\S+\s+Researcher:\s*[^\n]*?"
+        r"(?:Title:\s*[^\n]*?)?"
+        r"(?:Authors:\s*[^\n]*?)?"
+        r"(?:Primary\s+Topic:\s*[^\n]*?)?"
+        r"(?:Info:\s*[^\n]*?)?"
+        r"(?:DOI:\s*\S+\s*)?",
+        "", raw, flags=re.IGNORECASE,
+    ).strip()
+    # Also strip simpler "Paper ID: ... Researcher: ..." lines
+    raw = re.sub(r"^Paper\s+ID:\s*\d+.*?(?:Summary:\s*)?", "", raw, flags=re.IGNORECASE | re.DOTALL).strip() if raw.lower().startswith("paper id:") else raw
+
     title = str((meta or {}).get("title", "") or "").strip()
     authors = str((meta or {}).get("authors", "") or "").strip()
     lowered = raw.lower()
@@ -1142,18 +1231,19 @@ def _clean_snippet(meta: Dict[str, Any], text: str, *, limit: int) -> str:
 
 
 def format_docs_compact(docs: List[Document], *, max_docs: int, text_limit: int) -> str:
-    def _strip_tags(s: str) -> str:
-        return re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or ""))
+    def _clean_for_llm(s: str) -> str:
+        """Strip HTML and lowercase for cleaner LLM input."""
+        return re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or "")).lower().strip()
 
     blocks: List[str] = []
     for d in docs[:max_docs]:
         meta = d.metadata or {}
         text = _clean_snippet(meta, d.page_content or "", limit=text_limit)
         blocks.append("\n".join([
-            f"Title: {_strip_tags(meta.get('title', ''))}",
-            f"Authors: {_strip_tags(meta.get('authors', ''))}",
-            f"Year: {meta.get('year', meta.get('publication_date', ''))}",
-            f"Snippet: {_strip_tags(text)}",
+            f"title: {_clean_for_llm(meta.get('title', ''))}",
+            f"authors: {_clean_for_llm(meta.get('authors', ''))}",
+            f"year: {meta.get('year', meta.get('publication_date', ''))}",
+            f"snippet: {_clean_for_llm(text)}",
         ]))
     return "\n\n".join(blocks)
 
@@ -1361,6 +1451,13 @@ class UtilityWorker:
 
     def stop(self) -> None:
         self._stop.set()
+        # Drain any pending jobs so they don't write stale state after a reset
+        while True:
+            try:
+                self.q.get_nowait()
+                self.q.task_done()
+            except queue.Empty:
+                break
 
     def submit(self, job: UtilityJob) -> None:
         try:
@@ -1894,7 +1991,10 @@ class Engine:
         if not docs:
             return docs
         unique = self._merge_unique_docs(docs, [])
-        q_tokens = [t for t in _tokenize_words(query) if not _is_generic_query_token(t)]
+        # Strip corpus noise terms before tokenizing — "syracuse", "university"
+        # etc. aren't in paper content and would filter out everything.
+        clean_q = _strip_corpus_noise_terms(query)
+        q_tokens = [t for t in _tokenize_words(clean_q or query) if not _is_generic_query_token(t)]
         if not q_tokens:
             return unique
         pruned: List[Document] = []
@@ -1918,7 +2018,9 @@ class Engine:
         where_filter: Optional[Dict[str, Any]] = None,
         raw_question: str = "",
     ) -> List[Document]:
-        q = (query or "").strip()
+        q = _strip_corpus_noise_terms((query or "").strip())
+        if not q:
+            q = (query or "").strip()
         if not q:
             return []
         self._log_retrieval_state(where_filter=where_filter)
@@ -2003,15 +2105,35 @@ class Engine:
         if referential and anchor_value and not anchor_escape and not _anchor_in_text(anchor_value, query_for_retrieval):
             query_for_retrieval = _inject_anchor_into_query(query_for_retrieval or q, anchor_value).strip()
         if referential and not anchor_escape and (not anchor_value or not _anchor_in_text(anchor_value, query_for_retrieval)):
-            prev_user = self._last_user_turn_text()
-            fallback_parts: List[str] = []
-            if prev_user and _norm_text(prev_user) != _norm_text(q):
-                fallback_parts.append(prev_user)
-            fallback_parts.append(q)
-            query_for_retrieval = " ".join(p for p in fallback_parts if p).strip()
+            # No anchor available for a referential query. Augment with
+            # topic keywords from the rolling summary so retrieval stays
+            # on-topic instead of drifting to generic results.
+            topic_kw = _extract_summary_topic_keywords(self.rolling_summary, max_chars=140)
+            if topic_kw:
+                query_for_retrieval = f"{q} {topic_kw}".strip()
+            else:
+                prev_user = self._last_user_turn_text()
+                if prev_user and _norm_text(prev_user) != _norm_text(q):
+                    query_for_retrieval = f"{prev_user} {q}".strip()
             self.last_rewrite_blocked = True
         if not query_for_retrieval and q:
             query_for_retrieval = q
+
+        # If the query is short, lacks explicit entities/topics, and we have
+        # conversation history, augment with summary keywords. This catches
+        # implicit follow-ups like "now list the faculty" or "summarize their
+        # work" that have no pronouns but clearly reference prior context.
+        if (
+            not self.last_rewrite_blocked
+            and self._user_turn_count() > 0
+            and not _has_explicit_entity_signal(q)
+            and _query_is_short_or_pronoun(q)
+            and self.rolling_summary
+        ):
+            topic_kw = _extract_summary_topic_keywords(self.rolling_summary, max_chars=140)
+            if topic_kw and not _anchor_in_text(topic_kw[:40], query_for_retrieval):
+                query_for_retrieval = f"{query_for_retrieval} {topic_kw}".strip()
+
         detected_intent = _classify_generic_intent(query_for_retrieval or q)
         return query_for_retrieval, mem_docs, detected_intent
 
@@ -2069,7 +2191,8 @@ class Engine:
             or (allow_prev_context and hasattr(self.memory_vs, "similarity_search_by_vector"))
         )
         if rewritten_q.strip() and can_reuse:
-            query_embedding = self._embed_query_vector(rewritten_q)
+            embed_q = _strip_corpus_noise_terms(rewritten_q)
+            query_embedding = self._embed_query_vector(embed_q or rewritten_q)
 
         if rewritten_q.strip():
             t0 = time.perf_counter()
@@ -2293,7 +2416,7 @@ class Engine:
         max_docs = int(getattr(settings, "prompt_max_docs", 24))
         text_limit = int(getattr(settings, "prompt_doc_text_limit", 800))
         papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
-        msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx, question=context.rewritten_question)
+        msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx, question=context.rewritten_question.lower())
         full_prompt = "\n\n".join(m.content for m in msgs)
 
         tok = self.answer_runtime.count_tokens(full_prompt)
@@ -2301,7 +2424,7 @@ class Engine:
         if tok > trigger:
             pap_docs = pack_docs(pap_docs, max(600, int(budget_papers * 0.7)), self.answer_runtime.count_tokens)
             papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
-            msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx, question=context.rewritten_question)
+            msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx, question=context.rewritten_question.lower())
             full_prompt = "\n\n".join(m.content for m in msgs)
 
         try:
@@ -2447,6 +2570,19 @@ class EngineManager:
         )
 
     def reset_session(self, session_id: str) -> None:
+        # Drain any pending utility jobs for this session to prevent
+        # the background worker from writing back stale state after reset.
+        if self.utility_worker is not None:
+            drained = 0
+            while True:
+                try:
+                    self.utility_worker.q.get_nowait()
+                    self.utility_worker.q.task_done()
+                    drained += 1
+                except queue.Empty:
+                    break
+            if drained:
+                _dbg(f"[RESET] drained {drained} pending utility jobs")
         try:
             self.store.reset(session_id)
         except Exception:

@@ -27,6 +27,7 @@ from rag_engine import get_global_manager
 from conversation_memory import hard_reset_memory, clear_qa_cache
 from cache_manager import clear_cache as clear_rag_cache
 
+import gc
 import psutil
 import torch
 
@@ -101,13 +102,16 @@ def _render_graph(g: dict, graph_key: str) -> None:
     if toggle_key not in st.session_state:
         st.session_state[toggle_key] = False  # hidden by default
 
-    if st.button(
-        "▼ Hide Graph" if st.session_state[toggle_key] else "▶ Show Graph",
-        key=f"graph_btn_{graph_key}",
-    ):
-        st.session_state[toggle_key] = not st.session_state[toggle_key]
+    # Use st.toggle instead of st.button — toggling a checkbox does NOT
+    # interrupt an in-progress LLM generation the way a button rerun does.
+    show = st.toggle(
+        "Show Graph",
+        value=st.session_state[toggle_key],
+        key=f"graph_toggle_{graph_key}",
+    )
+    st.session_state[toggle_key] = show
 
-    if not st.session_state[toggle_key]:
+    if not show:
         return
 
     # ── Node styling by type ──────────────────────────────────────────────────
@@ -236,9 +240,36 @@ with st.sidebar:
         st.success("Memory cleared.")
 
     if st.button("Restart Conversation"):
+        # 1. Clear UI
         st.session_state["messages"] = []
+        # 2. Reset backend state for current session
         _safe_call(hard_reset_memory, USER_KEY)
-        st.success("Conversation restarted.")
+        _safe_call(clear_qa_cache, USER_KEY)
+        _safe_call(clear_rag_cache)
+        # 3. Generate a fresh session key so no stale state can leak
+        st.session_state["user_key"] = str(uuid.uuid4())
+        # 4. Force-reload the model runtimes to clear any accumulated
+        #    CUDA allocator fragmentation and get a clean model state
+        try:
+            mgr = ENGINE_MANAGER
+            if mgr.answer_runtime is not None:
+                mgr.answer_runtime.close()
+                mgr.answer_runtime = None
+                mgr.active_answer_model_key = ""
+            if mgr.utility_runtime is not None:
+                mgr.utility_runtime.close()
+                mgr.utility_runtime = None
+                mgr.active_utility_model_key = ""
+            if mgr.utility_worker is not None:
+                mgr.utility_worker.stop()
+                mgr.utility_worker = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        st.success("Conversation restarted — models will reload on next question.")
+        st.rerun()
 
     st.divider()
     st.subheader("Session Diagnostics")
@@ -297,7 +328,7 @@ for idx, msg in enumerate(st.session_state["messages"]):
             if sources:
                 with st.expander(f"Retrieved Sources ({len(sources)})", expanded=False):
                     for i, s in enumerate(sources, 1):
-                        st.markdown(f"**[{i}]** {s}", unsafe_allow_html=False)
+                        st.markdown(f"[{i}] {s}", unsafe_allow_html=False)
 
             graph_error = msg.get("graph_error", "")
             if graph_error:
@@ -346,7 +377,7 @@ if prompt:
         if sources:
             with st.expander(f"Retrieved Sources ({len(sources)})", expanded=False):
                 for i, s in enumerate(sources, 1):
-                    st.markdown(f"**[{i}]** {s}", unsafe_allow_html=False)
+                    st.markdown(f"[{i}] {s}", unsafe_allow_html=False)
 
         graph_error = str(out.get("graph_error", "") or "")
         if graph_error:

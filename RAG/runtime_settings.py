@@ -71,7 +71,7 @@ class RuntimeSettings:
     dominant_min_confidence: float = _env_float("RAG_DOMINANT_MIN_CONFIDENCE", 0.72)
     dominant_replace_confidence: float = _env_float("RAG_DOMINANT_REPLACE_CONFIDENCE", 0.82)
     metadata_filter_min_results: int = _env_int("RAG_METADATA_FILTER_MIN_RESULTS", 4)
-    retrieval_weak_min_docs: int = _env_int("RAG_RETRIEVAL_WEAK_MIN_DOCS", 3)
+    retrieval_weak_min_docs: int = _env_int("RAG_RETRIEVAL_WEAK_MIN_DOCS", 1)
     anchor_stable_confidence: float = _env_float("RAG_ANCHOR_STABLE_CONFIDENCE", 0.72)
     anchor_consistency_min_ratio: float = _env_float("RAG_ANCHOR_CONSISTENCY_MIN_RATIO", 0.45)
     low_conf_prompt_max_docs: int = _env_int("RAG_LOW_CONF_PROMPT_MAX_DOCS", 8)

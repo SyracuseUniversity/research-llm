@@ -22,6 +22,7 @@ from rag_engine import (
     _is_placeholder_anchor_value,
     _retrieval_confidence_label,
     _clean_snippet as _engine_clean_snippet,
+    _normalize_title_case,
 )
 from runtime_settings import settings
 from rag_graph import graph_retrieve_from_paper_docs
@@ -131,7 +132,7 @@ def _doc_to_source_md(d) -> str:
     """Format a retrieved document as a clean APA-style citation."""
     meta = d.metadata or {}
     authors = re.sub(r"</?[a-zA-Z][^>]*>", "", str(meta.get("authors", "") or "")).strip()
-    title = re.sub(r"</?[a-zA-Z][^>]*>", "", str(meta.get("title", "") or "")).strip()
+    title = _normalize_title_case(str(meta.get("title", "") or ""))
     year = str(meta.get("year", meta.get("publication_date", "")) or "").strip()
     doi = str(meta.get("doi", "") or "").strip()
 
@@ -191,6 +192,15 @@ def _query_tokens_for_relevance(question: str) -> List[str]:
     q = (question or "").strip().lower()
     if not q:
         return []
+    # Strip institutional terms that aren't in paper content
+    q = re.sub(
+        r"\b(syracuse\s+university|syracuse|university|faculty|professor|"
+        r"researcher|department|college|school|campus|institute)\b",
+        "", q, flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\s+", " ", q).strip()
+    if not q:
+        return []
     stopset = _get_stopword_set()
     min_len = int(getattr(settings, "retrieval_keyword_min_term_len", 3))
     out: List[str] = []
@@ -234,6 +244,7 @@ def _filter_noisy_docs(docs: List[Any], question: str) -> List[Any]:
     deduped = _dedupe_docs(docs)
     if not deduped:
         return []
+    # Use the cleaned token list (institutional terms already stripped)
     tokens = _query_tokens_for_relevance(question)
     if not tokens:
         return deduped[: int(PIPELINE_CFG["max_docs_after_filter"])]
@@ -577,20 +588,61 @@ def sanitize_answer_for_display(text: str) -> str:
     # Collapse runs of whitespace but preserve intentional paragraph breaks
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
 
-    # Force paragraph breaks between distinct researcher/topic blocks.
-    # LLaMA often writes "...topic A. Name B studies..." as one paragraph.
-    # Insert a break before sentences that start a new person/topic.
-    cleaned = re.sub(
-        r"(?<=[.!?])\s+(?=[A-Z][a-z]+ [A-Z][a-z]+ (?:is |studies |has |works |focuses |explores |investigates |examines |researches ))",
-        "\n\n", cleaned,
-    )
-    # Also break before "Additionally," / "Furthermore," / "Another researcher"
-    cleaned = re.sub(
-        r"(?<=[.!?])\s+(?=(?:Additionally|Furthermore|Moreover|Another researcher|In addition|Separately),?\s)",
-        "\n\n", cleaned,
+    # If the LLM already produced paragraph breaks, respect them
+    if "\n\n" in cleaned:
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    # --- Force paragraph breaks since LLM produced a wall of text ---
+
+    # Split into sentences
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+    if len(sentences) <= 3:
+        return cleaned.strip()
+
+    # Patterns that signal a new topic/researcher paragraph should start
+    _NEW_BLOCK_PATTERNS = re.compile(
+        r"^("
+        # Name + verb: "Shahar Sukenik has...", "Carlos A. Castañeda's..."
+        r"[A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+(?:'s)?\s+"
+        # Transition words
+        r"|Additionally[,\s]"
+        r"|Furthermore[,\s]"
+        r"|Moreover[,\s]"
+        r"|Another\s+researcher"
+        r"|In\s+addition[,\s]"
+        r"|Separately[,\s]"
+        r"|Meanwhile[,\s]"
+        r"|In\s+contrast[,\s]"
+        r"|His\s+research\s+also"
+        r"|Her\s+research\s+also"
+        r"|Their\s+research\s+also"
+        r"|While\s+(?:his|her|their|none|not)"
+        r"|Although\s"
+        r")",
+        re.IGNORECASE,
     )
 
-    # Normalise paragraph breaks: keep double-newlines, collapse triples+
+    paragraphs: List[str] = []
+    current: List[str] = []
+
+    for sent in sentences:
+        # Start a new paragraph if sentence matches a block-start pattern
+        # AND we already have at least 2 sentences in the current paragraph
+        if current and len(current) >= 2 and _NEW_BLOCK_PATTERNS.match(sent):
+            paragraphs.append(" ".join(current))
+            current = [sent]
+        else:
+            current.append(sent)
+            # Also break every 4 sentences as a fallback for readability
+            if len(current) >= 4:
+                paragraphs.append(" ".join(current))
+                current = []
+
+    if current:
+        paragraphs.append(" ".join(current))
+
+    cleaned = "\n\n".join(paragraphs)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -651,8 +703,9 @@ def _build_compact_context(
     max_docs: Optional[int] = None,
     text_limit: Optional[int] = None,
 ) -> str:
-    def _strip_tags(s: str) -> str:
-        return re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or ""))
+    def _clean_for_llm(s: str) -> str:
+        """Strip HTML and lowercase for cleaner LLM input."""
+        return re.sub(r"</?[a-zA-Z][^>]*>", "", str(s or "")).lower().strip()
 
     if max_docs is None:
         max_docs = int(getattr(settings, "prompt_max_docs", 24))
@@ -662,10 +715,10 @@ def _build_compact_context(
     for d in docs[:max_docs]:
         j = _doc_to_json(d, text_limit=text_limit)
         blocks.append("\n".join([
-            f"Title: {_strip_tags(j.get('title', ''))}",
-            f"Authors: {_strip_tags(j.get('authors', ''))}",
-            f"Year: {j.get('year', '')}",
-            f"Snippet: {_strip_tags(j.get('text', ''))}",
+            f"title: {_clean_for_llm(j.get('title', ''))}",
+            f"authors: {_clean_for_llm(j.get('authors', ''))}",
+            f"year: {j.get('year', '')}",
+            f"snippet: {_clean_for_llm(j.get('text', ''))}",
         ]))
     return "\n\n".join(blocks)
 
@@ -1085,6 +1138,25 @@ def answer_question(
             dominant_second_pass_count = len(second_pass_docs)
             paper_docs = _dedupe_docs(paper_docs + second_pass_docs)
 
+        # If dominance didn't trigger but the query has a person name,
+        # try a second pass using the 'researcher' metadata field which
+        # stores full names (avoiding "D. Brown" ambiguity from 'authors').
+        if not dominant_filter_usable and _has_explicit_entity_signal(q):
+            from rag_engine import _extract_person_name
+            person_name = _extract_person_name(q)
+            if person_name and len(person_name) > 3:
+                for field_name in ("researcher",):
+                    researcher_docs = eng.retrieve_papers(
+                        retrieval_q,
+                        int((context.budgets or {}).get("BUDGET_PAPERS", getattr(settings, "budget_papers", 0))),
+                        query_embedding=None, where_filter={field_name: person_name}, raw_question=q,
+                    )
+                    if researcher_docs:
+                        researcher_docs = _filter_noisy_docs(researcher_docs, retrieval_q)
+                        if researcher_docs:
+                            paper_docs = _dedupe_docs(paper_docs + researcher_docs)
+                            break
+
         post_filter_count = len(paper_docs)
         mem_docs = context.mem_docs or []
 
@@ -1132,7 +1204,7 @@ def answer_question(
         if recent_turns_ctx:
             prompt_base_sections.append("RECENT TURNS:\n" + recent_turns_ctx)
 
-        question_for_answer = resolved_q or q
+        question_for_answer = (resolved_q or q).lower()
 
         if summary_intent:
             style_hint = (
@@ -1169,15 +1241,11 @@ def answer_question(
         )
 
         # ── Answer generation ──────────────────────────────────────────────────────
-        min_docs_to_attempt = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
-
         if not paper_docs:
             answer_text = _insufficient_context_answer(q, detected_intent)
-        elif retrieval_confidence == "weak":
-            answer_text = _uncertain_retrieval_answer(q, anchor_value=anchor_value, reason=retrieval_confidence)
-        elif retrieval_confidence == "inconsistent" and len(paper_docs) < min_docs_to_attempt:
-            answer_text = _uncertain_retrieval_answer(q, anchor_value=anchor_value, reason=retrieval_confidence)
         else:
+            # Always attempt LLM generation when we have at least 1 paper.
+            # Even weak/inconsistent retrieval can produce useful partial answers.
             if retrieval_confidence == "inconsistent":
                 prompt_sections_for_call = [s for s in prompt_base_sections if not s.startswith("ROLLING SUMMARY")]
                 prompt, used_prompt_docs, used_prompt_text_limit = _fit_prompt_to_budget(
@@ -1280,18 +1348,15 @@ def answer_question(
 
     sources: List[str] = []
     seen_titles: set = set()
-    source_num = 0
     for d in paper_docs:
         try:
-            # Deduplicate by title to avoid showing the same paper twice
             meta = getattr(d, "metadata", {}) or {}
             title_key = re.sub(r"\s+", " ", str(meta.get("title", "") or "").strip().lower())
             if title_key and title_key != "untitled" and title_key in seen_titles:
                 continue
             if title_key and title_key != "untitled":
                 seen_titles.add(title_key)
-            source_num += 1
-            sources.append(f"[{source_num}] {_doc_to_source_md(d)}")
+            sources.append(_doc_to_source_md(d))
         except Exception:
             pass
 
