@@ -1,4 +1,4 @@
-# research-llm
+# research-llm Database
 
 Database branch for building a local research paper knowledge base backed by SQLite. This branch ingests PDFs, loads publication metadata from CSV exports, repairs incomplete records, tags papers with OpenAlex topics, and generates summaries for downstream LLM and retrieval workflows.
 
