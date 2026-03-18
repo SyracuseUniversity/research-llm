@@ -35,11 +35,15 @@ The system is built so retrieval drives the answer path. The prompt instructs th
 
 ### Conversation continuity through anchors
 
-The system tracks a current anchor, which is the dominant subject inferred from recent retrieval and conversation state. Short or pronoun based follow ups can be interpreted relative to that anchor when evidence is strong enough.
+The system tracks a current anchor, which is the dominant subject inferred from recent retrieval and conversation state. Short or pronoun based follow ups can be interpreted relative to that anchor when evidence is strong enough. Anchor validation now checks both the raw user question and the resolved or rewritten question, preventing spurious anchor drift when follow up queries use pronouns.
 
 ### Weak evidence handling
 
-The code distinguishes between confident retrieval, weak retrieval, and inconsistent retrieval. When evidence quality drops, the prompt is narrowed, the guardrails become stricter, and the pipeline can fall back to safer extractive answers.
+The code distinguishes between confident retrieval, weak retrieval, and inconsistent retrieval. When evidence quality drops, the prompt is narrowed, the guardrails become stricter, and the pipeline can fall back to safer extractive answers. Confidence downshifting for person queries has been relaxed so that initial format name matches such as D. Brown matching Duncan Brown are treated as strong evidence rather than triggering unnecessary downgrades.
+
+### Citation grounding and hallucination prevention
+
+After the answer model generates a response, the pipeline now validates quoted paper titles against the actual retrieved document set using fuzzy matching. Lines containing fabricated citations that do not match any retrieved paper are stripped before the answer reaches the user. This complements the existing researcher grounding check, which now uses bidirectional name matching to avoid false positives when metadata stores names in initial format.
 
 ### Local friendly runtime behavior
 
@@ -124,21 +128,22 @@ flowchart TD
     G5 --> AN1[Build candidate anchor from dominance analysis]
     G6 --> AN1
 
-    AN1 --> AN2[Choose whether to keep replace or ignore anchor]
+    AN1 --> AN2[Choose whether to keep replace or ignore anchor using raw and resolved question overlap]
     AN2 --> CTX1[Build rolling summary block for prompt]
     CTX1 --> CTX2[Build recent turns context block]
-    CTX2 --> CTX3[Build compact context from retrieved docs]
-    CTX3 --> CTX4[Fit document context to runtime token budget]
+    CTX2 --> CTX3[Build compact context from retrieved docs grouped by researcher]
+    CTX3 --> CTX4[Fit document context to runtime token budget using text first shrink strategy]
 
     CTX4 --> PR1[Compose grounded answer prompt]
     PR1 --> LLM1[Invoke answer model with timeout guard]
     LLM1 --> LLM2{Model returned usable answer}
 
     LLM2 -->|no| FB1[Fallback answer from retrieved docs]
-    LLM2 -->|yes| SAN1[Sanitize raw answer text]
+    LLM2 -->|yes| HC1[Strip hallucinated citations not found in retrieved docs]
 
+    HC1 --> SAN1[Sanitize raw answer text]
     SAN1 --> SAN2[Remove prompt leak labels and process narration]
-    SAN2 --> SAN3{Answer mentions unsupported researchers}
+    SAN2 --> SAN3{Answer mentions unsupported researchers using bidirectional name matching}
     SAN3 -->|yes| FB2[Replace with supported researcher extract answer]
     SAN3 -->|no| SAN4[Keep sanitized answer]
 
@@ -190,7 +195,7 @@ flowchart LR
     A4 --> R
 
     R --> D[Compute dominance and retrieval confidence]
-    D --> U[Choose keep replace or clear anchor]
+    D --> U[Choose keep replace or clear anchor checking both raw and resolved question]
     U --> T[Trim recent turns]
     T --> RS[Update rolling summary]
     RS --> P[Persist summary turns anchor and extra state]
@@ -204,7 +209,7 @@ flowchart TD
     Q0[Resolved retrieval query] --> R1[Retrieve Chroma candidates]
     R1 --> R2[Deduplicate and relevance filter docs]
     R2 --> P{Person query}
-    P -->|yes| P1[Rank by person support]
+    P -->|yes| P1[Rank by person support with initial name matching]
     P -->|no| D1[Use filtered docs]
     P1 --> D1
     D1 --> C1[Compute dominance anchor support and confidence]
@@ -213,10 +218,11 @@ flowchart TD
     C2 -->|no| G2[Use low confidence prompt limits]
     G1 --> L1[Invoke answer model]
     G2 --> L1
-    L1 --> A1{Answer usable and grounded}
+    L1 --> H1[Strip hallucinated citations]
+    H1 --> A1{Answer usable and grounded}
     A1 -->|yes| A2[Sanitize and return answer]
     A1 -->|no| F1[Fallback answer from docs]
-    A2 --> A3{Unsupported researcher mentioned}
+    A2 --> A3{Unsupported researcher mentioned using bidirectional matching}
     A3 -->|yes| F2[Replace with supported researcher extract]
     A3 -->|no| DONE[Return final answer]
     F1 --> DONE
@@ -355,8 +361,8 @@ This dataclass holds the active runtime configuration.
 
 1. `answer_max_new_tokens`
 2. `llm_timeout_s`
-3. `prompt_doc_text_limit`
-4. `prompt_max_docs`
+3. `prompt_doc_text_limit` — default raised from 500 to 600 to give the budget fitting loop a higher starting ceiling that results in more documents reaching the LLM
+4. `prompt_max_docs` — default raised from 8 to 16 so the budget fitting loop can preserve more documents before shrinking to fit the context window
 
 #### Retrieval sizing fields
 
@@ -381,9 +387,11 @@ This dataclass holds the active runtime configuration.
 4. `retrieval_weak_min_docs`
 5. `anchor_stable_confidence`
 6. `anchor_consistency_min_ratio`
-7. `followup_pronoun_regex`
-8. `followup_phrases`
-9. `followup_query_max_words`
+7. `low_conf_prompt_max_docs` — raised from 6 to 10 so weak or inconsistent retrievals still get enough document context
+8. `low_conf_prompt_doc_text_limit` — raised from 350 to 450 for the same reason
+9. `followup_pronoun_regex`
+10. `followup_phrases`
+11. `followup_query_max_words`
 
 #### Reranking and model separation fields
 
@@ -462,7 +470,7 @@ Applies LRU style eviction across top level caches when user count exceeds limit
 
 #### `clear_qa_cache(user_key)`
 
-Removes the cached answers for one user and also clears that user’s pipeline cache.
+Removes the cached answers for one user and also clears that user's pipeline cache.
 
 #### `get_cached_answer(user_key, key)`
 
@@ -665,7 +673,7 @@ Parses the `Summary:` section from stored Chroma page content. This function is 
 
 #### `build_compact_context(docs, max_docs=None, text_limit=None)`
 
-Builds the compact document context block used in prompts from title, researcher, authors, year, primary topic, extracted summary, and fallback snippet.
+Builds the compact document context block used in prompts from title, researcher, authors, year, primary topic, extracted summary, and fallback snippet. Documents are now sorted by researcher name before context assembly so the LLM sees coherent per researcher clusters, and researcher group separators are inserted when the researcher changes. This prevents the pattern where the model invents placeholder labels like Unknown researcher 1 and Unknown researcher 2 when docs from different people are interleaved.
 
 #### `dedupe_ci(items)`
 
@@ -691,7 +699,7 @@ Determines whether an anchor is stable enough to trust.
 
 #### `anchor_support_ratio(anchor_value, docs)`
 
-Measures how strongly the retrieved set supports the anchor.
+Measures how strongly the retrieved set supports the anchor. Now includes fuzzy person name matching so that a full name anchor like Duncan Brown correctly matches documents where the metadata stores the initial format D. Brown. The function first tries exact text matching and falls back to initial plus last name matching across researcher and authors fields.
 
 #### `retrieval_confidence_label(docs_count, anchor_consistent)`
 
@@ -905,7 +913,7 @@ Returns the singleton engine manager used by the pipeline and UI.
 
 ## 11. `rag_pipeline.py`
 
-This file is the main orchestration layer. It connects intent detection, retrieval, dominance analysis, anchor updates, prompt construction, answer generation, fallback logic, graph generation, caching, and final payload assembly.
+This file is the main orchestration layer. It connects intent detection, retrieval, dominance analysis, anchor updates, prompt construction, answer generation, hallucination detection, fallback logic, graph generation, caching, and final payload assembly.
 
 ### Pipeline config
 
@@ -979,7 +987,7 @@ Ranks documents using person match scores.
 
 #### `_select_docs_for_person(ranked_docs, ...)`
 
-Selects a usable person focused subset from the ranked results.
+Selects a usable person focused subset from the ranked results. The strong match threshold has been lowered from 3.0 to 2.0 so that initial format name matches such as D. Brown matching Duncan Brown are classified as strong evidence rather than merely matched. This directly prevents the confidence downshift cascade that previously caused sterile extractive answers on first turn person queries.
 
 ### Confidence and dominance helpers
 
@@ -989,7 +997,7 @@ Lowers a retrieval confidence label.
 
 #### `_downshift_confidence_for_person_support(label, ...)`
 
-Further reduces confidence when person specific evidence is weaker than expected.
+Further reduces confidence when person specific evidence is weaker than expected. The downshift thresholds have been relaxed so that retrievals where most documents match by initial plus last name no longer trigger aggressive downgrades. The previous thresholds required a 45 percent strong ratio and 75 percent matched ratio to maintain high confidence, which was too strict for academic metadata where initial format names are the norm. The new thresholds require 30 percent strong and 50 percent matched for high, and only downgrade further when strong evidence is below 10 percent.
 
 #### `_dominant_metadata_filter_from_docs(docs, question, ...)`
 
@@ -1033,9 +1041,9 @@ Applies final display safe cleanup to the answer.
 
 Creates a candidate anchor from dominance analysis.
 
-#### `_choose_anchor_update(current_anchor, candidate_anchor, dominance, question)`
+#### `_choose_anchor_update(current_anchor, candidate_anchor, dominance, question, resolved_question="")`
 
-Decides whether to keep, replace, or ignore the anchor.
+Decides whether to keep, replace, or ignore the anchor. Now accepts an optional `resolved_question` parameter and validates anchor candidates against both the raw user question and the resolved or rewritten question. This prevents anchor drift where an unrelated researcher from noisy retrieval results would silently become the anchor when the user asked a follow up using pronouns. A new candidate anchor is blocked with action `blocked_no_query_overlap` when it has zero token overlap with both the raw and resolved questions.
 
 ### Prompt composition
 
@@ -1053,7 +1061,7 @@ Builds the answer prompt from question, summary, recent turns, style hints, and 
 
 #### `_fit_prompt_to_budget(...)`
 
-Shrinks document count and context length iteratively so the prompt fits within model limits.
+Shrinks document count and context length iteratively so the prompt fits within model limits. The fitting strategy has been revised to use a two phase approach. Phase one shrinks only the per document text limit while preserving document count, since having more documents in the context is more important for answer quality than per document verbosity. Phase two alternates between shrinking documents and text when the text floor has been reached. The iteration count was increased from 28 to 36 and reduction steps were made gentler.
 
 ### Prompt context helpers
 
@@ -1093,11 +1101,25 @@ Extracts person like spans from generated text.
 
 #### `_answer_mentions_unsupported_researcher(answer, docs)`
 
-Checks whether the answer names researchers not supported by the retrieved evidence.
+Checks whether the answer names researchers not supported by the retrieved evidence. Now uses bidirectional name matching: it checks answer names against document metadata signatures and also checks document names against answer name signatures. This prevents false positives when the answer uses a full name like Duncan Brown but the metadata stores D. Brown. A last name only fallback is also applied so that shared surnames are not flagged as unsupported.
 
 #### `_build_researcher_extract_answer(docs, max_researchers=5)`
 
 Builds a safer extractive answer that lists supported researchers and papers when hallucination risk is high.
+
+### Citation hallucination detection
+
+#### `_collect_doc_titles(docs)`
+
+Collects normalized titles from retrieved documents for validation against the generated answer.
+
+#### `_strip_hallucinated_citations(answer, docs)`
+
+Removes lines from the generated answer that contain quoted paper titles not found in the retrieved document set. Uses fuzzy matching with a SequenceMatcher ratio threshold of 0.6 to account for minor formatting differences. This catches fabricated citations that the 3B model invents when given insufficient context.
+
+### Dominance usability gate
+
+The `dom_usable` flag that controls whether a targeted second pass retrieval is performed has been simplified. Previously it required the dominance confidence to exceed the replace confidence threshold or the ratio to exceed a separately computed strong floor, which sometimes blocked targeted retrieval even when the dominance detector had already confirmed the result. Now it requires only that `_dominant_metadata_filter_from_docs` returned `dominant=True` and the filter value is not a placeholder.
 
 ### Main entry point
 
@@ -1112,12 +1134,13 @@ This is the main application entry point. At a high level it:
 5. performs retrieval and optional anchor aware rewrite
 6. filters and analyzes documents
 7. computes confidence and dominance
-8. updates or preserves the anchor
-9. builds a prompt from summary turns and compact context
+8. updates or preserves the anchor using both raw and resolved question overlap
+9. builds a prompt from summary turns and compact context grouped by researcher
 10. invokes the answer model
-11. sanitizes or replaces weak answers
-12. persists updated state
-13. returns a UI ready result payload
+11. strips hallucinated citations from the generated answer
+12. sanitizes or replaces weak answers using bidirectional name matching
+13. persists updated state
+14. returns a UI ready result payload
 
 ### Output assembly
 
@@ -1215,8 +1238,9 @@ For each submitted prompt the UI:
 3. run Chroma retrieval
 4. deduplicate and filter documents
 5. check whether results cohere around one topic or person
-6. build prompt context from summary recent turns and compact doc context
+6. build prompt context from summary recent turns and compact doc context grouped by researcher
 7. invoke the answer model with grounding instructions
+8. strip any hallucinated citations from the answer
 
 ### Follow up question path
 
@@ -1224,15 +1248,16 @@ For each submitted prompt the UI:
 2. consult anchor and rolling summary
 3. optionally rewrite or expand the retrieval query with anchor context
 4. retrieve with larger search multipliers when configured
-5. recompute anchor stability and support ratio before answer generation
+5. recompute anchor stability and support ratio using fuzzy person name matching before answer generation
+6. validate anchor updates against both raw and resolved questions
 
 ### Weak or inconsistent retrieval path
 
-1. downgrade retrieval confidence
-2. shrink prompt size to reduce noise
+1. downgrade retrieval confidence using relaxed person support thresholds
+2. shrink prompt size to reduce noise using raised low confidence caps
 3. apply stricter anti hallucination guidance
 4. fall back to an extractive answer when synthesis is unsafe
-5. replace answers that mention unsupported researchers
+5. replace answers that mention unsupported researchers using bidirectional name matching
 
 ## Data contracts
 
@@ -1343,4 +1368,14 @@ That usually means retrieval confidence was weak or inconsistent, so the guardra
 
 The UI reset paths clear not just visible chat history but also persistent state, caches, memory collections, and sometimes loaded runtime objects.
 
-##
+### Why the prompt budget loop now prefers shrinking text over dropping documents
+
+The revised budget fitting strategy shrinks per document text limits first before reducing the number of documents. Having more documents in the context, even with shorter summaries, produces better grounded answers than having fewer documents with longer summaries. This is especially important for multi researcher queries where the model needs to see evidence from several different people.
+
+### Why anchor updates check the resolved question
+
+When a user asks a follow up like Summarize the mechanisms described in his papers, the raw question contains only pronouns. The resolved question after coreference rewriting contains the actual entity name. Anchor validation now checks both, preventing a dominant but unrelated researcher from noisy retrieval results from silently hijacking the conversation anchor.
+
+### Why citation validation runs after generation
+
+Small language models sometimes fabricate plausible looking paper titles and journal references when given insufficient context. The post generation citation check compares all quoted titles in the answer against the actual retrieved documents and removes lines containing fabricated references. This is a lightweight safeguard that runs without additional model calls.

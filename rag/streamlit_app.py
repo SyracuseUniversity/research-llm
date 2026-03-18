@@ -2,23 +2,20 @@
 import os
 import html
 import uuid
+import gc
 import streamlit as st
 from streamlit_agraph import agraph, Node, Edge, Config
 
-_LOCAL_EMBED_PATH = r"C:\codes\models\all-MiniLM-L6-v2"
-if os.path.isdir(_LOCAL_EMBED_PATH):
+_LOCAL_EMBED_PATH = os.environ.get("LOCAL_EMBED_PATH", "")
+if _LOCAL_EMBED_PATH and os.path.isdir(_LOCAL_EMBED_PATH):
     os.environ.setdefault("EMBED_MODEL", _LOCAL_EMBED_PATH)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_HOME", r"C:\codes\hf_cache")
-
-# Force embeddings to CPU so they don't contend with the LLM for VRAM
+_HF_HOME = os.environ.get("HF_HOME_OVERRIDE", "")
+if _HF_HOME and os.path.isdir(_HF_HOME):
+    os.environ.setdefault("HF_HOME", _HF_HOME)
 os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
-
-# Prevent tokenizer parallelism deadlock on Windows
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-# Raise LLM timeout to handle complex/long queries
 os.environ.setdefault("RAG_LLM_TIMEOUT_S", "300")
 
 from rag_pipeline import answer_question, sanitize_answer_for_display
@@ -27,68 +24,19 @@ from rag_engine import get_global_manager
 from conversation_memory import hard_reset_memory, clear_qa_cache
 from cache_manager import clear_cache as clear_rag_cache
 
-import gc
 import psutil
 import torch
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _safe_call(fn, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs)
-    except Exception:
-        return None
+    try: return fn(*args, **kwargs)
+    except Exception: return None
 
-
-def _esc(value: object) -> str:
+def _esc(value) -> str:
     return html.escape(str(value or ""))
 
-
-def _esc_answer(value: object) -> str:
-    """Sanitise an LLM answer for display.
-
-    We no longer html.escape() here because Streamlit's st.markdown with
-    unsafe_allow_html=False already prevents XSS.  HTML-escaping was causing
-    literal '&amp;' artefacts and preventing markdown rendering.
-    """
+def _esc_answer(value) -> str:
     return sanitize_answer_for_display(str(value or ""))
-
-
-def _ram_stats() -> dict:
-    vm = psutil.virtual_memory()
-    return {
-        "used_gb": vm.used / (1024 ** 3),
-        "total_gb": vm.total / (1024 ** 3),
-        "pct": vm.percent,
-    }
-
-
-def _vram_stats() -> dict | None:
-    if not torch.cuda.is_available():
-        return None
-    try:
-        free_b, total_b = torch.cuda.mem_get_info()
-        used_b = total_b - free_b
-        return {
-            "used_gb": used_b / (1024 ** 3),
-            "total_gb": total_b / (1024 ** 3),
-            "pct": (used_b / total_b * 100) if total_b else 0.0,
-        }
-    except Exception:
-        return None
-
-
-def _session_metrics(user_key: str) -> dict:
-    state = ENGINE_MANAGER.store.load(user_key)
-    return {
-        "session_id": user_key,
-        "turn_count": len(state.get("turns", []) or []),
-        "summary_len": len(state.get("rolling_summary", "") or ""),
-        "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),
-    }
 
 
 def _render_graph(g: dict, graph_key: str) -> None:
@@ -97,104 +45,51 @@ def _render_graph(g: dict, graph_key: str) -> None:
     if not nodes_raw or not edges_raw:
         return
 
-    # ── Toggle state ──────────────────────────────────────────────────────────
     toggle_key = f"graph_open_{graph_key}"
     if toggle_key not in st.session_state:
-        st.session_state[toggle_key] = False  # hidden by default
+        st.session_state[toggle_key] = False
 
-    # Use st.toggle instead of st.button — toggling a checkbox does NOT
-    # interrupt an in-progress LLM generation the way a button rerun does.
-    show = st.toggle(
-        "Show Graph",
-        value=st.session_state[toggle_key],
-        key=f"graph_toggle_{graph_key}",
-    )
+    show = st.toggle("Show Graph", value=st.session_state[toggle_key],
+                      key=f"graph_toggle_{graph_key}")
     st.session_state[toggle_key] = show
-
     if not show:
         return
 
-    # ── Node styling by type ──────────────────────────────────────────────────
     TYPE_CONFIG = {
-        "paper":      {"size": 18, "color": "#4A90D9"},
-        "researcher": {"size": 28, "color": "#E87B3A"},
-        "topic":      {"size": 20, "color": "#5BAD72"},
-        "author":     {"size": 14, "color": "#9B6BBE"},
+        "paper": (18, "#4A90D9"), "researcher": (28, "#E87B3A"),
+        "topic": (20, "#5BAD72"), "author": (14, "#9B6BBE"),
     }
-    DEFAULT_CFG = {"size": 16, "color": "#888888"}
+    FONT = {"size": 11, "color": "#1a1a1a", "background": "rgba(255,255,255,0.85)",
+            "strokeWidth": 2, "strokeColor": "#ffffff"}
 
-    def _truncate(label: str, max_len: int = 48) -> str:
-        return label if len(label) <= max_len else label[:max_len - 1].rstrip() + "…"
-
-    nodes, edges = [], []
-
+    nodes = []
     for n in nodes_raw:
-        nid   = str(n.get("id", "")).strip()
-        label = _truncate(str(n.get("label", "")).strip() or nid)
-        ntype = str(n.get("type", "")).strip().lower()
-        cfg   = TYPE_CONFIG.get(ntype, DEFAULT_CFG)
-        nodes.append(Node(
-            id=nid,
-            label=label,
-            size=cfg["size"],
-            color=cfg["color"],
-            font={
-                "size": 11,
-                "color": "#1a1a1a",
-                "background": "rgba(255,255,255,0.85)",
-                "strokeWidth": 2,
-                "strokeColor": "#ffffff",
-            },
-            borderWidth=2,
-            borderWidthSelected=3,
-        ))
+        nid = str(n.get("id", "")).strip()
+        label = str(n.get("label", "")).strip() or nid
+        if len(label) > 48: label = label[:47].rstrip() + "…"
+        sz, color = TYPE_CONFIG.get(str(n.get("type", "")).strip().lower(), (16, "#888888"))
+        nodes.append(Node(id=nid, label=label, size=sz, color=color, font=FONT,
+                          borderWidth=2, borderWidthSelected=3))
 
-    for e in edges_raw:
-        src = str(e.get("source", "")).strip()
-        tgt = str(e.get("target", "")).strip()
-        if src and tgt:
-            edges.append(Edge(
-                source=src,
-                target=tgt,
-                label=str(e.get("type", "")),
-                color={"color": "#aaaaaa", "opacity": 0.7},
-                width=1.5,
-                font={"size": 9, "color": "#555555",
-                      "background": "rgba(255,255,255,0.75)"},
-                smooth={"type": "curvedCW", "roundness": 0.1},
-            ))
+    edges = [Edge(source=str(e.get("source", "")).strip(),
+                  target=str(e.get("target", "")).strip(),
+                  label=str(e.get("type", "")),
+                  color={"color": "#aaaaaa", "opacity": 0.7}, width=1.5,
+                  font={"size": 9, "color": "#555555", "background": "rgba(255,255,255,0.75)"},
+                  smooth={"type": "curvedCW", "roundness": 0.1})
+             for e in edges_raw if str(e.get("source", "")).strip() and str(e.get("target", "")).strip()]
 
     config = Config(
-        width="100%",
-        height=520,
-        directed=True,
-        physics=True,
-        hierarchical=False,
-        fit=True,
-        stabilization={
-            "enabled": True,
-            "iterations": 300,
-            "updateInterval": 25,
-            "fit": True,
-        },
+        width="100%", height=520, directed=True, physics=True, hierarchical=False, fit=True,
+        stabilization={"enabled": True, "iterations": 300, "updateInterval": 25, "fit": True},
         solver="forceAtlas2Based",
-        forceAtlas2Based={
-            "gravitationalConstant": -50,
-            "centralGravity": 0.01,
-            "springLength": 120,
-            "springConstant": 0.08,
-            "damping": 0.9,
-            "avoidOverlap": 0.8,
-        },
-        zoomView=True,
-        dragNodes=True,
-        dragView=True,
-        navigationButtons=True,
-        keyboard=True,
+        forceAtlas2Based={"gravitationalConstant": -50, "centralGravity": 0.01,
+                          "springLength": 120, "springConstant": 0.08,
+                          "damping": 0.9, "avoidOverlap": 0.8},
+        zoomView=True, dragNodes=True, dragView=True, navigationButtons=True, keyboard=True,
     )
-
-    # Render directly in page — NOT inside st.expander (causes zero-height mount)
-    agraph(nodes=nodes, edges=edges, config=config)
+    with st.container():
+        agraph(nodes=nodes, edges=edges, config=config)
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +107,6 @@ if "engine_manager" not in st.session_state:
     st.session_state["engine_manager"] = get_global_manager()
 ENGINE_MANAGER = st.session_state["engine_manager"]
 
-# Always-on settings
 settings.debug_rag = True
 settings.use_graph = True
 
@@ -222,10 +116,10 @@ settings.use_graph = True
 
 with st.sidebar:
     st.subheader("System Memory")
-    ram_caption_placeholder  = st.empty()
-    ram_bar_placeholder      = st.empty()
-    vram_caption_placeholder = st.empty()
-    vram_bar_placeholder     = st.empty()
+    ram_ph = st.empty()
+    ram_bar_ph = st.empty()
+    vram_ph = st.empty()
+    vram_bar_ph = st.empty()
 
     st.divider()
     st.subheader("Session")
@@ -240,26 +134,19 @@ with st.sidebar:
         st.success("Memory cleared.")
 
     if st.button("Restart Conversation"):
-        # 1. Clear UI
         st.session_state["messages"] = []
-        # 2. Reset backend state for current session
         _safe_call(hard_reset_memory, USER_KEY)
         _safe_call(clear_qa_cache, USER_KEY)
         _safe_call(clear_rag_cache)
-        # 3. Generate a fresh session key so no stale state can leak
         st.session_state["user_key"] = str(uuid.uuid4())
-        # 4. Force-reload the model runtimes to clear any accumulated
-        #    CUDA allocator fragmentation and get a clean model state
         try:
             mgr = ENGINE_MANAGER
-            if mgr.answer_runtime is not None:
-                mgr.answer_runtime.close()
-                mgr.answer_runtime = None
-                mgr.active_answer_model_key = ""
-            if mgr.utility_runtime is not None:
-                mgr.utility_runtime.close()
-                mgr.utility_runtime = None
-                mgr.active_utility_model_key = ""
+            for rt_attr in ("answer_runtime", "utility_runtime"):
+                rt = getattr(mgr, rt_attr, None)
+                if rt is not None:
+                    rt.close()
+                    setattr(mgr, rt_attr, None)
+                    setattr(mgr, f"active_{rt_attr.replace('_runtime', '')}_model_key", "")
             if mgr.utility_worker is not None:
                 mgr.utility_worker.stop()
                 mgr.utility_worker = None
@@ -273,76 +160,64 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Session Diagnostics")
-    diagnostics_placeholder = st.empty()
+    diag_ph = st.empty()
 
 
 def _refresh_sidebar(user_key: str) -> None:
-    """Write current stats into sidebar placeholders — no rerun needed."""
-    ram = _ram_stats()
-    ram_caption_placeholder.caption(
-        f"**RAM** {ram['used_gb']:.1f} / {ram['total_gb']:.1f} GB  ({ram['pct']:.0f}%)"
-    )
-    ram_bar_placeholder.progress(int(ram["pct"]))
+    vm = psutil.virtual_memory()
+    ram_ph.caption(f"**RAM** {vm.used / 1e9:.1f} / {vm.total / 1e9:.1f} GB  ({vm.percent:.0f}%)")
+    ram_bar_ph.progress(int(vm.percent))
 
-    vram = _vram_stats()
-    if vram:
-        vram_caption_placeholder.caption(
-            f"**VRAM** {vram['used_gb']:.1f} / {vram['total_gb']:.1f} GB  ({vram['pct']:.0f}%)"
-        )
-        vram_bar_placeholder.progress(int(vram["pct"]))
+    if torch.cuda.is_available():
+        try:
+            free_b, total_b = torch.cuda.mem_get_info()
+            used = total_b - free_b
+            pct = used / total_b * 100 if total_b else 0
+            vram_ph.caption(f"**VRAM** {used / 1e9:.1f} / {total_b / 1e9:.1f} GB  ({pct:.0f}%)")
+            vram_bar_ph.progress(int(pct))
+        except Exception:
+            vram_ph.caption("**VRAM** — error reading GPU info")
+            vram_bar_ph.empty()
     else:
-        vram_caption_placeholder.caption("**VRAM** — GPU not available")
-        vram_bar_placeholder.empty()
+        vram_ph.caption("**VRAM** — GPU not available")
+        vram_bar_ph.empty()
 
-    metrics = _session_metrics(user_key)
-    diagnostics_placeholder.json({
-        "session_id":           metrics["session_id"],
-        "turn_count":           metrics["turn_count"],
-        "summary_len":          metrics["summary_len"],
-        "retrieval_confidence": metrics["retrieval_confidence"],
+    state = ENGINE_MANAGER.store.load(user_key)
+    diag_ph.json({
+        "session_id": user_key,
+        "turn_count": len(state.get("turns", []) or []),
+        "summary_len": len(state.get("rolling_summary", "") or ""),
+        "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),
     })
 
 
-# Initial population on every page load
 _refresh_sidebar(USER_KEY)
 
 # ---------------------------------------------------------------------------
-# Chat history
+# Chat history & input
 # ---------------------------------------------------------------------------
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
 for idx, msg in enumerate(st.session_state["messages"]):
-    role = msg["role"]
-    with st.chat_message(role):
-        if role == "assistant":
-            content = msg.get("content", "")
-            st.markdown(_esc_answer(content), unsafe_allow_html=False)
-
-            timing_caption = msg.get("timing_caption", "")
-            if timing_caption:
-                st.caption(timing_caption)
-
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            st.markdown(_esc_answer(msg.get("content", "")), unsafe_allow_html=False)
+            if msg.get("timing_caption"):
+                st.caption(msg["timing_caption"])
             sources = msg.get("sources", [])
             if sources:
                 with st.expander(f"Retrieved Sources ({len(sources)})", expanded=False):
                     for i, s in enumerate(sources, 1):
                         st.markdown(f"[{i}] {s}", unsafe_allow_html=False)
-
-            graph_error = msg.get("graph_error", "")
-            if graph_error:
-                st.warning(graph_error)
+            if msg.get("graph_error"):
+                st.warning(msg["graph_error"])
             _render_graph(msg.get("graph", {}) or {}, graph_key=f"history_{idx}")
         else:
             st.write(_esc(msg.get("content", "")))
 
-# ---------------------------------------------------------------------------
-# Chat input
-# ---------------------------------------------------------------------------
-
 prompt = st.chat_input("Ask about Syracuse research...")
-
 if prompt:
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -350,27 +225,18 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Retrieving context and generating answer..."):
-            out = answer_question(
-                prompt,
-                user_key=USER_KEY,
-                use_graph=True,
-                stateless=False,
-            )
+            out = answer_question(prompt, user_key=USER_KEY, use_graph=True, stateless=False)
 
         answer_text = (out.get("answer") or "").strip()
-        if answer_text:
-            st.markdown(_esc_answer(answer_text), unsafe_allow_html=False)
-        else:
+        if not answer_text:
             answer_text = "I could not generate an answer, but the retrieved sources are shown below."
-            st.markdown(answer_text, unsafe_allow_html=False)
+        st.markdown(_esc_answer(answer_text), unsafe_allow_html=False)
 
         llm_calls = out.get("llm_calls", {}) if isinstance(out.get("llm_calls"), dict) else {}
-        timing    = out.get("timing_ms", {})  if isinstance(out.get("timing_ms"),  dict) else {}
-        timing_caption = (
-            f"LLM calls — answer: {llm_calls.get('answer_llm_calls', 0)} | "
-            f"utility: {llm_calls.get('utility_llm_calls', 0)} | "
-            f"total: {timing.get('total_ms', 0):.0f} ms"
-        )
+        timing = out.get("timing_ms", {}) if isinstance(out.get("timing_ms"), dict) else {}
+        timing_caption = (f"LLM calls — answer: {llm_calls.get('answer_llm_calls', 0)} | "
+                          f"utility: {llm_calls.get('utility_llm_calls', 0)} | "
+                          f"total: {timing.get('total_ms', 0):.0f} ms")
         st.caption(timing_caption)
 
         sources = list(out.get("sources", []) or [])
@@ -383,18 +249,10 @@ if prompt:
         if graph_error:
             st.warning(graph_error)
         g = dict(out.get("graph_graph", {}) or {})
-        new_msg_idx = len(st.session_state["messages"])
-        _render_graph(g, graph_key=f"history_{new_msg_idx}")
+        _render_graph(g, graph_key=f"history_{len(st.session_state['messages'])}")
 
-    # Persist turn
     st.session_state["messages"].append({
-        "role":           "assistant",
-        "content":        answer_text,
-        "sources":        sources,
-        "graph":          g,
-        "graph_error":    graph_error,
-        "timing_caption": timing_caption,
+        "role": "assistant", "content": answer_text, "sources": sources,
+        "graph": g, "graph_error": graph_error, "timing_caption": timing_caption,
     })
-
-    # Refresh sidebar in-place — no rerun, graph stays mounted
     _refresh_sidebar(USER_KEY)
