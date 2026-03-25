@@ -12,6 +12,8 @@ class DatabaseConfig:
     chroma_dir: str
     collection: str
     description: str
+    neo4j_db: str = ""          # Neo4j database name; empty = use default from config
+    display_label: str = ""     # Human-readable label for UI dropdown
 
 
 class DatabaseManager:
@@ -24,6 +26,24 @@ class DatabaseManager:
             collection=getattr(config, "CHROMA_COLLECTION_FULL",
                                getattr(config, "CHROMA_COLLECTION", "papers_all")),
             description="Full text papers with metadata",
+            neo4j_db=config.NEO4J_DB,
+            display_label="Legacy DB",
+        ))
+        self.register_config("openalex", DatabaseConfig(
+            mode="openalex",
+            chroma_dir=getattr(config, "CHROMA_DIR_OPENALEX", ""),
+            collection=getattr(config, "CHROMA_COLLECTION_OPENALEX", "syracuse_papers"),
+            description="OpenAlex papers with Docling fulltext",
+            neo4j_db=getattr(config, "NEO4J_DB_OPENALEX", "syr-rag-openalex"),
+            display_label="OpenAlex DB",
+        ))
+        self.register_config("abstracts", DatabaseConfig(
+            mode="abstracts",
+            chroma_dir=getattr(config, "CHROMA_DIR_ABSTRACTS", ""),
+            collection=getattr(config, "CHROMA_COLLECTION_ABSTRACTS", "syracuse_abstracts"),
+            description="OpenAlex abstracts only (no fulltext)",
+            neo4j_db=getattr(config, "NEO4J_DB_ABSTRACTS", "syr-rag-abstracts"),
+            display_label="Abstracts Only",
         ))
 
     def register_config(self, name: str, cfg: DatabaseConfig) -> None:
@@ -59,3 +79,12 @@ class DatabaseManager:
         for cfg in self.configs.values():
             if cfg and cfg.chroma_dir:
                 os.makedirs(cfg.chroma_dir, exist_ok=True)
+
+    def display_labels(self) -> Dict[str, str]:
+        """Return {config_name: display_label} for UI dropdowns."""
+        return {name: (cfg.display_label or name) for name, cfg in self.configs.items()}
+
+    def get_active_neo4j_db(self) -> str:
+        """Return the Neo4j database name for the active config."""
+        cfg = self.get_active_config()
+        return (cfg.neo4j_db if cfg and cfg.neo4j_db else config.NEO4J_DB)

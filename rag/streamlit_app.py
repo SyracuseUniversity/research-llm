@@ -9,8 +9,9 @@ from streamlit_agraph import agraph, Node, Edge, Config
 _LOCAL_EMBED_PATH = os.environ.get("LOCAL_EMBED_PATH", "")
 if _LOCAL_EMBED_PATH and os.path.isdir(_LOCAL_EMBED_PATH):
     os.environ.setdefault("EMBED_MODEL", _LOCAL_EMBED_PATH)
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Note: HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE removed — they block
+# the transformers cache format migration needed by v4.22+. Local models
+# still load from disk via local_files_only in ModelRuntime.
 _HF_HOME = os.environ.get("HF_HOME_OVERRIDE", "")
 if _HF_HOME and os.path.isdir(_HF_HOME):
     os.environ.setdefault("HF_HOME", _HF_HOME)
@@ -159,6 +160,96 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.subheader("Dataset")
+
+    # Build dropdown from registered DatabaseManager configs
+    _db_labels = ENGINE_MANAGER.dbm.display_labels()         # {"full": "Legacy DB", "openalex": "OpenAlex DB"}
+    _label_to_key = {v: k for k, v in _db_labels.items()}    # reverse map
+    _options = list(_db_labels.values())
+
+    # Persist selection across reruns
+    if "active_dataset" not in st.session_state:
+        st.session_state["active_dataset"] = _db_labels.get(ENGINE_MANAGER.active_mode, _options[0])
+
+    selected_label = st.selectbox(
+        "Choose dataset",
+        options=_options,
+        index=_options.index(st.session_state["active_dataset"]) if st.session_state["active_dataset"] in _options else 0,
+        key="dataset_selector",
+    )
+
+    if selected_label != st.session_state["active_dataset"]:
+        new_mode = _label_to_key[selected_label]
+        ENGINE_MANAGER.switch_mode(new_mode)
+        settings.active_mode = new_mode
+        # Invalidate the cached papers vectorstore so it reloads from new chroma dir
+        ENGINE_MANAGER.papers_vs_cache.pop(new_mode, None)
+        st.session_state["active_dataset"] = selected_label
+        st.success(f"Switched to **{selected_label}**")
+        st.rerun()
+    else:
+        # Ensure engine manager stays in sync on every rerun
+        current_key = _label_to_key.get(selected_label, "full")
+        if ENGINE_MANAGER.active_mode != current_key:
+            ENGINE_MANAGER.switch_mode(current_key)
+            settings.active_mode = current_key
+
+    st.divider()
+    st.subheader("Model")
+
+    _MODEL_OPTIONS = {
+        "LLaMA 3.2 3B": "llama-3.2-3b",
+        "LLaMA 3.1 8B (8-bit)": "llama-3.1-8b",
+        "Gemma 3 12B (8-bit)": "gemma-3-12b",
+        "Qwen 2.5 14B (8-bit)": "qwen-2.5-14b",
+        "GPT-OSS 20B (8-bit)": "gpt-oss-20b",
+    }
+    _model_labels = list(_MODEL_OPTIONS.keys())
+    _model_keys = list(_MODEL_OPTIONS.values())
+
+    # Persist selection
+    if "active_model" not in st.session_state:
+        # Match current setting to a label
+        current_key = getattr(settings, "answer_model_key", "llama-3.2-3b")
+        st.session_state["active_model"] = next(
+            (lbl for lbl, k in _MODEL_OPTIONS.items() if k == current_key),
+            _model_labels[0],  # default to 3B
+        )
+
+    selected_model_label = st.selectbox(
+        "Answer model",
+        options=_model_labels,
+        index=_model_labels.index(st.session_state["active_model"]) if st.session_state["active_model"] in _model_labels else 0,
+        key="model_selector",
+    )
+
+    if selected_model_label != st.session_state["active_model"]:
+        new_model_key = _MODEL_OPTIONS[selected_model_label]
+        settings.answer_model_key = new_model_key
+        settings.llm_model = new_model_key
+        # Unload current model, load the new one immediately
+        try:
+            mgr = ENGINE_MANAGER
+            if mgr.answer_runtime is not None:
+                mgr.answer_runtime.close()
+                mgr.answer_runtime = None
+                mgr.active_answer_model_key = ""
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        st.session_state["active_model"] = selected_model_label
+        # Load the new model right away so it's ready for the next question
+        with st.spinner(f"Loading **{selected_model_label}**..."):
+            try:
+                ENGINE_MANAGER.switch_answer_model(new_model_key)
+                st.success(f"**{selected_model_label}** loaded and ready.")
+            except Exception as e:
+                st.error(f"Failed to load {selected_model_label}: {e}")
+        st.rerun()
+
+    st.divider()
     st.subheader("Session Diagnostics")
     diag_ph = st.empty()
 
@@ -183,8 +274,14 @@ def _refresh_sidebar(user_key: str) -> None:
         vram_bar_ph.empty()
 
     state = ENGINE_MANAGER.store.load(user_key)
+    active_cfg = ENGINE_MANAGER.dbm.get_active_config()
     diag_ph.json({
         "session_id": user_key,
+        "active_dataset": ENGINE_MANAGER.active_mode,
+        "chroma_collection": active_cfg.collection if active_cfg else "",
+        "neo4j_db": ENGINE_MANAGER.dbm.get_active_neo4j_db(),
+        "answer_model": getattr(settings, "answer_model_key", ""),
+        "model_loaded": ENGINE_MANAGER.active_answer_model_key or "(not loaded)",
         "turn_count": len(state.get("turns", []) or []),
         "summary_len": len(state.get("rolling_summary", "") or ""),
         "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),

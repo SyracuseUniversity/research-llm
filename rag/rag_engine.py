@@ -838,21 +838,45 @@ class _DirectGenerationLLM:
 
 class ModelRuntime:
     def __init__(self, model_id_or_path: str, *, max_new_tokens: int,
-                 do_sample: bool = False, temperature: float = 0.0, top_p: Optional[float] = None):
+                 do_sample: bool = False, temperature: float = 0.0, top_p: Optional[float] = None,
+                 load_in_8bit: bool = False, local_only: bool = True):
         if getattr(settings, "force_gpu", True) and not torch.cuda.is_available():
             raise RuntimeError("CUDA is required but torch.cuda.is_available() is False")
 
         self.model_id_or_path = model_id_or_path
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, local_files_only=True, use_fast=True)
+        self.load_in_8bit = load_in_8bit
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id_or_path, local_files_only=local_only, use_fast=True,
+            trust_remote_code=True)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id_or_path, dtype=dtype, local_files_only=True,
-            low_cpu_mem_usage=False, device_map=None)
-        if torch.cuda.is_available():
-            self.model.to("cuda:0")
+        if load_in_8bit and torch.cuda.is_available():
+            try:
+                from transformers import BitsAndBytesConfig
+                import bitsandbytes  # noqa: F401 — verify it's actually installed
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id_or_path,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    local_files_only=local_only,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
+                logger.info("Loaded %s in 8-bit mode", model_id_or_path)
+            except (ImportError, Exception) as e:
+                logger.warning("8-bit loading failed (%s) — falling back to fp16 with device_map=auto", e)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id_or_path, torch_dtype=torch.float16, local_files_only=local_only,
+                    low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True)
+        else:
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id_or_path, torch_dtype=dtype, local_files_only=local_only,
+                low_cpu_mem_usage=False, device_map=None, trust_remote_code=True)
+            if torch.cuda.is_available():
+                self.model.to("cuda:0")
         self.model.eval()
 
         self.generation_kwargs: Dict[str, Any] = {
@@ -963,15 +987,14 @@ def build_embeddings() -> Any:
     def _make(device):
         return HuggingFaceEmbeddings(
             model_name=config.EMBED_MODEL,
-            model_kwargs={"device": device, "local_files_only": True, "trust_remote_code": False,
-                          "model_kwargs": {"low_cpu_mem_usage": False, "dtype": torch.float32}},
+            model_kwargs={"device": device, "trust_remote_code": False},
             encode_kwargs={"normalize_embeddings": True, "batch_size": 128},
         )
     for factory in [lambda: _make("cpu"), lambda: _TransformerMeanEmbeddings(config.EMBED_MODEL, "cpu")]:
         try:
             return factory()
-        except Exception:
-            logger.debug("Embedding init attempt failed", exc_info=True)
+        except Exception as e:
+            logger.warning("Embedding init attempt failed: %s", e)
     raise RuntimeError("All embedding initialization strategies failed")
 
 
@@ -986,7 +1009,47 @@ def _resolve_llm_path(llm_model_key: str) -> str:
     key = (llm_model_key or "").strip().lower()
     if key in {"llama-3.2-1b", "llama_1b", "1b"}:
         return str(getattr(settings, "llama_1b_path", "") or "").strip() or config.LLAMA_1B
+    if key in {"llama-3.1-8b", "llama_8b", "8b"}:
+        return str(getattr(settings, "llama_8b_path", "") or "").strip() or getattr(config, "LLAMA_8B", "")
+    if key in {"gemma-3-12b", "gemma_12b", "12b"}:
+        return str(getattr(settings, "gemma_12b_path", "") or "").strip() or getattr(config, "GEMMA_12B", "")
+    if key in {"qwen-2.5-14b", "qwen_14b", "14b"}:
+        return str(getattr(settings, "qwen_14b_path", "") or "").strip() or getattr(config, "QWEN_14B", "")
+    if key in {"gpt-oss-20b", "gpt_oss_20b", "20b"}:
+        return str(getattr(settings, "gpt_oss_20b_path", "") or "").strip() or getattr(config, "GPT_OSS_20B", "openai/gpt-oss-20b")
     return config.LLAMA_3B
+
+
+# Models that need 8-bit quantization (too large for fp16 on typical consumer GPUs)
+_8BIT_MODEL_KEYS = {
+    "llama-3.1-8b", "llama_8b", "8b",
+    "gemma-3-12b", "gemma_12b", "12b",
+    "qwen-2.5-14b", "qwen_14b", "14b",
+    "gpt-oss-20b", "gpt_oss_20b", "20b",
+}
+
+def _should_quantize_8bit(llm_model_key: str) -> bool:
+    """Return True if the model should be loaded in 8-bit mode."""
+    key = (llm_model_key or "").strip().lower()
+    if key in _8BIT_MODEL_KEYS:
+        return bool(getattr(settings, "quantize_8bit", True))
+    return False
+
+
+def _is_remote_model(llm_model_key: str) -> bool:
+    """Return True if the resolved model path is a HuggingFace Hub ID (not a local directory)."""
+    import os as _os
+    path = _resolve_llm_path(llm_model_key)
+    if not path:
+        return True
+    # If it looks like a local path and exists, it's local
+    if _os.path.sep in path or path.startswith("/") or (len(path) > 2 and path[1] == ":"):
+        return False
+    # If it exists on disk as-is, it's local
+    if _os.path.isdir(path):
+        return False
+    # Otherwise it's a HF Hub ID like "openai/gpt-oss-20b"
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1976,7 +2039,11 @@ class EngineManager:
             setattr(self, attr_name, None)
         clear_runtime_cache()
         max_new = desired_max or int(getattr(settings, "utility_max_new_tokens", 256))
-        rt = ModelRuntime(_resolve_llm_path(key), max_new_tokens=max_new, do_sample=False, temperature=0.0)
+        use_8bit = _should_quantize_8bit(key)
+        local_only = not _is_remote_model(key)
+        rt = ModelRuntime(_resolve_llm_path(key), max_new_tokens=max_new,
+                          do_sample=False, temperature=0.0, load_in_8bit=use_8bit,
+                          local_only=local_only)
         setattr(self, attr_name, rt)
         setattr(self, key_attr, key)
         if max_tokens_attr and desired_max is not None:
