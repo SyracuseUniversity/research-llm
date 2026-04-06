@@ -1,88 +1,86 @@
 # conversation_memory.py
-import json
+import logging
 import os
-import threading
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
-# ---------------------------------------------------------------------------
-# In-memory QA cache and pipeline cache, keyed by (user_key, cache_key).
-# These are process-local and intentionally not persisted to disk — they exist
-# only to avoid redundant LLM calls within a single server session.
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
-_qa_cache: Dict[str, Dict[str, Any]] = {}
-_pipeline_cache: Dict[str, Any] = {}
-_lock = threading.Lock()
+_MAX_QA_PER_USER = 10
+_MAX_USERS = 500
+
+_QA_CACHE: "OrderedDict[str, OrderedDict[str, Dict[str, Any]]]" = OrderedDict()
+_PIPELINE_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 
-# ---------------------------------------------------------------------------
-# QA answer cache
-# ---------------------------------------------------------------------------
-
-def get_cached_answer(user_key: str, cache_key: str) -> Optional[Dict[str, Any]]:
-    """Return a previously cached answer dict, or None if not found."""
-    with _lock:
-        user_store = _qa_cache.get(user_key)
-        if not isinstance(user_store, dict):
-            return None
-        return user_store.get(cache_key)
-
-
-def set_cached_answer(user_key: str, cache_key: str, payload: Dict[str, Any]) -> None:
-    """Store an answer payload under (user_key, cache_key)."""
-    if not user_key or not cache_key or not isinstance(payload, dict):
-        return
-    with _lock:
-        if user_key not in _qa_cache:
-            _qa_cache[user_key] = {}
-        _qa_cache[user_key][cache_key] = payload
+def _evict_oldest_users() -> None:
+    for cache in (_QA_CACHE, _PIPELINE_CACHE):
+        while len(cache) > _MAX_USERS:
+            cache.popitem(last=False)
 
 
 def clear_qa_cache(user_key: str) -> None:
-    """Remove all cached answers for a given user/session."""
-    with _lock:
-        _qa_cache.pop(user_key, None)
+    _QA_CACHE.pop(user_key, None)
+    clear_pipeline_cache(user_key)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline state cache (lightweight — stores retrieval/summary digest only)
-# ---------------------------------------------------------------------------
-
-def get_pipeline_cache(user_key: str) -> Optional[Dict[str, Any]]:
-    """Return the last pipeline state snapshot for a user, or None."""
-    with _lock:
-        return _pipeline_cache.get(user_key)
+def get_cached_answer(user_key: str, key: str) -> Optional[Dict[str, Any]]:
+    u = _QA_CACHE.get(user_key)
+    return u.get((key or "").strip()) if u else None
 
 
-def set_pipeline_cache(user_key: str, payload: Dict[str, Any]) -> None:
-    """Overwrite the pipeline state snapshot for a user."""
-    if not user_key:
-        return
-    with _lock:
-        _pipeline_cache[user_key] = payload if isinstance(payload, dict) else {}
+def set_cached_answer(user_key: str, key: str, payload: Dict[str, Any]) -> None:
+    u = _QA_CACHE.setdefault(user_key, OrderedDict())
+    _QA_CACHE.move_to_end(user_key)
+    cache_key = (key or "").strip()
+    if cache_key in u:
+        u.move_to_end(cache_key)
+    u[cache_key] = payload
+    while len(u) > _MAX_QA_PER_USER:
+        u.popitem(last=False)
+    _evict_oldest_users()
 
-
-# ---------------------------------------------------------------------------
-# Hard reset — clears both caches and delegates to the engine manager to wipe
-# the vector memory store for the session.
-# ---------------------------------------------------------------------------
 
 def hard_reset_memory(user_key: str) -> None:
-    """
-    Full session reset:
-      1. Clears the in-memory QA cache for this user.
-      2. Clears the pipeline cache for this user.
-      3. Resets the persistent session state and Chroma memory collection via
-         the global EngineManager (session_store rows + memory embeddings).
-    """
+    import sys
+    mod = sys.modules.get("rag_engine")
+    manager = getattr(mod, "_GLOBAL_MANAGER", None) if mod else None
+    if manager is not None:
+        try:
+            manager.reset_session(user_key)
+        except Exception:
+            logger.warning("Failed to reset session via EngineManager", exc_info=True)
+    else:
+        # Reset stores directly without creating EngineManager
+        try:
+            from session_store import SessionStore
+            SessionStore(os.getenv("RAG_STATE_DB", "chat_state.sqlite")).reset(user_key)
+        except Exception:
+            logger.warning("Failed to reset SessionStore directly", exc_info=True)
+        try:
+            import chromadb
+            client = chromadb.PersistentClient(path=os.getenv("RAG_MEMORY_DIR", "chroma_memory"))
+            col = client.get_collection("memory")
+            ids = ((col.get(where={"session_id": user_key}) or {}).get("ids") or [])
+            if ids:
+                col.delete(ids=ids)
+        except Exception:
+            logger.warning("Failed to reset chroma memory directly", exc_info=True)
     clear_qa_cache(user_key)
-    with _lock:
-        _pipeline_cache.pop(user_key, None)
 
-    # Import here to avoid a circular import at module load time.
-    try:
-        from rag_engine import get_global_manager
-        mgr = get_global_manager()
-        mgr.reset_session(user_key)
-    except Exception:
-        pass
+
+def get_pipeline_cache(user_key: str) -> Optional[Dict[str, Any]]:
+    return _PIPELINE_CACHE.get(user_key)
+
+
+def set_pipeline_cache(user_key: str, data: Dict[str, Any]) -> None:
+    if data:
+        _PIPELINE_CACHE[user_key] = data
+        _PIPELINE_CACHE.move_to_end(user_key)
+        _evict_oldest_users()
+    else:
+        _PIPELINE_CACHE.pop(user_key, None)
+
+
+def clear_pipeline_cache(user_key: str) -> None:
+    _PIPELINE_CACHE.pop(user_key, None)
