@@ -140,23 +140,11 @@ with st.sidebar:
         _safe_call(clear_qa_cache, USER_KEY)
         _safe_call(clear_rag_cache)
         st.session_state["user_key"] = str(uuid.uuid4())
-        try:
-            mgr = ENGINE_MANAGER
-            for rt_attr in ("answer_runtime", "utility_runtime"):
-                rt = getattr(mgr, rt_attr, None)
-                if rt is not None:
-                    rt.close()
-                    setattr(mgr, rt_attr, None)
-                    setattr(mgr, f"active_{rt_attr.replace('_runtime', '')}_model_key", "")
-            if mgr.utility_worker is not None:
-                mgr.utility_worker.stop()
-                mgr.utility_worker = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        st.success("Conversation restarted — models will reload on next question.")
+        # Don't unload models on restart — they're expensive to reload and the
+        # user almost certainly wants to keep chatting with the same model.
+        # Only reset the conversation state (memory, cache, session key).
+        # If the user wants a different model, the Model dropdown handles that.
+        st.success("Conversation restarted.")
         st.rerun()
 
     st.divider()
@@ -227,20 +215,12 @@ with st.sidebar:
         new_model_key = _MODEL_OPTIONS[selected_model_label]
         settings.answer_model_key = new_model_key
         settings.llm_model = new_model_key
-        # Unload current model, load the new one immediately
-        try:
-            mgr = ENGINE_MANAGER
-            if mgr.answer_runtime is not None:
-                mgr.answer_runtime.close()
-                mgr.answer_runtime = None
-                mgr.active_answer_model_key = ""
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
         st.session_state["active_model"] = selected_model_label
-        # Load the new model right away so it's ready for the next question
+
+        # Let switch_answer_model handle the full unload→load cycle in one
+        # pass.  The old code manually closed the runtime, ran gc.collect +
+        # empty_cache, then called switch_answer_model which did it all again
+        # — doubling the cleanup time for no benefit.
         with st.spinner(f"Loading **{selected_model_label}**..."):
             try:
                 ENGINE_MANAGER.switch_answer_model(new_model_key)
@@ -275,6 +255,15 @@ def _refresh_sidebar(user_key: str) -> None:
 
     state = ENGINE_MANAGER.store.load(user_key)
     active_cfg = ENGINE_MANAGER.dbm.get_active_config()
+    # Show attention implementation being used
+    _attn_info = ""
+    _rt = getattr(ENGINE_MANAGER, "answer_runtime", None)
+    if _rt and hasattr(_rt, "model"):
+        _attn_info = str(getattr(getattr(_rt.model, "config", None), "_attn_implementation", "unknown"))
+    _gpu_name = ""
+    if torch.cuda.is_available():
+        try: _gpu_name = torch.cuda.get_device_name(0)
+        except Exception: pass
     diag_ph.json({
         "session_id": user_key,
         "active_dataset": ENGINE_MANAGER.active_mode,
@@ -282,6 +271,8 @@ def _refresh_sidebar(user_key: str) -> None:
         "neo4j_db": ENGINE_MANAGER.dbm.get_active_neo4j_db(),
         "answer_model": getattr(settings, "answer_model_key", ""),
         "model_loaded": ENGINE_MANAGER.active_answer_model_key or "(not loaded)",
+        "attention": _attn_info or "(unknown)",
+        "gpu": _gpu_name or "(none)",
         "turn_count": len(state.get("turns", []) or []),
         "summary_len": len(state.get("rolling_summary", "") or ""),
         "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),

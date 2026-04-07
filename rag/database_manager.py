@@ -1,7 +1,7 @@
 # database_manager.py
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import config_full as config
 
@@ -12,8 +12,8 @@ class DatabaseConfig:
     chroma_dir: str
     collection: str
     description: str
-    neo4j_db: str = ""          # Neo4j database name; empty = use default from config
-    display_label: str = ""     # Human-readable label for UI dropdown
+    neo4j_db: str = ""
+    display_label: str = ""
 
 
 class DatabaseManager:
@@ -81,10 +81,20 @@ class DatabaseManager:
                 os.makedirs(cfg.chroma_dir, exist_ok=True)
 
     def display_labels(self) -> Dict[str, str]:
-        """Return {config_name: display_label} for UI dropdowns."""
         return {name: (cfg.display_label or name) for name, cfg in self.configs.items()}
 
     def get_active_neo4j_db(self) -> str:
-        """Return the Neo4j database name for the active config."""
         cfg = self.get_active_config()
         return (cfg.neo4j_db if cfg and cfg.neo4j_db else config.NEO4J_DB)
+
+    def validate_active_config(self) -> Dict[str, Any]:
+        """Post-switch health check — call after switch_config()."""
+        cfg = self.get_active_config()
+        if not cfg or not cfg.chroma_dir or not os.path.isdir(cfg.chroma_dir):
+            return {"healthy": False, "reason": "missing"}
+        try:
+            import chromadb
+            n = chromadb.PersistentClient(path=cfg.chroma_dir).get_collection(cfg.collection).count()
+            return {"healthy": n > 0, "doc_count": n}
+        except Exception as e:
+            return {"healthy": False, "reason": str(e)}

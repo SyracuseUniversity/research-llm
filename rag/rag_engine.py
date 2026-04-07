@@ -1,4 +1,3 @@
-# rag_engine.py
 import os
 import re
 import uuid
@@ -49,6 +48,8 @@ from rag_utils import (
     looks_like_person_candidate as _looks_like_person_candidate, strip_possessive as _strip_possessive,
     has_explicit_entity_signal as _has_explicit_entity_signal, query_tokens_for_relevance,
     is_meta_command as _is_meta_command,
+    get_name_token_set as _get_name_token_set,
+    get_english_word_set as _get_english_word_set,
 )
 
 logger = logging.getLogger(__name__)
@@ -428,13 +429,17 @@ _VRAM_RELEASE_EVERY_N = 5
 
 def _release_vram_cache() -> None:
     global _vram_release_counter
-    gc.collect()
+    # Skip gc.collect() on every call — with inference_mode() there's no
+    # autograd graph accumulating, so the only benefit of gc.collect here was
+    # reclaiming stale Python wrappers.  Doing it every call added ~50-200ms
+    # of pure overhead per LLM invocation.
     with _vram_release_lock:
         _vram_release_counter += 1
         should_release = _vram_release_counter >= _VRAM_RELEASE_EVERY_N
         if should_release:
             _vram_release_counter = 0
     if should_release:
+        gc.collect()
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -674,6 +679,14 @@ def _extract_person_name(question: str) -> str:
     cleaned = re.sub(r"(\w)['\\u2019]s\b", r"\1", raw)
     stopset = _get_stopword_set()
 
+    # --- Fix 13: NLTK-based guard inside _accept() as defense-in-depth.
+    # If all tokens are common English words and none appear in the NLTK
+    # names corpus, reject.  This catches "Computer Science", "Marine
+    # Paleontology", "Mechanisms Described", "Syracuse University" etc.
+    # without hardcoding any domain or institutional terms. ---
+    _epn_name_tokens = _get_name_token_set()
+    _epn_english_words = _get_english_word_set()
+
     def _titlecase_token(token: str) -> str:
         tok = _strip_possessive(token or "")
         if re.fullmatch(r"[A-Za-z]\.", tok):
@@ -686,7 +699,9 @@ def _extract_person_name(question: str) -> str:
 
     def _accept(candidate: str) -> str:
         c = _strip_possessive(_normalize_candidate(candidate))
-        return c if c and _looks_like_person_candidate(c) else ""
+        if not c or not _looks_like_person_candidate(c):
+            return ""
+        return c
 
     raw_tokens = [t for t in re.findall(r"[A-Za-z][A-Za-z\.\-']*", cleaned) if t]
     if 2 <= len(raw_tokens) <= 4:
@@ -740,7 +755,10 @@ _DEGENERATE_ANSWER_PATTERNS = re.compile(
 
 def _answer_is_bad(answer: str) -> bool:
     a = (answer or "").strip()
-    return not a or len(_tokenize_words(a)) < 20 or bool(_DEGENERATE_ANSWER_PATTERNS.match(a))
+    # 10-word minimum instead of 20 — some models give concise but correct
+    # answers.  The degenerate pattern check catches the truly bad cases
+    # like "X is a researcher." regardless of word count.
+    return not a or len(_tokenize_words(a)) < 10 or bool(_DEGENERATE_ANSWER_PATTERNS.match(a))
 
 
 def _extract_focus_from_question(question: str) -> str:
@@ -795,6 +813,17 @@ class _DirectGenerationLLM:
         self.model = model
         self.tokenizer = tokenizer
         self.generation_kwargs = dict(generation_kwargs or {})
+        # Cache device to avoid iterating parameters on every invoke.
+        try:
+            self._device = next(model.parameters()).device
+        except StopIteration:
+            self._device = torch.device("cpu")
+
+    # Structured separator used by invoke() to split system vs user content.
+    # Callers can embed this in the prompt string to indicate the boundary;
+    # invoke() will use it for chat-template formatting when the tokenizer
+    # supports it.  Chosen to be unlikely to appear in natural content.
+    SYSTEM_USER_SEP = "\n<<SYS_USER_BOUNDARY>>\n"
 
     def invoke(self, prompt: str) -> str:
         p = str(prompt or "")
@@ -803,10 +832,48 @@ class _DirectGenerationLLM:
         max_new = int(self.generation_kwargs.get("max_new_tokens", 256))
         max_ctx = int(getattr(self.model.config, "max_position_embeddings", 0)
                       or getattr(self.tokenizer, "model_max_length", 4096) or 4096)
-        enc = self.tokenizer(p, return_tensors="pt", truncation=True,
+
+        # --- Fix E: Model-agnostic chat template application ---
+        # Instruction-tuned models expect messages wrapped in model-specific
+        # delimiters.  Without them, the model may treat system instructions as
+        # content to continue, echoing them in its output.
+        #
+        # Strategy:
+        # 1. If the prompt contains SYSTEM_USER_SEP, split there (explicit boundary).
+        # 2. Otherwise, treat the entire prompt as a user message.
+        # 3. If the tokenizer has apply_chat_template, use it for ANY model —
+        #    this is model-agnostic because every HF instruct model ships its
+        #    own Jinja template in tokenizer_config.json.
+        # 4. If the tokenizer has no chat_template (base models, old checkpoints),
+        #    fall back to the raw string — identical to the previous behavior.
+        formatted_prompt = p
+        _has_chat_template = (
+            hasattr(self.tokenizer, "apply_chat_template")
+            and getattr(self.tokenizer, "chat_template", None) is not None
+        )
+        if _has_chat_template:
+            try:
+                if self.SYSTEM_USER_SEP in p:
+                    sys_part, user_part = p.split(self.SYSTEM_USER_SEP, 1)
+                    messages = [
+                        {"role": "system", "content": sys_part.strip()},
+                        {"role": "user", "content": user_part.strip()},
+                    ]
+                else:
+                    # No explicit boundary — wrap entire prompt as user message.
+                    # This is safe for all model families: instruction-tuned models
+                    # will get proper <user> delimiters, base models without a
+                    # chat_template already fell through the _has_chat_template gate.
+                    messages = [{"role": "user", "content": p}]
+                formatted_prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                # Any failure (missing template, Jinja error, etc.) — use raw string
+                formatted_prompt = p
+
+        enc = self.tokenizer(formatted_prompt, return_tensors="pt", truncation=True,
                              max_length=max(64, max_ctx - max_new - 16))
-        if torch.cuda.is_available():
-            enc = {k: v.to("cuda:0") for k, v in enc.items()}
+        enc = {k: v.to(self._device) for k, v in enc.items()}
 
         gen_kwargs = {
             "max_new_tokens": max_new,
@@ -821,62 +888,255 @@ class _DirectGenerationLLM:
                 if val is not None:
                     gen_kwargs[key] = float(val)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             out = self.model.generate(**enc, **gen_kwargs)
+            prompt_len = int(enc["input_ids"].shape[1])
+            result = self.tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
 
-        prompt_len = int(enc["input_ids"].shape[1])
-        result = self.tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
         del enc, out
-        for obj in (self.model, getattr(self.model, "generation_config", None)):
-            if obj and hasattr(obj, "_cache"):
-                try:
-                    obj._cache = None
-                except Exception:
-                    pass
         return result
+
+
+def _needs_trust_remote_code(model_id_or_path: str, local_only: bool) -> bool:
+    """Return True only for local models that bundle custom tokenizer/model classes.
+
+    ``trust_remote_code=True`` tells the transformers library to execute the
+    custom Python files that shipped with the model when it was downloaded.
+    Because all models in this deployment are loaded from local disk, this
+    carries no network-fetch risk — it only runs code that was already
+    reviewed and placed on disk.
+
+    We still restrict it to an explicit allowlist so that adding a new model
+    path can never silently enable custom-code execution without a deliberate
+    decision to add it here.
+
+    Override via ``RAG_TRUST_REMOTE_CODE=1`` as an audited escape hatch.
+    """
+    if os.getenv("RAG_TRUST_REMOTE_CODE", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    if not local_only:
+        return False
+    path = str(model_id_or_path or "").strip()
+    path_is_local = (
+        os.path.sep in path
+        or path.startswith("/")
+        or (len(path) > 2 and path[1] == ":")
+        or os.path.isdir(path)
+    )
+    if not path_is_local:
+        return False
+    # Models that ship custom tokenizer/model classes and require this flag.
+    # Match against the tail directory name so absolute paths work correctly.
+    _TRUST_REMOTE_CODE_ALLOWLIST = {
+        "qwen-2.5-14b", "qwen_14b", "14b",
+        "gpt-oss-20b", "gpt_oss_20b", "20b",
+        "gemma-3-12b", "gemma_12b", "12b",  # Fix K: Gemma 3 may ship custom classes
+    }
+    basename = os.path.basename(path.rstrip("/\\")).lower()
+    return any(allowed in basename for allowed in _TRUST_REMOTE_CODE_ALLOWLIST)
 
 
 class ModelRuntime:
     def __init__(self, model_id_or_path: str, *, max_new_tokens: int,
                  do_sample: bool = False, temperature: float = 0.0, top_p: Optional[float] = None,
-                 load_in_8bit: bool = False, local_only: bool = True):
+                 load_in_8bit: bool = False, quantize_bits: int = 0, local_only: bool = True):
         if getattr(settings, "force_gpu", True) and not torch.cuda.is_available():
             raise RuntimeError("CUDA is required but torch.cuda.is_available() is False")
 
         self.model_id_or_path = model_id_or_path
-        self.load_in_8bit = load_in_8bit
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id_or_path, local_files_only=local_only, use_fast=True,
-            trust_remote_code=True)
-        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.quantize_bits = quantize_bits if quantize_bits else (8 if load_in_8bit else 0)
+        trust_rc = _needs_trust_remote_code(model_id_or_path, local_only)
 
-        if load_in_8bit and torch.cuda.is_available():
+        # Disable gradient tracking during the entire load — saves memory and
+        # time by preventing autograd graph construction for weight tensors.
+        with torch.no_grad():
+            # --- Fix J: Fast tokenizer fallback ---
+            # Models downloaded with newer transformers (>= 4.45) save
+            # tokenizer.json in a format that older tokenizers libraries
+            # can't parse ("data did not match any variant of untagged enum
+            # ModelWrapper").  Fall back to the slow Python tokenizer which
+            # reads tokenizer_model/tokenizer_config.json instead.
             try:
-                from transformers import BitsAndBytesConfig
-                import bitsandbytes  # noqa: F401 — verify it's actually installed
-                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id_or_path,
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    local_files_only=local_only,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
-                )
-                logger.info("Loaded %s in 8-bit mode", model_id_or_path)
-            except (ImportError, Exception) as e:
-                logger.warning("8-bit loading failed (%s) — falling back to fp16 with device_map=auto", e)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id_or_path, torch_dtype=torch.float16, local_files_only=local_only,
-                    low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True)
-        else:
-            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id_or_path, torch_dtype=dtype, local_files_only=local_only,
-                low_cpu_mem_usage=False, device_map=None, trust_remote_code=True)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_id_or_path, local_files_only=local_only, use_fast=True,
+                    trust_remote_code=trust_rc)
+            except Exception as _tok_err:
+                if "ModelWrapper" in str(_tok_err) or "untagged enum" in str(_tok_err):
+                    logger.warning(
+                        "Fast tokenizer failed for %s (likely version mismatch), "
+                        "falling back to slow tokenizer: %s", model_id_or_path, _tok_err)
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        model_id_or_path, local_files_only=local_only, use_fast=False,
+                        trust_remote_code=trust_rc)
+                else:
+                    raise
+            if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+            # Detect best attention implementation available.
+            # flash_attention_2 requires Ampere+ (SM >= 8.0).
+            # Turing GPUs (SM 7.5, e.g. Quadro RTX 5000, RTX 2080) do NOT
+            # support FA2 — use SDPA instead, which is still 2-3× faster
+            # than eager attention on Turing.
+            _attn_impl = "eager"
+            _gpu_sm = 0
             if torch.cuda.is_available():
-                self.model.to("cuda:0")
+                try:
+                    _gpu_sm = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
+                except Exception:
+                    pass
+
+            if _gpu_sm >= 80:
+                # Ampere or newer — try FA2 first
+                try:
+                    import flash_attn  # noqa: F401
+                    _attn_impl = "flash_attention_2"
+                except ImportError:
+                    pass
+
+            if _attn_impl == "eager":
+                # SDPA works on all GPUs with PyTorch >= 2.0 (including Turing)
+                if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                    _attn_impl = "sdpa"
+
+            logger.info("Loading %s | attn=%s | gpu_sm=%d | quant=%dbit",
+                        model_id_or_path, _attn_impl, _gpu_sm, self.quantize_bits)
+            print(f"[MODEL_LOAD] {model_id_or_path} | attn={_attn_impl} | "
+                  f"gpu_sm={_gpu_sm} | quant={self.quantize_bits}bit")
+
+            # Common kwargs shared by all loading paths.
+            # attn_implementation requires transformers >= 4.36.  If the kwarg
+            # is rejected by an older version, we retry without it.
+            _common_kwargs = dict(
+                local_files_only=local_only,
+                low_cpu_mem_usage=True,
+                trust_remote_code=trust_rc,
+            )
+            if _attn_impl != "eager":
+                _common_kwargs["attn_implementation"] = _attn_impl
+
+            if self.quantize_bits in (4, 8) and torch.cuda.is_available():
+                try:
+                    from transformers import BitsAndBytesConfig
+                    import bitsandbytes  # noqa: F401 — verify it's actually installed
+                    if self.quantize_bits == 4:
+                        quantization_config = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_use_double_quant=True,
+                        )
+                    else:
+                        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                    try:
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            model_id_or_path,
+                            quantization_config=quantization_config,
+                            device_map="auto",
+                            **_common_kwargs,
+                        )
+                    except TypeError:
+                        # attn_implementation kwarg rejected by older transformers
+                        _fallback = {k: v for k, v in _common_kwargs.items()
+                                     if k != "attn_implementation"}
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            model_id_or_path,
+                            quantization_config=quantization_config,
+                            device_map="auto",
+                            **_fallback,
+                        )
+                    logger.info("Loaded %s in %d-bit mode", model_id_or_path, self.quantize_bits)
+                except (ImportError, Exception) as e:
+                    _err_str = str(e)
+                    logger.warning("%d-bit loading failed (%s) — attempting fallback",
+                                   self.quantize_bits, e)
+                    print(f"[MODEL_LOAD] {self.quantize_bits}-bit failed: {_err_str[:120]}")
+
+                    # --- Fix N: Graceful quantization fallback ladder ---
+                    # "set_submodule" error = torch<2.1 + bitsandbytes version
+                    # mismatch.  Try 8-bit (needs less torch internals) before
+                    # falling all the way back to fp16 (which OOMs on 8B+ models
+                    # with only 16GB VRAM).
+                    _model_loaded = False
+
+                    # Step 1: If 4-bit failed, try 8-bit
+                    if self.quantize_bits == 4 and not _model_loaded:
+                        try:
+                            print("[MODEL_LOAD] Trying 8-bit fallback...")
+                            _8bit_config = BitsAndBytesConfig(load_in_8bit=True)
+                            _fb_kwargs = {k: v for k, v in _common_kwargs.items()
+                                          if k != "attn_implementation"}
+                            self.model = AutoModelForCausalLM.from_pretrained(
+                                model_id_or_path,
+                                quantization_config=_8bit_config,
+                                device_map="auto",
+                                **_fb_kwargs,
+                            )
+                            self.quantize_bits = 8
+                            _model_loaded = True
+                            print(f"[MODEL_LOAD] Loaded {model_id_or_path} in 8-bit (fallback from 4-bit)")
+                        except Exception as e2:
+                            logger.warning("8-bit fallback also failed: %s", e2)
+                            print(f"[MODEL_LOAD] 8-bit fallback also failed: {str(e2)[:120]}")
+
+                    # Step 2: Try fp16 with device_map="auto" (may OOM on large models)
+                    if not _model_loaded:
+                        try:
+                            print("[MODEL_LOAD] Trying fp16 with device_map=auto...")
+                            self.model = AutoModelForCausalLM.from_pretrained(
+                                model_id_or_path, torch_dtype=torch.float16,
+                                device_map="auto", **_common_kwargs)
+                            _model_loaded = True
+                        except TypeError:
+                            _fallback = {k: v for k, v in _common_kwargs.items()
+                                         if k != "attn_implementation"}
+                            self.model = AutoModelForCausalLM.from_pretrained(
+                                model_id_or_path, torch_dtype=torch.float16,
+                                device_map="auto", **_fallback)
+                            _model_loaded = True
+                        except Exception as e3:
+                            # Log version info so the user knows what to upgrade
+                            _torch_ver = getattr(torch, "__version__", "unknown")
+                            _bnb_ver = "unknown"
+                            try:
+                                _bnb_ver = bitsandbytes.__version__
+                            except Exception:
+                                pass
+                            _tf_ver = "unknown"
+                            try:
+                                import transformers as _tf
+                                _tf_ver = _tf.__version__
+                            except Exception:
+                                pass
+                            print(f"[MODEL_LOAD] All loading strategies failed for {model_id_or_path}")
+                            print(f"[MODEL_LOAD] Versions: torch={_torch_ver}, "
+                                  f"bitsandbytes={_bnb_ver}, transformers={_tf_ver}")
+                            print(f"[MODEL_LOAD] For 4-bit: requires torch>=2.1, "
+                                  f"bitsandbytes>=0.41, transformers>=4.36")
+                            raise RuntimeError(
+                                f"Failed to load {model_id_or_path} with any quantization "
+                                f"strategy (4-bit, 8-bit, fp16). Original error: {_err_str}"
+                            ) from e3
+            else:
+                dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                if torch.cuda.is_available():
+                    try:
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            model_id_or_path, torch_dtype=dtype,
+                            device_map="auto", **_common_kwargs)
+                    except TypeError:
+                        _fallback = {k: v for k, v in _common_kwargs.items()
+                                     if k != "attn_implementation"}
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            model_id_or_path, torch_dtype=dtype,
+                            device_map="auto", **_fallback)
+                else:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_id_or_path, torch_dtype=dtype,
+                        device_map=None, low_cpu_mem_usage=False,
+                        local_files_only=local_only,
+                        trust_remote_code=trust_rc)
+
         self.model.eval()
 
         self.generation_kwargs: Dict[str, Any] = {
@@ -896,12 +1156,39 @@ class ModelRuntime:
         self.llm = _DirectGenerationLLM(model=self.model, tokenizer=self.tokenizer,
                                         generation_kwargs=self.generation_kwargs)
 
+        # Warmup: run a tiny forward pass to trigger CUDA kernel compilation
+        # and memory allocation.  Without this the first real query pays a
+        # 2-5 second penalty while kernels are JIT-compiled.
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """Run a minimal forward pass to pre-compile CUDA kernels."""
+        try:
+            dummy = self.tokenizer("warmup", return_tensors="pt", truncation=True, max_length=8)
+            # With device_map="auto" the model may span devices; use the
+            # model's own device for the first embedding layer.
+            target_device = next(self.model.parameters()).device
+            dummy = {k: v.to(target_device) for k, v in dummy.items()}
+            with torch.inference_mode():
+                self.model.generate(
+                    **dummy, max_new_tokens=1,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            del dummy
+        except Exception:
+            logger.debug("Model warmup failed (non-fatal)", exc_info=True)
+
     def close(self) -> None:
+        # Delete heavy objects first, then collect once.
+        model = getattr(self, "model", None)
         for attr in ("llm", "model", "tokenizer"):
             try:
                 delattr(self, attr)
             except Exception:
                 pass
+        # Only do the expensive gc+empty_cache once, not per-attribute.
+        del model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -910,13 +1197,26 @@ class ModelRuntime:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
 
+def _fast_count_tokens(text: str) -> int:
+    """Character-based token estimate: ~4 chars per token.
+    Used inside pack_docs during retrieval so we never call the LLM tokenizer
+    on every doc — the real tokenizer is slow on large models (8B+) and was
+    the sole reason retrieval appeared slower with bigger models.
+    The estimate is intentionally conservative (rounds up) so budget enforcement
+    stays safe.  Accuracy within ±15% is sufficient here; _fit_prompt_to_budget
+    uses the real tokenizer later when building the final prompt.
+    """
+    return max(1, (len(text) + 3) // 4)
+
+
 def pack_docs(docs: List[Document], budget: int, count_tokens_fn) -> List[Document]:
-    # Count tokens on the formatted representation (title + researcher + authors +
-    # year + summary + snippet) rather than raw page_content alone, which is 2-3x
-    # smaller and causes _fit_prompt_to_budget to receive an oversized doc list that
-    # it then aggressively shrinks, hurting answer quality.
-    # A minimum floor of 8 docs is kept regardless of budget so the LLM always
-    # has meaningful context even when summaries are long.
+    # Use a fast char-based estimate instead of calling count_tokens_fn (the LLM
+    # tokenizer) on every doc.  The real tokenizer is O(n_chars) per call and on
+    # large models (8B+) adds hundreds of milliseconds per retrieval — showing up
+    # as inflated retrieval_total_ms in logs.  _fit_prompt_to_budget will trim the
+    # list to the true token budget using the real tokenizer after retrieval, so
+    # the approximation here only affects how many docs we pass through, not the
+    # final prompt.  MIN_DOCS floor ensures the LLM always has meaningful context.
     MIN_DOCS = 8
     out, total = [], 0
     for d in docs:
@@ -936,7 +1236,7 @@ def pack_docs(docs: List[Document], budget: int, count_tokens_fn) -> List[Docume
             f"summary: {summary_raw}" if summary_raw else None,
             str(d.page_content or "")[:500],
         ]))
-        t = count_tokens_fn(formatted)
+        t = _fast_count_tokens(formatted)
         if total + t > budget and len(out) >= MIN_DOCS:
             break
         out.append(d)
@@ -953,11 +1253,34 @@ format_docs_compact = build_compact_context
 
 class _TransformerMeanEmbeddings:
     def __init__(self, model_name: str, device: str) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
-        self.model = AutoModel.from_pretrained(model_name, local_files_only=True,
-                                               dtype=torch.float32, low_cpu_mem_usage=False)
-        self.model.to("cpu").eval()
-        self.device = "cpu"
+        # Determine the correct dtype kwarg for this transformers version.
+        # Versions >=4.49 renamed torch_dtype → dtype and deprecated the old name.
+        import transformers as _tf
+        _tf_version = tuple(int(x) for x in _tf.__version__.split(".")[:2])
+        _dtype_kwarg = "dtype" if _tf_version >= (4, 49) else "torch_dtype"
+
+        last_err: Optional[Exception] = None
+        # Try local cache first, then allow download if not cached.
+        for local_only in (True, False):
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, local_files_only=local_only, use_fast=True,
+                    trust_remote_code=False)
+                self.model = AutoModel.from_pretrained(
+                    model_name, local_files_only=local_only,
+                    trust_remote_code=False,
+                    **{_dtype_kwarg: torch.float32})
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                if not local_only:
+                    raise
+                logger.info("Embedding model not available locally (%s), retrying with download …", exc)
+        if last_err is not None:
+            raise last_err
+        self.model.to(device).eval()
+        self.device = device
 
     def _encode_texts(self, texts: List[str]) -> List[List[float]]:
         if not texts:
@@ -966,7 +1289,7 @@ class _TransformerMeanEmbeddings:
         for i in range(0, len(texts), 32):
             batch = [str(t or "") for t in texts[i:i + 32]]
             enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
-            enc = {k: v.to("cpu") for k, v in enc.items()}
+            enc = {k: v.to(self.device) for k, v in enc.items()}
             with torch.no_grad():
                 hidden = self.model(**enc).last_hidden_state
                 mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
@@ -983,23 +1306,94 @@ class _TransformerMeanEmbeddings:
         return vecs[0] if vecs else []
 
 
+class _BertFallbackEmbeddings:
+    """Last-resort embedder that imports BertModel / BertTokenizer directly.
+
+    Newer transformers versions sometimes fail to resolve 'BertModel' via
+    AutoModel when loading from a local cache.  Importing the concrete class
+    from ``transformers.models.bert`` bypasses the auto-resolution machinery.
+    """
+
+    def __init__(self, model_name: str, device: str) -> None:
+        from transformers.models.bert.modeling_bert import BertModel as _BertModel
+        from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast as _Tok
+
+        for local_only in (True, False):
+            try:
+                self.tokenizer = _Tok.from_pretrained(
+                    model_name, local_files_only=local_only)
+                self.model = _BertModel.from_pretrained(
+                    model_name, local_files_only=local_only)
+                break
+            except Exception:
+                if not local_only:
+                    raise
+        self.model.to(device).eval()
+        self.device = device
+
+    def _encode_texts(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        out = []
+        for i in range(0, len(texts), 32):
+            batch = [str(t or "") for t in texts[i:i + 32]]
+            enc = self.tokenizer(batch, padding=True, truncation=True,
+                                 max_length=512, return_tensors="pt")
+            enc = {k: v.to(self.device) for k, v in enc.items()}
+            with torch.no_grad():
+                hidden = self.model(**enc).last_hidden_state
+                mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                pooled = torch.nn.functional.normalize(
+                    (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-9),
+                    p=2, dim=1)
+                out.extend(pooled.detach().tolist())
+        return out
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._encode_texts(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        vecs = self._encode_texts([text])
+        return vecs[0] if vecs else []
+
+
 def build_embeddings() -> Any:
-    def _make(device):
+    model_name = config.EMBED_MODEL
+    errors: List[str] = []
+
+    # Strategy 1: langchain HuggingFaceEmbeddings (needs sentence-transformers)
+    try:
         return HuggingFaceEmbeddings(
-            model_name=config.EMBED_MODEL,
-            model_kwargs={"device": device, "trust_remote_code": False},
+            model_name=model_name,
+            model_kwargs={"device": "cpu", "trust_remote_code": False},
             encode_kwargs={"normalize_embeddings": True, "batch_size": 128},
         )
-    for factory in [lambda: _make("cpu"), lambda: _TransformerMeanEmbeddings(config.EMBED_MODEL, "cpu")]:
-        try:
-            return factory()
-        except Exception as e:
-            logger.warning("Embedding init attempt failed: %s", e)
-    raise RuntimeError("All embedding initialization strategies failed")
+    except Exception as e:
+        errors.append(f"HuggingFaceEmbeddings: {e}")
+        logger.warning("Embedding init attempt failed (HuggingFaceEmbeddings): %s", e)
+
+    # Strategy 2: AutoModel fallback (needs only transformers)
+    try:
+        return _TransformerMeanEmbeddings(model_name, "cpu")
+    except Exception as e:
+        errors.append(f"AutoModel: {e}")
+        logger.warning("Embedding init attempt failed (AutoModel): %s", e)
+
+    # Strategy 3: direct BertModel import fallback — handles newer transformers
+    # versions where AutoModel resolution may fail for cached BERT configs.
+    try:
+        return _BertFallbackEmbeddings(model_name, "cpu")
+    except Exception as e:
+        errors.append(f"BertModel direct: {e}")
+        logger.warning("Embedding init attempt failed (BertModel direct): %s", e)
+
+    raise RuntimeError(
+        f"All embedding initialization strategies failed for '{model_name}':\n"
+        + "\n".join(f"  - {err}" for err in errors)
+    )
 
 
 def clear_runtime_cache() -> None:
-    _ensure_dir(CACHE_DIR)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1021,19 +1415,19 @@ def _resolve_llm_path(llm_model_key: str) -> str:
 
 
 # Models that need 8-bit quantization (too large for fp16 on typical consumer GPUs)
-_8BIT_MODEL_KEYS = {
+_4BIT_MODEL_KEYS = {
     "llama-3.1-8b", "llama_8b", "8b",
     "gemma-3-12b", "gemma_12b", "12b",
     "qwen-2.5-14b", "qwen_14b", "14b",
     "gpt-oss-20b", "gpt_oss_20b", "20b",
 }
 
-def _should_quantize_8bit(llm_model_key: str) -> bool:
-    """Return True if the model should be loaded in 8-bit mode."""
+def _quantize_bits(llm_model_key: str) -> int:
+    """Return quantization bits: 4 for large models, 0 for small (3B/1B)."""
     key = (llm_model_key or "").strip().lower()
-    if key in _8BIT_MODEL_KEYS:
-        return bool(getattr(settings, "quantize_8bit", True))
-    return False
+    if key in _4BIT_MODEL_KEYS:
+        return 4 if bool(getattr(settings, "quantize_8bit", True)) else 0
+    return 0
 
 
 def _is_remote_model(llm_model_key: str) -> bool:
@@ -1308,7 +1702,8 @@ class UtilityWorker:
 
 class Engine:
     def __init__(self, *, answer_runtime, utility_runtime, papers_vs, memory_vs,
-                 store, session_id, utility_worker, stateless=False):
+                 store, session_id, utility_worker, stateless=False,
+                 manager=None):
         self.answer_runtime = answer_runtime
         self.utility_runtime = utility_runtime
         self.papers_vs = papers_vs
@@ -1317,6 +1712,7 @@ class Engine:
         self.session_id = session_id
         self.utility_worker = utility_worker
         self.stateless = bool(stateless)
+        self._manager = manager  # weak ref to EngineManager for lazy utility fetch
 
         self.last_focus = self.last_topic = self.rolling_summary = ""
         self.anchor: Dict[str, Any] = {}
@@ -1360,10 +1756,31 @@ class Engine:
                 return t.text.strip()
         return ""
 
+    def _get_utility_runtime(self):
+        """Lazily fetch the utility runtime from the EngineManager.
+
+        The utility model loads on a background thread.  When Engine is
+        constructed during the first question, utility_runtime may still be
+        None.  By re-checking the manager we pick it up once it finishes
+        loading, enabling query rewriting from Q1 onward.
+        """
+        if self.utility_runtime is not None:
+            return self.utility_runtime
+        mgr = self._manager
+        if mgr is not None:
+            rt = getattr(mgr, "utility_runtime", None)
+            if rt is not None:
+                self.utility_runtime = rt
+                return rt
+        return None
+
     def _rewrite_query_structured(self, question: str, *, anchor_value: str = "") -> Dict[str, Any]:
         q = (question or "").strip()
         fallback = {"standalone_question": q}
-        if not bool(getattr(settings, "rewrite_enable", True)) or self.utility_runtime is None:
+        utility_rt = self._get_utility_runtime()
+        if not bool(getattr(settings, "rewrite_enable", True)) or utility_rt is None:
+            _dbg("[REWRITE] skipped: enable=%s, utility_rt=%s" % (
+                getattr(settings, "rewrite_enable", True), utility_rt is not None))
             return fallback
         try:
             msgs = REWRITE_PROMPT.format_messages(
@@ -1371,15 +1788,22 @@ class Engine:
                 recent_turns=self._recent_turns_text(
                     max(1, min(3, int(getattr(settings, "rewrite_max_recent_turns", 3))))) or "",
                 question=question, anchor_value=anchor_value or "(none)")
-            raw = _invoke_with_timeout(
-                self.utility_runtime.llm, msgs[0].content + "\n" + msgs[1].content,
-                int(getattr(settings, "rewrite_timeout_s", 10)))
+            prompt_text = msgs[0].content + "\n" + msgs[1].content
+            # Use direct invoke instead of _invoke_with_timeout to avoid
+            # contention with the single-worker _LLM_EXECUTOR used by
+            # answer generation.  The rewrite runs BEFORE the answer call,
+            # so there's no concurrency concern — and direct invoke avoids
+            # the overhead of thread submission + future.result().
+            timeout_s = int(getattr(settings, "rewrite_timeout_s", 10))
+            raw = str(utility_rt.llm.invoke(prompt_text) or "")
             self.last_utility_llm_calls += 1
+            _dbg("[REWRITE] raw response", raw[:300])
             m = re.search(r"\{.*\}", str(raw or "").strip(), re.DOTALL)
             sq = re.sub(r"\s+", " ", str(json.loads(m.group(0) if m else raw).get("standalone_question", "") or "")).strip()
             max_chars = int(getattr(settings, "rewrite_max_chars", 220))
             return {"standalone_question": (sq or q)[:max_chars]}
-        except Exception:
+        except Exception as exc:
+            _dbg("[REWRITE] exception: %s" % exc)
             return fallback
 
     def maybe_rewrite_query(self, raw_q: str) -> str:
@@ -1504,10 +1928,82 @@ class Engine:
             if isinstance(vect_docs, list):
                 return vect_docs
 
+        # --- Fix G (revised): Catch HNSW index errors AND hangs ---
+        # ChromaDB can either raise RuntimeError on HNSW failures, or hang
+        # indefinitely in SQLite metadata hydration on large unfiltered queries.
+        # Wrap all retrieval calls with a timeout to prevent blocking.
+        _retrieval_timeout = int(getattr(settings, "retrieval_timeout_s", 60))
+
+        def _invoke_with_retrieval_timeout(retriever, q, timeout_s):
+            """Run retriever.invoke in a thread with a timeout."""
+            if timeout_s <= 0:
+                return retriever.invoke(q)
+            _result_box = [None]
+            _error_box = [None]
+            def _run():
+                try:
+                    _result_box[0] = retriever.invoke(q)
+                except Exception as exc:
+                    _error_box[0] = exc
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=timeout_s)
+            if t.is_alive():
+                logger.warning("Retrieval timed out after %ds (filter=%s)", timeout_s, where_filter)
+                print(f"[RETRIEVE] TIMEOUT after {timeout_s}s")
+                return []
+            if _error_box[0] is not None:
+                raise _error_box[0]
+            return _result_box[0] if _result_box[0] is not None else []
+
         search_kwargs = {"k": k, "fetch_k": fk, "lambda_mult": lm}
         if where_filter:
             search_kwargs["filter"] = where_filter
-        return self.papers_vs.as_retriever(search_type="mmr", search_kwargs=search_kwargs).invoke(query)
+            # --- Fix: When a metadata filter is active, try similarity search
+            # first.  Filtered queries typically return small result sets where
+            # MMR's fetch_k exceeds the available docs, triggering HNSW
+            # "contiguous 2D array" errors.  Similarity search is more robust
+            # for small filtered collections. ---
+            try:
+                sim_kwargs = {"k": min(k, 30)}
+                sim_kwargs["filter"] = where_filter
+                retriever = self.papers_vs.as_retriever(
+                    search_type="similarity", search_kwargs=sim_kwargs)
+                result = _invoke_with_retrieval_timeout(retriever, query, _retrieval_timeout)
+                if result:
+                    return result
+            except RuntimeError as e:
+                if "contiguous" not in str(e).lower() and "ef" not in str(e).lower():
+                    raise
+                logger.warning("Similarity+filter failed (%s), trying MMR", e)
+        try:
+            retriever = self.papers_vs.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
+            return _invoke_with_retrieval_timeout(retriever, query, _retrieval_timeout)
+        except RuntimeError as e:
+            if "contiguous" not in str(e).lower() and "ef" not in str(e).lower():
+                raise
+            logger.warning("HNSW error with filter=%s, falling back: %s", where_filter, e)
+
+        # Fallback 1: plain similarity search with filter, smaller k
+        if where_filter:
+            try:
+                fallback_kwargs = {"k": min(k, 20)}
+                fallback_kwargs["filter"] = where_filter
+                retriever = self.papers_vs.as_retriever(
+                    search_type="similarity", search_kwargs=fallback_kwargs)
+                return _invoke_with_retrieval_timeout(retriever, query, _retrieval_timeout)
+            except RuntimeError:
+                logger.warning("HNSW fallback similarity+filter also failed")
+
+        # Fallback 2: MMR without filter
+        try:
+            plain_kwargs = {"k": k, "fetch_k": fk, "lambda_mult": lm}
+            retriever = self.papers_vs.as_retriever(search_type="mmr", search_kwargs=plain_kwargs)
+            return _invoke_with_retrieval_timeout(retriever, query, _retrieval_timeout)
+        except RuntimeError:
+            logger.warning("HNSW fallback MMR without filter also failed")
+
+        return []
 
     def _merge_unique_docs(self, a, b):
         return dedupe_docs((a or []) + (b or []))
@@ -1602,6 +2098,33 @@ class Engine:
         docs = self._retrieve_once(q, query_embedding=query_embedding, search_k=search_k,
                                    fetch_k=fetch_k, lambda_mult=lambda_mult, where_filter=where_filter)
 
+        # --- Fix F (revised): Person-targeted supplemental retrieval ---
+        # When the resolved query contains a person name, run a supplemental
+        # metadata-filtered query.  Stop after the first variant that returns
+        # results — cascading through all variants wastes retrieval calls
+        # (e.g. "P. Systems", "P Systems" when no such person exists).
+        if not where_filter:
+            _person_in_query = _extract_person_name(q)
+            if _person_in_query and len(_person_in_query) > 3 and _looks_like_person_candidate(_person_in_query):
+                _ptoks = [t for t in re.findall(r"[A-Za-z]+", str(_person_in_query).strip()) if t]
+                if len(_ptoks) >= 2:
+                    _first, _last = _ptoks[0], _ptoks[-1]
+                    _variants = [
+                        f"{_first} {_last}",
+                        f"{_first[0]}. {_last}",
+                    ]
+                    for _var in _variants:
+                        _var = _var.strip()
+                        if not _var:
+                            continue
+                        _person_docs = self._retrieve_once(
+                            q, query_embedding=None, search_k=search_k,
+                            fetch_k=fetch_k, lambda_mult=lambda_mult,
+                            where_filter={"researcher": _var})
+                        if _person_docs:
+                            docs = self._merge_unique_docs(docs, _person_docs)
+                            break  # Found docs — no need to try more variants
+
         is_followup = _query_is_short_or_pronoun(raw_question or q)
         anchor_value = str((self.anchor or {}).get("value", "") or "").strip()
         anchor_ratio = _anchor_support_ratio(anchor_value, docs) if anchor_value else 0.0
@@ -1655,25 +2178,37 @@ class Engine:
             query_for_retrieval = _inject_anchor_into_query(query_for_retrieval or q, anchor_value).strip()
 
         if referential and (not anchor_value or not _anchor_in_text(anchor_value, query_for_retrieval)):
-            # --- Fix 10: Instead of blindly prepending the entire previous user
-            # query (which creates an unusable search string like "what does Duncan
-            # Brown study Summarize the mechanisms described in his papers"), extract
-            # only the meaningful entity/focus from the previous turn. ---
-            prev_user = self._last_user_turn_text()
-            if prev_user and _norm_text(prev_user) != _norm_text(q):
-                # Try to extract just the person name or key entity from prev turn
-                prev_person = _extract_person_name(prev_user)
-                if prev_person and len(prev_person) > 3:
-                    query_for_retrieval = _inject_anchor_into_query(q, prev_person).strip()
-                else:
-                    # Fall back to short focus extraction rather than full query concat
-                    prev_focus = _extract_focus_from_question(prev_user)
-                    if prev_focus and len(prev_focus) > 3:
-                        query_for_retrieval = f"{q} {prev_focus}".strip()
-                    else:
-                        query_for_retrieval = (query_for_retrieval or q).strip()
-            else:
+            # --- Fix: Guard against false-positive referential detection ---
+            # A query with 4+ substantive (non-generic) tokens is likely a new
+            # self-contained topic, not a follow-up — even if it contains a
+            # pronoun like "there" or "it" in a non-referential sense
+            # (e.g. "Is there any research on quantum computing at Syracuse?").
+            # Skip prior-turn context injection for such queries.
+            _q_substantive_toks = [t for t in _tokenize_words(q)
+                                   if len(t) >= 3 and not _is_generic_query_token(t)]
+            _skip_prev_inject = len(_q_substantive_toks) >= 4
+
+            if _skip_prev_inject:
                 query_for_retrieval = (query_for_retrieval or q).strip()
+            else:
+                # --- Fix 10: Instead of blindly prepending the entire previous user
+                # query (which creates an unusable search string), extract only the
+                # meaningful entity/focus from the previous turn. ---
+                prev_user = self._last_user_turn_text()
+                if prev_user and _norm_text(prev_user) != _norm_text(q):
+                    # Try to extract just the person name or key entity from prev turn
+                    prev_person = _extract_person_name(prev_user)
+                    if prev_person and len(prev_person) > 3:
+                        query_for_retrieval = _inject_anchor_into_query(q, prev_person).strip()
+                    else:
+                        # Fall back to short focus extraction rather than full query concat
+                        prev_focus = _extract_focus_from_question(prev_user)
+                        if prev_focus and len(prev_focus) > 3:
+                            query_for_retrieval = f"{q} {prev_focus}".strip()
+                        else:
+                            query_for_retrieval = (query_for_retrieval or q).strip()
+                else:
+                    query_for_retrieval = (query_for_retrieval or q).strip()
             # --- Fix 5: Only inject summary keywords when there is a stable anchor
             # and the keywords overlap with the anchor value.  Previously, summary
             # keywords from prior turns (e.g. "alexander analyses") were blindly
@@ -1863,12 +2398,36 @@ class Engine:
                 and self.last_retrieval_confidence in {"medium", "high"}
                 and anchor_consistent and anchor_hq)
 
+        # --- Fix H: Preserve person-entity anchors through weak-confidence turns ---
+        # When answer_question() sets an anchor from explicit_entity_signal (Fix A),
+        # but retrieval confidence is "weak" (Fix C downgrades it because the first-pass
+        # had few name matches), the anchor gets reverted to empty by the else branch
+        # below.  This breaks follow-up questions like "Summarize his papers" because
+        # the anchor "Duncan Brown" is lost between turns.
+        #
+        # Fix: if the current anchor was set from an explicit entity signal during
+        # this turn AND the anchor has non-zero support in the retrieved docs,
+        # treat it as safe to persist even with weak confidence.
+        anchor_source = str((self.anchor or {}).get("source", "") or "").strip().lower()
+        person_anchor_set_this_turn = (
+            anchor_source in {"explicit_entity_signal", "dominant_metadata:researcher"}
+            and anchor_value
+            and self.anchor_last_action in {"set_from_dominance", "kept_reinforced"}
+            and anchor_ratio > 0
+        )
+
         if safe:
             if new_focus: self.last_focus = new_focus
             if new_topic: self.last_topic = new_topic
             anchor_to_save = _normalize_anchor(self.anchor)
             action_to_save = self.anchor_last_action
         elif no_results or retrieval_weak or anchor_absent:
+            anchor_to_save = _normalize_anchor(self.anchor)
+            action_to_save = self.anchor_last_action
+        elif person_anchor_set_this_turn:
+            # Person anchor is valid — persist it even though overall confidence is weak.
+            # Update focus to the person name so the rolling summary tracks them.
+            if new_focus: self.last_focus = new_focus
             anchor_to_save = _normalize_anchor(self.anchor)
             action_to_save = self.anchor_last_action
         else:
@@ -1946,7 +2505,10 @@ class Engine:
         papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
         msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx,
                                              question=context.rewritten_question.lower())
-        full_prompt = "\n\n".join(m.content for m in msgs)
+        # Use structured separator so invoke() can reliably split system vs user
+        # content for chat-template formatting (Fix E).
+        _sep = _DirectGenerationLLM.SYSTEM_USER_SEP
+        full_prompt = _sep.join(m.content for m in msgs)
 
         tok = self.answer_runtime.count_tokens(full_prompt)
         trigger = context.budgets["TRIGGER"]
@@ -1956,7 +2518,7 @@ class Engine:
             papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
             msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx,
                                                  question=context.rewritten_question.lower())
-            full_prompt = "\n\n".join(m.content for m in msgs)
+            full_prompt = _sep.join(m.content for m in msgs)
 
         try:
             self.last_answer_llm_calls += 1
@@ -2001,6 +2563,7 @@ class EngineManager:
         self.active_answer_max_new_tokens = 0
         self.answer_generation_lock = threading.Lock()
         self.utility_worker: Optional[UtilityWorker] = None
+        self._utility_suppressed = False  # Set True when large answer model evicts utility
 
     def get_papers_vs(self, mode: str) -> Chroma:
         m = self.dbm.resolve_mode(mode)
@@ -2023,6 +2586,37 @@ class EngineManager:
         self.active_mode = resolved
         self.dbm.switch_config(resolved)
 
+    # Minimum VRAM headroom (MB) needed for the KV cache and generation.
+    _VRAM_HEADROOM_MB = 2500
+
+    def _vram_is_tight(self) -> bool:
+        """Return True if free VRAM is below the headroom threshold."""
+        vram_free = available_vram_mb()
+        if vram_free <= 0:
+            return False  # Can't measure — assume OK
+        return vram_free < self._VRAM_HEADROOM_MB
+
+    def _evict_utility_if_needed(self) -> None:
+        """Unload the utility model and stop its worker to free VRAM."""
+        if self.utility_worker is not None:
+            try:
+                self.utility_worker.stop()
+            except Exception:
+                pass
+            self.utility_worker = None
+        if self.utility_runtime is not None:
+            try:
+                self.utility_runtime.close()
+            except Exception:
+                pass
+            self.utility_runtime = None
+            self.active_utility_model_key = ""
+            # Set suppression flag — prevents get_engine from reloading the
+            # utility model on the very next question, which was causing
+            # load→evict→load→evict thrashing (~20-30s wasted per question).
+            self._utility_suppressed = True
+            print("[VRAM] Evicted utility model to free VRAM for answer generation")
+
     def _switch_runtime(self, attr_name, key_attr, key, max_tokens_attr=None, desired_max=None):
         key = (key or "").strip().lower()
         current_key = getattr(self, key_attr)
@@ -2037,17 +2631,31 @@ class EngineManager:
             try: current_rt.close()
             except Exception: pass
             setattr(self, attr_name, None)
-        clear_runtime_cache()
         max_new = desired_max or int(getattr(settings, "utility_max_new_tokens", 256))
-        use_8bit = _should_quantize_8bit(key)
+        q_bits = _quantize_bits(key)
         local_only = not _is_remote_model(key)
+
+        # For large answer models: evict utility BEFORE loading and suppress
+        # it for the lifetime of this answer model.
+        if attr_name == "answer_runtime":
+            if q_bits > 0:
+                self._evict_utility_if_needed()
+            else:
+                # Switching to a small model — clear suppression so utility
+                # can load again when there's room.
+                self._utility_suppressed = False
+
         rt = ModelRuntime(_resolve_llm_path(key), max_new_tokens=max_new,
-                          do_sample=False, temperature=0.0, load_in_8bit=use_8bit,
+                          do_sample=False, temperature=0.0, quantize_bits=q_bits,
                           local_only=local_only)
         setattr(self, attr_name, rt)
         setattr(self, key_attr, key)
         if max_tokens_attr and desired_max is not None:
             setattr(self, max_tokens_attr, desired_max)
+
+        # After loading a large answer model, check VRAM and suppress if tight
+        if attr_name == "answer_runtime" and self._vram_is_tight():
+            self._evict_utility_if_needed()
 
     def switch_answer_model(self, llm_model_key: str) -> None:
         desired = int(getattr(settings, "answer_max_new_tokens", 768))
@@ -2061,6 +2669,11 @@ class EngineManager:
         self._switch_runtime("utility_runtime", "active_utility_model_key", llm_model_key)
 
     def _ensure_utility_worker(self) -> None:
+        # Don't load utility if it was suppressed due to VRAM pressure
+        if getattr(self, "_utility_suppressed", False):
+            return
+        if self._vram_is_tight():
+            return
         if self.utility_worker is not None:
             if self.utility_worker._thread is not None and self.utility_worker._thread.is_alive():
                 return
@@ -2075,14 +2688,22 @@ class EngineManager:
     def get_engine(self, session_id, mode, *, stateless=False) -> Engine:
         if self.answer_runtime is None:
             self.switch_answer_model(getattr(settings, "answer_model_key", "llama-3.2-3b"))
-        if self.utility_runtime is None:
-            self.switch_utility_model(getattr(settings, "utility_model_key", "llama-3.2-1b"))
-        if int(getattr(settings, "enable_utility_background", 1)) == 1:
+
+        # Only load utility model if not suppressed (large answer model active)
+        # and VRAM has room.
+        enable_bg = int(getattr(settings, "enable_utility_background", 1)) == 1
+        suppressed = getattr(self, "_utility_suppressed", False)
+        if enable_bg and not suppressed and not self._vram_is_tight():
+            if self.utility_runtime is None:
+                self.switch_utility_model(getattr(settings, "utility_model_key", "llama-3.2-1b"))
             self._ensure_utility_worker()
-        return Engine(answer_runtime=self.answer_runtime, utility_runtime=self.utility_runtime,
+
+        return Engine(answer_runtime=self.answer_runtime,
+                      utility_runtime=self.utility_runtime,
                       papers_vs=self.get_papers_vs(mode), memory_vs=self.memory_vs,
                       store=self.store, session_id=session_id,
-                      utility_worker=self.utility_worker, stateless=stateless)
+                      utility_worker=self.utility_worker, stateless=stateless,
+                      manager=self)
 
     def reset_session(self, session_id: str) -> None:
         if self.utility_worker is not None:

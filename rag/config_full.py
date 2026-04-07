@@ -45,7 +45,7 @@ CHROMA_MAX_BATCH = int(_env("CHROMA_MAX_BATCH", "5400"))
 
 NEO4J_URI = _env("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = _env("NEO4J_USER", "neo4j")
-NEO4J_PASS = _env("NEO4J_PASS", "OSPOlol@1234")
+NEO4J_PASS = _env("NEO4J_PASS", "")
 NEO4J_DB = _env("NEO4J_DB", "syr-rag-one")
 
 # ── OpenAlex dataset ──────────────────────────────────────────────────────────
