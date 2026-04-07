@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#rag_chat.py
 """
 RAG Live Chat
 =============
@@ -8,10 +8,10 @@ Every question/answer is saved incrementally to a timestamped JSON log
 using the same field structure as benchmark_rag.py.
 
 Usage:
-    python rag_chat.py                              # interactive picker
+    python rag_chat.py
     python rag_chat.py --model llama-3.2-3b --db full
     python rag_chat.py --model gemma-3-12b --db openalex
-    python rag_chat.py --list                       # show available models & databases
+    python rag_chat.py --list
 
 Commands inside the chat:
     /model <key>       — switch to a different model
@@ -28,7 +28,7 @@ Commands inside the chat:
 Examples:
     python rag_chat.py -m llama-3.1-8b -d openalex
     python rag_chat.py --model qwen-2.5-14b --db abstracts
-    python rag_chat.py -o ./logs                   # save JSON to ./logs/
+    python rag_chat.py -o ./logs
 """
 
 import argparse
@@ -39,13 +39,14 @@ import sys
 import time
 import traceback
 import uuid
-import readline  # noqa: F401 — enables arrow-key history in input()
+try:
+    import readline  # noqa: F401 — enables arrow-key history on Linux/macOS
+except ImportError:
+    pass  # readline unavailable on Windows; line editing disabled
+
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-# ---------------------------------------------------------------------------
-# Ensure the RAG project is importable
-# ---------------------------------------------------------------------------
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
@@ -54,10 +55,6 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("RAG_DEBUG", "0")
 os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
 os.environ.setdefault("RAG_LLM_TIMEOUT_S", "300")
-
-# ---------------------------------------------------------------------------
-# Configuration — mirrors benchmark_rag.py
-# ---------------------------------------------------------------------------
 
 MODELS: Dict[str, str] = {
     "llama-3.2-3b":   "LLaMA 3.2 3B",
@@ -72,10 +69,6 @@ DATABASES: Dict[str, str] = {
     "openalex":  "OpenAlex DB",
     "abstracts": "Abstracts Only",
 }
-
-# ---------------------------------------------------------------------------
-# ANSI Colors
-# ---------------------------------------------------------------------------
 
 class C:
     RESET   = "\033[0m"
@@ -94,10 +87,6 @@ class C:
 
 def styled(text: str, *styles: str) -> str:
     return "".join(styles) + text + C.RESET
-
-# ---------------------------------------------------------------------------
-# Helpers (match benchmark_rag.py)
-# ---------------------------------------------------------------------------
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
@@ -127,10 +116,6 @@ def _gpu_info() -> Dict[str, Any]:
         pass
     return info
 
-# ---------------------------------------------------------------------------
-# Banner — SYR-RAG
-# ---------------------------------------------------------------------------
-
 BANNER = (
     f"\n{C.CYAN}{C.BOLD}"
     "\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n"
@@ -144,10 +129,6 @@ BANNER = (
     "\u2502                                                               \u2502\n"
     f"\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f{C.RESET}\n"
 )
-
-# ---------------------------------------------------------------------------
-# Session Logger — writes benchmark-compatible JSON after every interaction
-# ---------------------------------------------------------------------------
 
 class SessionLogger:
     """Incrementally saves a JSON log matching the benchmark_rag.py schema."""
@@ -269,11 +250,6 @@ class SessionLogger:
         except Exception as e:
             print(styled(f"  [WARN] Failed to save session log: {e}", C.RED))
 
-
-# ---------------------------------------------------------------------------
-# Engine wrapper
-# ---------------------------------------------------------------------------
-
 class RAGChat:
     """Manages the RAG pipeline session."""
 
@@ -282,8 +258,6 @@ class RAGChat:
         self.settings = None
         self.answer_fn = None
         self.hard_reset_memory = None
-        self.clear_qa_cache = None
-        self.clear_rag_cache = None
 
         self.logger: SessionLogger = logger
         self.current_model: Optional[str] = None
@@ -301,15 +275,12 @@ class RAGChat:
         from rag_pipeline import answer_question
         from rag_engine import get_global_manager
         from runtime_settings import settings
-        from conversation_memory import hard_reset_memory, clear_qa_cache
-        from cache_manager import clear_cache as clear_rag_cache
+        from conversation_memory import hard_reset_memory
 
         self.mgr = get_global_manager()
         self.settings = settings
         self.answer_fn = answer_question
         self.hard_reset_memory = hard_reset_memory
-        self.clear_qa_cache = clear_qa_cache
-        self.clear_rag_cache = clear_rag_cache
         print(styled("  Pipeline loaded.", C.GREEN))
 
     def switch_model(self, model_key: str) -> float:
@@ -382,10 +353,6 @@ class RAGChat:
     def reset_session(self):
         try: self.hard_reset_memory(self.user_key)
         except Exception: pass
-        try: self.clear_qa_cache(self.user_key)
-        except Exception: pass
-        try: self.clear_rag_cache()
-        except Exception: pass
         self.user_key = f"chat_{uuid.uuid4().hex[:8]}"
         self.history.clear()
         self.question_count = 0
@@ -444,11 +411,6 @@ class RAGChat:
             "llm_calls": record["llm_calls"],
         }
 
-
-# ---------------------------------------------------------------------------
-# Interactive picker
-# ---------------------------------------------------------------------------
-
 def pick_option(title: str, options: Dict[str, str], prompt_text: str = "Enter choice") -> str:
     keys = list(options.keys())
     print(f"\n{styled(title, C.BOLD, C.CYAN)}")
@@ -472,11 +434,6 @@ def pick_option(title: str, options: Dict[str, str], prompt_text: str = "Enter c
         except ValueError:
             pass
         print(styled(f"  Invalid choice. Enter 1-{len(keys)} or a key name.", C.RED))
-
-
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
 
 def handle_command(cmd: str, args_str: str, chat: RAGChat) -> bool:
     """Handle a /command. Returns True if the chat loop should continue."""
@@ -593,11 +550,6 @@ def handle_command(cmd: str, args_str: str, chat: RAGChat) -> bool:
 
     return True
 
-
-# ---------------------------------------------------------------------------
-# Print answer
-# ---------------------------------------------------------------------------
-
 def print_answer(result: Dict[str, Any], verbose: bool = False):
     answer = result["answer"]
     error = result.get("error", "")
@@ -608,12 +560,10 @@ def print_answer(result: Dict[str, Any], verbose: bool = False):
         if not answer:
             return
 
-    # Answer
     print(f"\n{styled('Answer', C.BOLD, C.GREEN)}")
     print(styled("\u2500" * 60, C.DIM))
     print(answer)
 
-    # Sources
     if sources:
         print(f"\n{styled(f'Sources ({len(sources)})', C.BOLD, C.BLUE)}")
         print(styled("\u2500" * 60, C.DIM))
@@ -634,7 +584,6 @@ def print_answer(result: Dict[str, Any], verbose: bool = False):
             else:
                 print(f"  {styled(str(i) + '.', C.CYAN)} {src}")
 
-    # Verbose details
     if verbose:
         t = result.get("timing", {})
         r = result.get("retrieval", {})
@@ -656,7 +605,6 @@ def print_answer(result: Dict[str, Any], verbose: bool = False):
         if q.get("anchor_action"):
             print(f"  Anchor:       {q['anchor_action']}")
 
-    # Brief timing line when not verbose
     if not verbose:
         wall = result.get("wall_time_s", 0)
         conf = result.get("retrieval", {}).get("confidence", "")
@@ -673,11 +621,6 @@ def print_answer(result: Dict[str, Any], verbose: bool = False):
 
     print()
 
-
-# ---------------------------------------------------------------------------
-# Prompt
-# ---------------------------------------------------------------------------
-
 def get_prompt(chat: RAGChat) -> str:
     model_short = chat.current_model or "?"
     db_short = chat.current_db or "?"
@@ -685,22 +628,17 @@ def get_prompt(chat: RAGChat) -> str:
     arrow = styled("\u203a", C.BOLD, C.WHITE)
     return f"{styled(f'[{model_short}', C.CYAN)}{cross}{styled(f'{db_short}]', C.CYAN)} {arrow} "
 
-
-# ---------------------------------------------------------------------------
-# Main chat loop
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
         description="SYR-RAG Live Chat \u2014 interactive terminal interface",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                   # interactive picker
-  %(prog)s --model llama-3.2-3b --db full    # specify at launch
-  %(prog)s -m gemma-3-12b -d openalex        # short flags
-  %(prog)s --list                            # show available options
-  %(prog)s -o ./logs                         # save JSON log to ./logs/
+  %(prog)s
+  %(prog)s --model llama-3.2-3b --db full
+  %(prog)s -m gemma-3-12b -d openalex
+  %(prog)s --list
+  %(prog)s -o ./logs
         """,
     )
     parser.add_argument("-m", "--model", default=None,
@@ -717,7 +655,6 @@ Examples:
                         help="Start in stateless mode (no conversation memory)")
     args = parser.parse_args()
 
-    # --list
     if args.list:
         print(f"\n{styled('Available Models:', C.BOLD, C.CYAN)}")
         for key, label in MODELS.items():
@@ -728,10 +665,8 @@ Examples:
         print()
         return
 
-    # Banner
     print(BANNER)
 
-    # Validate CLI args
     if args.model and args.model not in MODELS:
         print(styled(f"Unknown model '{args.model}'. Available: {', '.join(MODELS.keys())}", C.RED))
         sys.exit(1)
@@ -739,15 +674,12 @@ Examples:
         print(styled(f"Unknown database '{args.db}'. Available: {', '.join(DATABASES.keys())}", C.RED))
         sys.exit(1)
 
-    # Pick model & database
     model_key = args.model or pick_option("Select Model", MODELS, "Model")
     db_key = args.db or pick_option("Select Database", DATABASES, "Database")
 
-    # Initialize logger
     logger = SessionLogger(output_dir=args.output_dir)
     print(f"\n  {styled('Session log:', C.DIM)} {styled(logger.json_path, C.BLUE)}")
 
-    # Initialize chat
     chat = RAGChat(logger=logger)
     chat.verbose = args.verbose
     chat.stateless = args.stateless
@@ -764,7 +696,6 @@ Examples:
     print(f"\n{styled('Ready! Type your question, or /help for commands.', C.BOLD, C.GREEN)}")
     print(styled("\u2500" * 60, C.DIM))
 
-    # Chat loop
     while True:
         try:
             user_input = input(get_prompt(chat)).strip()
@@ -776,7 +707,6 @@ Examples:
         if not user_input:
             continue
 
-        # Handle commands
         if user_input.startswith("/"):
             parts = user_input[1:].split(None, 1)
             cmd = parts[0].lower()
@@ -787,7 +717,6 @@ Examples:
                 break
             continue
 
-        # Ask the question
         try:
             result = chat.ask(user_input)
             print_answer(result, verbose=chat.verbose)
@@ -797,7 +726,6 @@ Examples:
             print(styled(f"\n  Error: {e}", C.RED))
             traceback.print_exc()
 
-    # Final session summary
     total = logger.total_questions
     errs = logger.total_errors
     elapsed = time.perf_counter() - logger.t0
@@ -809,7 +737,6 @@ Examples:
     print(f"  Runs:       {len(logger.runs)}")
     print(f"  Log saved:  {styled(logger.json_path, C.BLUE)}")
     print()
-
 
 if __name__ == "__main__":
     main()

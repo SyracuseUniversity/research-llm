@@ -1,13 +1,10 @@
+#rag_utils.py
 import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
  
 from runtime_settings import settings
- 
-# ---------------------------------------------------------------------------
-# Text normalisation
-# ---------------------------------------------------------------------------
  
 def norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", str(s or "").strip().lower())
@@ -26,10 +23,6 @@ def normalize_title_case(s: str) -> str:
 def collapse_whitespace(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
  
-# ---------------------------------------------------------------------------
-# Tokenisation
-# ---------------------------------------------------------------------------
- 
 def tokenize_words(s: str) -> List[str]:
     return re.findall(r"[a-z0-9]+(?:['\-\.][a-z0-9]+)?", norm_text(s))
  
@@ -37,10 +30,6 @@ def token_in_hay(token: str, hay: str) -> bool:
     if not token or not hay:
         return False
     return re.search(rf"\b{re.escape(token)}\b", hay) is not None
- 
-# ---------------------------------------------------------------------------
-# Stopwords / generic-token filtering
-# ---------------------------------------------------------------------------
  
 _NLTK_BOOTSTRAP_ATTEMPTED = False
 _NLTK_STOPWORDS_CACHE: Optional[Set[str]] = None
@@ -65,9 +54,7 @@ def bootstrap_nltk_data() -> None:
     except Exception:
         pass
  
- 
 _WORDNET_AVAILABLE: Optional[bool] = None
- 
  
 def _wordnet_is_common_word(token: str) -> bool:
     """Return True if *token* has WordNet synsets as a noun, verb, adjective,
@@ -78,8 +65,9 @@ def _wordnet_is_common_word(token: str) -> bool:
     Some names like 'brown', 'grant', 'mark' DO appear in WordNet (as
     adjectives/verbs), but those also appear in the NLTK names corpus, so the
     caller can combine both signals.
- 
-    Results are cached per-token for the lifetime of the process.
+
+    WordNet availability is cached for the lifetime of the process via
+    `_WORDNET_AVAILABLE`; synsets for individual tokens are looked up on each call.
     """
     global _WORDNET_AVAILABLE
     if _WORDNET_AVAILABLE is False:
@@ -159,6 +147,8 @@ _GENERIC_QUERY_TERMS_CACHE: Optional[Set[str]] = None
 _FOLLOWUP_PHRASES_CACHE: Optional[List[str]] = None
 _FOLLOWUP_PRONOUN_PATTERN_CACHE: Optional[re.Pattern] = None
 _FOLLOWUP_PRONOUN_PATTERN_READY: bool = False
+_PERSON_PRONOUN_PATTERN_CACHE: Optional[re.Pattern] = None
+_PERSON_PRONOUN_PATTERN_READY: bool = False
  
 def _split_config_terms(raw: str) -> List[str]:
     return [s for item in re.split(r"[,;\n|]+", raw or "") if (s := item.strip().lower())]
@@ -190,6 +180,26 @@ def get_followup_pronoun_pattern() -> Optional[re.Pattern]:
             _FOLLOWUP_PRONOUN_PATTERN_CACHE = None
     return _FOLLOWUP_PRONOUN_PATTERN_CACHE
  
+def get_person_pronoun_pattern() -> Optional[re.Pattern]:
+    """Compiled pattern for person pronouns (he/she/him/her/they/them/…).
+
+    Used by the topic-pivot and dangling-pronoun fixes to distinguish
+    person references from impersonal topic references (it/this/that).
+    Reads from ``settings.person_pronoun_regex`` so the set of pronouns
+    is fully configurable at runtime via environment variables.
+    """
+    global _PERSON_PRONOUN_PATTERN_READY, _PERSON_PRONOUN_PATTERN_CACHE
+    if _PERSON_PRONOUN_PATTERN_READY:
+        return _PERSON_PRONOUN_PATTERN_CACHE
+    _PERSON_PRONOUN_PATTERN_READY = True
+    raw = str(getattr(settings, "person_pronoun_regex", "") or "").strip()
+    if raw:
+        try:
+            _PERSON_PRONOUN_PATTERN_CACHE = re.compile(raw, re.IGNORECASE)
+        except re.error:
+            _PERSON_PRONOUN_PATTERN_CACHE = None
+    return _PERSON_PRONOUN_PATTERN_CACHE
+ 
 def is_generic_query_token(token: str) -> bool:
     t = (token or "").strip().lower()
     if not t or len(t) < max(1, int(getattr(settings, "generic_token_min_len", 3))):
@@ -212,6 +222,7 @@ def is_followup_coref_question(question: str) -> bool:
 def bust_caches(changed_field: str) -> None:
     global _GENERIC_QUERY_TERMS_CACHE, _FOLLOWUP_PHRASES_CACHE
     global _FOLLOWUP_PRONOUN_PATTERN_CACHE, _FOLLOWUP_PRONOUN_PATTERN_READY
+    global _PERSON_PRONOUN_PATTERN_CACHE, _PERSON_PRONOUN_PATTERN_READY
     if changed_field in {"generic_query_terms", "generic_token_min_len"}:
         _GENERIC_QUERY_TERMS_CACHE = None
     if changed_field == "followup_phrases":
@@ -219,10 +230,9 @@ def bust_caches(changed_field: str) -> None:
     if changed_field == "followup_pronoun_regex":
         _FOLLOWUP_PRONOUN_PATTERN_CACHE = None
         _FOLLOWUP_PRONOUN_PATTERN_READY = False
- 
-# ---------------------------------------------------------------------------
-# Corpus noise stripping
-# ---------------------------------------------------------------------------
+    if changed_field == "person_pronoun_regex":
+        _PERSON_PRONOUN_PATTERN_CACHE = None
+        _PERSON_PRONOUN_PATTERN_READY = False
  
 _CORPUS_NOISE_TERMS = re.compile(
     r"\b(syracuse|university|faculty|professor|researcher|department|"
@@ -234,10 +244,6 @@ def strip_corpus_noise_terms(query: str) -> str:
     cleaned = re.sub(r"\s+", " ", _CORPUS_NOISE_TERMS.sub(" ", query)).strip()
     tokens = [t for t in tokenize_words(cleaned) if not is_generic_query_token(t)]
     return cleaned if tokens else (query or "").strip()
- 
-# ---------------------------------------------------------------------------
-# Document helpers
-# ---------------------------------------------------------------------------
  
 def dedupe_docs(docs: List[Any]) -> List[Any]:
     seen: set = set()
@@ -313,12 +319,10 @@ def _extract_summary_from_page_content(page_content: str) -> str:
     if not m:
         return ""
     after = text[m.end():]
-    # Stop at next section header (e.g. "Fulltext (full_text):")
     stop = re.search(r"(?im)^[A-Za-z][A-Za-z _]*(?:\([^)]*\))?\s*:", after)
     if stop:
         after = after[:stop.start()]
     return collapse_whitespace(clean_html(after.strip()))
- 
  
 def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
                           text_limit: Optional[int] = None) -> str:
@@ -327,13 +331,9 @@ def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
     if text_limit is None:
         text_limit = int(getattr(settings, "prompt_doc_text_limit", 800))
  
-    # Sort docs by researcher name so the LLM sees coherent clusters per person.
-    # This prevents the "Unknown researcher 1/2/3" hallucination pattern that
-    # occurs when docs from different researchers are interleaved.
     def _researcher_sort_key(d):
         meta = getattr(d, "metadata", None) or {}
         r = collapse_whitespace(str(meta.get("researcher", "") or "")).lower()
-        # Put docs with known researchers first, unknowns at end
         if not r or r in ("unknown", "n/a", "none", ""):
             return (1, "", str(meta.get("paper_id", "")))
         return (0, r, str(meta.get("paper_id", "")))
@@ -348,19 +348,16 @@ def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
         page_content = getattr(d, "page_content", "") or ""
         researcher = collapse_whitespace(str(meta.get("researcher", "") or ""))
  
-        # Try abstract_text from metadata first, fall back to regex extraction
         _PH = {"n/a", "na", "unknown", "none", "null", "not available", "not provided", "untitled"}
         _ma = str(meta.get("abstract_text", "") or "").strip()
         _raw_summary = _ma if len(_ma) > 10 and _ma.lower() not in _PH else _extract_summary_from_page_content(page_content)
         _summary_is_real = bool(_raw_summary) and len(_raw_summary) > 10 and _raw_summary.lower() not in _PH
         summary_text = truncate_text(_raw_summary, text_limit) if _summary_is_real else ""
  
-        # If no usable summary, fall back to cleaned snippet of full content
         snippet = ""
         if not summary_text:
             snippet = clean_snippet(meta, page_content, limit=text_limit)
  
-        # Add researcher group separator when researcher changes
         researcher_key = researcher.lower().strip() if researcher else ""
         if researcher_key and researcher_key != (last_researcher or ""):
             blocks.append(f"--- Papers by {researcher} ---")
@@ -381,10 +378,6 @@ def build_compact_context(docs: List[Any], max_docs: Optional[int] = None,
         blocks.append("\n".join(ln for ln in lines if ln is not None))
     return "\n\n".join(blocks)
  
-# ---------------------------------------------------------------------------
-# Case-insensitive deduplication
-# ---------------------------------------------------------------------------
- 
 def dedupe_ci(items: List[str]) -> List[str]:
     out: List[str] = []
     seen: set = set()
@@ -395,18 +388,11 @@ def dedupe_ci(items: List[str]) -> List[str]:
             out.append(item.strip())
     return out
  
-# ---------------------------------------------------------------------------
-# Anchor helpers
-# ---------------------------------------------------------------------------
- 
 def is_placeholder_anchor_value(value: str) -> bool:
     raw = collapse_whitespace(str(value or "")).lower()
     compact = re.sub(r"[^a-z0-9]+", "", raw)
     if not compact:
         return True
-    # "Untitled" is a corpus noise value — many papers lack titles and get "Untitled"
-    # stored in metadata.  Treating it as a valid dominant filter causes a second-pass
-    # query for where={"title": "Untitled"} which returns thousands of irrelevant docs.
     return compact in {
         "na", "nslasha", "unknown", "none", "null", "nil", "empty",
         "unspecified", "notavailable", "notapplicable", "notprovided", "tbd",
@@ -453,13 +439,10 @@ def anchor_support_ratio(anchor_value: str, docs: List[Any]) -> float:
     if not anchor or not docs or is_placeholder_anchor_value(anchor):
         return 0.0
  
-    # First try exact text match
     exact_count = sum(1 for d in docs if anchor_in_text(anchor, doc_haystack(d)))
     if exact_count > 0:
         return float(exact_count) / max(1, len(docs))
  
-    # Fuzzy person-name match: "Duncan Brown" should match "D. Brown" in metadata.
-    # Build name signatures and check researcher/authors fields.
     toks = [t for t in re.findall(r"[A-Za-z]+", anchor) if t]
     if len(toks) >= 2:
         first, last = toks[0].lower(), toks[-1].lower()
@@ -469,10 +452,8 @@ def anchor_support_ratio(anchor_value: str, docs: List[Any]) -> float:
                 raw = collapse_whitespace(str(meta.get(field, "") or "")).lower()
                 if not raw:
                     continue
-                # Full name match
                 if first in raw and last in raw:
                     return True
-                # Initial + last name match (D. Brown matching Duncan Brown)
                 if last in raw and re.search(rf"\b{re.escape(first[0])}\.?\s", raw):
                     return True
             return False
@@ -481,10 +462,6 @@ def anchor_support_ratio(anchor_value: str, docs: List[Any]) -> float:
             return float(fuzzy_count) / max(1, len(docs))
  
     return 0.0
- 
-# ---------------------------------------------------------------------------
-# Retrieval confidence
-# ---------------------------------------------------------------------------
  
 def retrieval_confidence_label(*, docs_count: int, anchor_consistent: bool) -> str:
     min_docs = max(1, int(getattr(settings, "retrieval_weak_min_docs", 3)))
@@ -498,11 +475,6 @@ def retrieval_confidence_label(*, docs_count: int, anchor_consistent: bool) -> s
         return "medium"
     return "low"
  
- 
-# ---------------------------------------------------------------------------
-# Intent classification
-# ---------------------------------------------------------------------------
- 
 def classify_generic_intent(question: str) -> str:
     """Classify question intent using grammatical structure only.
     No hardcoded domain terms — detection is based entirely on
@@ -511,23 +483,12 @@ def classify_generic_intent(question: str) -> str:
     if not q:
         return "default"
  
-    # --- Comparison intent (checked first — "what are the differences"
-    # should be comparison, not list) ---
     if re.search(r"\b(?:compar\w*|differ\w*|versus|vs\.?|similarit\w*)\b", q):
         return "comparison"
  
-    # --- Time-range intent ---
     if re.search(r"\b(?:when\s+(?:did|was|were|is)|(?:what|which)\s+(?:year|time\s+period|date\s+range|time\s+range|time\s+frame))\b", q):
         return "time_range"
  
-    # --- List intent: detected by grammatical signals that the user wants
-    # multiple items back. ---
-    #
-    # Signal 1: "else" after an interrogative → wants MORE of something
-    # Signal 2: question starts with imperative verb requesting enumeration
-    # Signal 3: "who/what" + plural copula/verb → expects multiple
-    # Signal 4: "show me" — display request implies a set
-    # Signal 5: "which" at start — inherently selects from a set
     if re.search(r"\b(?:who|what|which)\s+else\b", q):
         return "list"
     if re.match(r"^\s*(?:identify|list|name|find|suggest|show)\b", q):
@@ -541,22 +502,12 @@ def classify_generic_intent(question: str) -> str:
  
     return "default"
  
-# ---------------------------------------------------------------------------
-# Prompt-leak stripping
-# ---------------------------------------------------------------------------
- 
 _PROMPT_LEAK_MARKERS = (
     "papers:", "paper context:", "question:",
     "system:", "user:", "assistant:",
     "[paper", "[mem", "[recent", "[summary",
 )
  
-# These markers are only treated as prompt leaks when they appear at the
-# START of a line (after optional whitespace).  The old code matched them
-# anywhere in a line, which killed legitimate answer sentences like
-# "In the context of gravitational-wave research..." because they contained
-# the substring "context:".  This was the primary cause of empty answers
-# from larger models (8B+) that write more natural English.
 _PROMPT_LEAK_PREFIX_RE = re.compile(
     r"^\s*(?:papers\s*:|paper context\s*:|question\s*:|system\s*:|user\s*:|assistant\s*:"
     r"|\[paper|\[mem|\[recent|\[summary)",
@@ -567,17 +518,10 @@ def strip_prompt_leak(answer: str) -> str:
     a = (answer or "").strip()
     if not a:
         return a
-    # Only strip lines that START with a prompt-leak label.
-    # Previously "context:" anywhere in a line was a match — that destroyed
-    # valid answer sentences from 8B+ models.
     if any(m in a.lower() for m in _PROMPT_LEAK_MARKERS):
         a = "\n".join(ln.strip() for ln in a.splitlines()
                       if not _PROMPT_LEAK_PREFIX_RE.match(ln)).strip()
     return re.sub(r"\n{3,}", "\n\n", a).strip()
- 
-# ---------------------------------------------------------------------------
-# Entity extraction helpers
-# ---------------------------------------------------------------------------
  
 def looks_like_person_candidate(name: str) -> bool:
     if not name:
@@ -597,17 +541,12 @@ def looks_like_person_candidate(name: str) -> bool:
     if not all(re.match(r"^[A-Za-z][A-Za-z\.\-']*$", t) for t in toks):
         return False
     lower_toks = [t.rstrip(".").lower() for t in toks]
-    # --- Fix 3: reject conjunctions, prepositions, and common non-name words ---
     _NON_NAME_WORDS = {
-        # conjunctions
         "and", "but", "for", "nor", "yet", "not", "with", "without",
-        # prepositions / articles
         "the", "from", "into", "onto", "upon", "over", "under", "about",
         "between", "through", "during", "before", "after", "above", "below",
-        # common academic/query words that get capitalized mid-sentence
         "studies", "study", "research", "using", "based", "toward",
         "towards", "within", "across", "among", "along",
-        # other words frequently misdetected as name parts
         "new", "old", "how", "why", "what", "when", "where", "which",
         "does", "did", "has", "had", "was", "were", "are", "been",
     }
@@ -646,10 +585,6 @@ def looks_like_person_candidate(name: str) -> bool:
         name_hits_all = sum(1 for t in lexical_parts if t in name_tokens)
         uncommon_hits = sum(1 for t in non_last_parts if t not in english_words)
         english_hits = sum(1 for t in lexical_parts if t in english_words)
-        # Reject only if ALL tokens are common English words, NONE are known
-        # names (across all positions), and NONE are uncommon.  This avoids
-        # rejecting "Duncan Brown" when "duncan" is a known name even if the
-        # names corpus is incomplete for "brown".
         if not has_initial and name_hits_all == 0 and name_hits == 0 and uncommon_hits == 0 and english_hits == len(lexical_parts):
             return False
  
@@ -662,42 +597,6 @@ def looks_like_person_candidate(name: str) -> bool:
         and suffix_like_parts):
         return False
  
-    # --- Fix 12 (v5): WordNet + names-corpus plausibility guard ---
-    #
-    # Instead of maintaining a hardcoded blocklist of non-person words,
-    # use WordNet to dynamically detect common-word tokens.  WordNet indexes
-    # common nouns, verbs, adjectives, and adverbs — but NOT proper nouns
-    # (person/place names).  So a token that has WordNet synsets and is NOT
-    # in the NLTK names corpus is almost certainly a common word, not a name
-    # component.
-    #
-    # Some names like "brown", "grant", "mark" DO appear in WordNet (as
-    # adjectives/verbs), but they also appear in the NLTK names corpus.
-    # The rule: a token is a "non-name common word" if it has WordNet senses
-    # AND is absent from the names corpus.
-    #
-    # Decision logic:
-    #   For each token, classify it as:
-    #     - "name":     in names corpus (regardless of WordNet)
-    #     - "common":   has WordNet senses AND not in names corpus
-    #     - "uncommon": no WordNet senses AND not in names corpus
-    #                   (plausible rare surname like "Gearty", "Nitz")
-    #
-    #   Accept if: at least one "name" token in first-name position, OR
-    #              at least one "uncommon" token (possible rare surname)
-    #              paired with at least one "name" token anywhere.
-    #   Reject if: any token is "common" with zero "name" tokens, OR
-    #              all tokens are "common".
-    #
-    # Decision matrix:
-    #   "Duncan Brown"       → duncan=name, brown=name       → ACCEPT
-    #   "William Gearty"     → william=name, gearty=uncommon → ACCEPT
-    #   "Plant Systems"      → plant=common, systems=common  → REJECT
-    #   "Proteins Especially"→ proteins=common, especially=common → REJECT
-    #   "Researchers Whose"  → researchers=common, whose=common  → REJECT
-    #   "Syracuse University"→ syracuse=uncommon, university=common → no name hit → REJECT
-    #   "Computer Science"   → computer=common, science=common → REJECT
- 
     if not has_initial and lexical_parts:
         n_name = 0
         n_common = 0
@@ -709,32 +608,18 @@ def looks_like_person_candidate(name: str) -> bool:
             elif _wordnet_is_common_word(t):
                 n_common += 1
             elif english_words and t in english_words:
-                # In NLTK words corpus but not in names — treat as common.
-                # (Covers cases where WordNet is unavailable or incomplete.)
                 n_common += 1
             else:
-                # Not a known name, not a known common word — plausible
-                # rare surname (e.g. "Gearty", "Nitz", "Sukenik").
                 n_uncommon += 1
  
         n_total = len(lexical_parts)
  
-        # If ANY token is a recognized common word and there are ZERO known
-        # names, reject.  This catches "Plant Systems", "Proteins Especially",
-        # "Researchers Whose", etc. regardless of domain.
         if n_common > 0 and n_name == 0:
             return False
  
-        # If ALL tokens are common words (even if some are also names),
-        # require at least one to be in the names corpus.  This prevents
-        # "Computer Science" while allowing "Mark Brown" (mark=name+common,
-        # brown=name+common).
         if n_name == 0 and n_uncommon == 0:
             return False
  
-        # If there's exactly one name hit and the rest are common words,
-        # require the name to be in first-name position.
-        # Accepts "Duncan Brown" but rejects "Brown Research".
         if n_name == 1 and n_uncommon == 0 and n_total >= 2:
             if lexical_parts[0] not in (name_tokens or set()):
                 return False
@@ -751,6 +636,65 @@ def strip_possessive(name: str) -> str:
             return s[:-1].strip()
     return s
  
+def tokenize_name(name: str) -> List[str]:
+    """Split a person name into alphabetic tokens.
+
+    >>> tokenize_name("Duncan A. Brown")
+    ['Duncan', 'A', 'Brown']
+    """
+    return [t for t in re.findall(r"[A-Za-z]+", str(name or "").strip()) if t]
+
+def generate_name_variants(toks: List[str]) -> List[str]:
+    """Generate common academic name variants from a token list.
+
+    Given ``["Duncan", "Andrew", "Brown"]`` produces (most specific first)::
+
+        Duncan Andrew Brown      -- all tokens full
+        Duncan A. Brown          -- middles as initials
+        D. A. Brown              -- all pre-surname tokens as initials
+        Duncan Brown             -- middles omitted
+        D. Brown                 -- first initial, middles omitted
+
+    Works for any number of middle names (0, 1, 2, ...).
+    """
+    if len(toks) < 2:
+        return list(toks)
+    first, last = toks[0], toks[-1]
+    middles = toks[1:-1]
+
+    variants: List[str] = []
+    seen: set = set()
+
+    def _add(v: str) -> None:
+        v = v.strip()
+        key = re.sub(r"\s+", " ", v).lower()
+        if key and key not in seen:
+            seen.add(key)
+            variants.append(v)
+
+    if middles:
+        mid_full = " ".join(middles)
+        mid_init = " ".join(f"{m[0]}." for m in middles)
+        _add(f"{first} {mid_full} {last}")
+        _add(f"{first} {mid_init} {last}")
+        _add(f"{first[0]}. {mid_init} {last}")
+
+    _add(f"{first} {last}")
+    _add(f"{first[0]}. {last}")
+    _add(f"{first[0]} {last}")
+
+    return variants
+
+def split_author_names(raw_authors: str) -> List[str]:
+    """Split a raw authors string on ``;``, ``,``, or ``and``.
+
+    Returns a list of cleaned author name strings (>= 2 chars each).
+    """
+    if not raw_authors:
+        return []
+    return [n for p in re.split(r"\s*[;,]\s*|\s+and\s+", raw_authors)
+            if (n := re.sub(r"\s+", " ", p.strip())) and len(n) >= 2]
+
 def has_explicit_entity_signal(question: str, ents: Optional[Dict[str, List[str]]] = None) -> bool:
     q = (question or "").strip()
     if not q:
@@ -764,21 +708,12 @@ def has_explicit_entity_signal(question: str, ents: Optional[Dict[str, List[str]
     topic_tokens = [t for t in data.get("topics", []) if not is_generic_query_token(t)]
     return len(topic_tokens) >= max(1, int(getattr(settings, "retrieval_topic_min_terms", 2)))
  
-# ---------------------------------------------------------------------------
-# Hashing & timestamps
-# ---------------------------------------------------------------------------
- 
 def short_hash(value: Any, *, length: int = 12) -> str:
     data = norm_text(str(value or "")).encode("utf-8", errors="ignore")
     return hashlib.sha256(data).hexdigest()[:max(6, int(length))]
  
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
- 
- 
-# ---------------------------------------------------------------------------
-# Meta-command detection
-# ---------------------------------------------------------------------------
  
 _META_COMMAND_PATTERNS = re.compile(
     r"^\s*(switch\s+topic|change\s+(?:the\s+)?(?:subject|topic)|new\s+topic"
@@ -793,11 +728,6 @@ def is_meta_command(question: str) -> bool:
     q = (question or "").strip()
     return bool(q and _META_COMMAND_PATTERNS.match(q))
  
- 
-# ---------------------------------------------------------------------------
-# Anchor-query relevance overlap
-# ---------------------------------------------------------------------------
- 
 def anchor_query_overlap(anchor_value: str, question: str) -> bool:
     """Return True if the question has meaningful token overlap with the anchor value."""
     a_val = norm_text(anchor_value)
@@ -811,10 +741,6 @@ def anchor_query_overlap(anchor_value: str, question: str) -> bool:
     if not a_toks:
         return False
     return bool(a_toks & q_toks)
- 
-# ---------------------------------------------------------------------------
-# Query-token extraction for relevance filtering
-# ---------------------------------------------------------------------------
  
 _INSTITUTIONAL_TERMS_RE = re.compile(
     r"\b(syracuse\s+university|syracuse|university|faculty|professor|"
