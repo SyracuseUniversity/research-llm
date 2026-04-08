@@ -1,3 +1,4 @@
+#rag_engine.py
 import os
 import re
 import uuid
@@ -37,6 +38,7 @@ from rag_utils import (
     collapse_whitespace, tokenize_words as _tokenize_words, token_in_hay,
     get_stopword_set as _get_stopword_set, get_generic_query_terms as _get_generic_query_terms,
     get_followup_phrases as _get_followup_phrases, get_followup_pronoun_pattern as _get_followup_pronoun_pattern,
+    get_person_pronoun_pattern as _get_person_pronoun_pattern,
     is_generic_query_token as _is_generic_query_token, is_followup_coref_question as _is_followup_coref_question,
     bootstrap_nltk_data as _bootstrap_nltk_data, strip_corpus_noise_terms as _strip_corpus_noise_terms,
     dedupe_docs, doc_haystack, truncate_text as _truncate_text, clean_snippet as _clean_snippet,
@@ -50,6 +52,7 @@ from rag_utils import (
     is_meta_command as _is_meta_command,
     get_name_token_set as _get_name_token_set,
     get_english_word_set as _get_english_word_set,
+    tokenize_name, generate_name_variants, split_author_names,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,7 +63,6 @@ STATE_DB = os.getenv("RAG_STATE_DB", "chat_state.sqlite")
 _EMBED_DEVICE = os.getenv("RAG_EMBED_DEVICE", "").strip().lower()
 if _EMBED_DEVICE not in {"cuda", "cpu"}:
     _EMBED_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
@@ -76,7 +78,6 @@ def _dbg(title: str, obj: Any = None, limit: int = 2000) -> None:
     if obj is not None:
         s = obj if isinstance(obj, str) else repr(obj)
         print(s[:limit] + "\n...truncated..." if limit and len(s) > limit else s)
-
 
 @dataclass
 class Turn:
@@ -97,7 +98,6 @@ class EngineContext:
     budgets: Dict[str, int]
     anchor: Dict[str, Any]
 
-
 def available_ram_mb() -> int:
     return int(psutil.virtual_memory().available / (1024 * 1024))
 
@@ -109,7 +109,6 @@ def available_vram_mb() -> int:
         return int(free_b / (1024 * 1024))
     except Exception:
         return 0
-
 
 def dynamic_budgets() -> Dict[str, int]:
     ram, vram = available_ram_mb(), available_vram_mb()
@@ -144,15 +143,9 @@ def dynamic_budgets() -> Dict[str, int]:
         "TRIGGER": max(mt, int(base_trigger * st_)),
     }
 
-
 def _no_results_summary_line(question: str) -> str:
     q = re.sub(r"\s+", " ", (question or "").strip())
     return f"No results for: {q}" if q else "No results for the last query."
-
-
-# ---------------------------------------------------------------------------
-# Rolling summary management
-# ---------------------------------------------------------------------------
 
 _SUMMARY_SECTIONS: Tuple[str, ...] = (
     "Current focus", "Researcher mentions", "Core entities",
@@ -168,12 +161,10 @@ _SUMMARY_ALIASES: Dict[str, str] = {
     "constraints": "Constraints", "open questions": "Open questions",
 }
 
-
 def _summary_template_empty() -> str:
     blocks = [("Constraints: Use only retrieved Syracuse corpus context." if sec == "Constraints"
                 else f"{sec}: (none)") for sec in _SUMMARY_SECTIONS]
     return "\n".join(blocks)
-
 
 def _extract_summary_sections(text: str) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {sec: [] for sec in _SUMMARY_SECTIONS}
@@ -197,14 +188,12 @@ def _extract_summary_sections(text: str) -> Dict[str, List[str]]:
             out[current].append(line.lstrip("- ").strip())
     return out
 
-
 def _format_summary_sections(sections: Dict[str, List[str]]) -> str:
     blocks = []
     for sec in _SUMMARY_SECTIONS:
         vals = [re.sub(r"\s+", " ", v.strip()) for v in (sections.get(sec) or []) if v and v.strip()]
         blocks.append(f"{sec}: {' | '.join(vals or ['(none)'])}")
     return "\n".join(blocks).strip()
-
 
 def _clean_answer_for_summary_signal(text: str) -> str:
     blocked = ("no further analysis is required", "no additional retrieval is required",
@@ -219,14 +208,11 @@ def _clean_answer_for_summary_signal(text: str) -> str:
             lines.append(line)
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
-
 def _extract_answer_theme_keywords(answer_text: str, *, max_items: int = 6) -> List[str]:
     cleaned = _clean_answer_for_summary_signal(answer_text)
     if not cleaned:
         return []
     stopset = _get_stopword_set()
-    # Common academic terms that appear in many answers but don't help
-    # distinguish topics — these pollute the rolling summary.
     _ACADEMIC_NOISE = {
         "research", "researchers", "study", "studies", "paper", "papers",
         "work", "works", "findings", "finding", "results", "result",
@@ -253,7 +239,6 @@ def _extract_answer_theme_keywords(answer_text: str, *, max_items: int = 6) -> L
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [token for token, _ in ranked][:max(1, max_items)]
 
-
 def _sanitize_entity_values(values: List[str], *, max_items: int = 8) -> List[str]:
     stopset = _get_stopword_set()
     out, seen = [], set()
@@ -275,7 +260,6 @@ def _sanitize_entity_values(values: List[str], *, max_items: int = 8) -> List[st
             break
     return out
 
-
 def build_rolling_summary(previous_summary: str, user_question: str,
                           retrieval_metadata: str, assistant_answer: str) -> str:
     base = previous_summary if (previous_summary or "").strip() else _summary_template_empty()
@@ -292,8 +276,6 @@ def build_rolling_summary(previous_summary: str, user_question: str,
     if q:
         sections["Current focus"] = [q[:220]]
 
-    # Extract researcher/topic signals from structured metadata with strict
-    # support thresholds to avoid polluting the summary with noisy titles.
     meta_people_counts: Dict[str, int] = {}
     meta_people_display: Dict[str, str] = {}
     meta_topic_counts: Dict[str, int] = {}
@@ -416,23 +398,13 @@ def build_rolling_summary(previous_summary: str, user_question: str,
         return summary
     return (previous_summary or "").strip() or _summary_template_empty()
 
-
-# ---------------------------------------------------------------------------
-# LLM invocation
-# ---------------------------------------------------------------------------
-
 _LLM_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-invoke")
 _vram_release_lock = threading.Lock()
 _vram_release_counter = 0
 _VRAM_RELEASE_EVERY_N = 5
 
-
 def _release_vram_cache() -> None:
     global _vram_release_counter
-    # Skip gc.collect() on every call — with inference_mode() there's no
-    # autograd graph accumulating, so the only benefit of gc.collect here was
-    # reclaiming stale Python wrappers.  Doing it every call added ~50-200ms
-    # of pure overhead per LLM invocation.
     with _vram_release_lock:
         _vram_release_counter += 1
         should_release = _vram_release_counter >= _VRAM_RELEASE_EVERY_N
@@ -445,7 +417,6 @@ def _release_vram_cache() -> None:
                 torch.cuda.empty_cache()
         except Exception:
             pass
-
 
 def _invoke_with_timeout(llm: Any, prompt: str, timeout_s: int) -> str:
     if timeout_s <= 0:
@@ -460,7 +431,6 @@ def _invoke_with_timeout(llm: Any, prompt: str, timeout_s: int) -> str:
         result = ""
     _release_vram_cache()
     return result
-
 
 def _regenerate_rolling_summary(*, llm, old_summary, new_turns_text, question,
                                 ner_line, source_context, no_results, timeout_s) -> str:
@@ -485,11 +455,6 @@ def _regenerate_rolling_summary(*, llm, old_summary, new_turns_text, question,
                                  " ".join([source_context or "", ner_line or ""]).strip(),
                                  answer_snippet)
 
-
-# ---------------------------------------------------------------------------
-# Entity extraction
-# ---------------------------------------------------------------------------
-
 _ANCHOR_ESCAPE_PATTERN = re.compile(
     r"\b(who else|what else|other (researchers?|faculty|people|authors?|scientists?)"
     r"|others|besides|apart from|different (from|researcher|faculty)|not .{0,30} but"
@@ -503,7 +468,6 @@ def _is_anchor_escape_question(question: str) -> bool:
 
 def _looks_like_person_token(token: str) -> bool:
     return bool(token and (re.match(r"^[A-Z][A-Za-z\-']+$", token) or re.match(r"^[A-Z]\.$", token)))
-
 
 def _extract_entities_regex(raw: str, *, max_items: int = 6) -> Dict[str, List[str]]:
     people, entities = [], []
@@ -528,7 +492,6 @@ def _extract_entities_regex(raw: str, *, max_items: int = 6) -> Dict[str, List[s
     topics = [k for k, _ in sorted(counts.items(), key=lambda x: (-x[1], x[0]))][:max_items]
     orgs = _dedupe_ci([e for e in entities if re.fullmatch(r"[A-Z]{2,10}", e)])[:max_items]
     return {"people": people, "orgs": orgs, "entities": entities, "topics": topics}
-
 
 def _extract_entities_nltk(raw: str, *, max_items: int = 6) -> Optional[Dict[str, List[str]]]:
     if not all((nltk, word_tokenize, pos_tag, ne_chunk)):
@@ -587,7 +550,6 @@ def _extract_entities_nltk(raw: str, *, max_items: int = 6) -> Optional[Dict[str
     except Exception:
         return None
 
-
 def _extract_entities_basic(text: str, *, max_items: int = 6) -> Dict[str, List[str]]:
     raw = (text or "").strip()
     if not raw:
@@ -601,7 +563,6 @@ def _extract_entities_basic(text: str, *, max_items: int = 6) -> Dict[str, List[
                               if t and not _is_generic_query_token(t)])[:max_items],
     }
 
-
 def _build_ner_context_text(docs: List[Document], max_docs: int = 12) -> str:
     parts: List[str] = []
     for d in docs[:max_docs]:
@@ -612,9 +573,8 @@ def _build_ner_context_text(docs: List[Document], max_docs: int = 12) -> str:
 
         raw_authors = re.sub(r"\s+", " ", str(meta.get("authors", "") or "").strip())
         if raw_authors:
-            author_parts = [n for n in re.split(r"\s*[;,]\s*|\s+and\s+", raw_authors) if n.strip()]
-            for author in author_parts[:6]:
-                candidate = _strip_possessive(re.sub(r"\s+", " ", author).strip())
+            for author in split_author_names(raw_authors)[:6]:
+                candidate = _strip_possessive(author)
                 if candidate and _looks_like_person_candidate(candidate):
                     parts.append(f"author:{candidate}")
 
@@ -626,13 +586,10 @@ def _build_ner_context_text(docs: List[Document], max_docs: int = 12) -> str:
                 parts.append(f"topic:{topic}")
     return " | ".join(parts)
 
-
 def _extract_summary_topic_keywords(summary: str, *, max_chars: int = 180) -> str:
     if not summary:
         return ""
     themes = _extract_summary_sections(summary).get("Key themes", [])
-    # Theme entries may be pipe-delimited ("brown | collisions | high-energy").
-    # Split into individual tokens before joining.
     individual = []
     for t in themes:
         if not t or t.strip() == "(none)":
@@ -645,7 +602,6 @@ def _extract_summary_topic_keywords(summary: str, *, max_chars: int = 180) -> st
     result = " ".join(parts).strip()
     return result[:max_chars].rstrip() if len(result) > max_chars else result
 
-
 def _summary_query_from_text(summary: str, *, max_chars: int = 320) -> str:
     if not summary:
         return ""
@@ -655,7 +611,6 @@ def _summary_query_from_text(summary: str, *, max_chars: int = 320) -> str:
     tail = " ".join(lines[-3:])
     return tail[:max_chars - 1].rstrip() + "…" if len(tail) > max_chars else tail
 
-
 def _summary_keywords_overlap_anchor(topic_keywords: str, anchor_value: str) -> bool:
     """Return True if the summary topic keywords share at least one meaningful
     token with the anchor value.  This prevents injecting stale summary keywords
@@ -664,13 +619,11 @@ def _summary_keywords_overlap_anchor(topic_keywords: str, anchor_value: str) -> 
         return False
     a_toks = set(_tokenize_words(anchor_value))
     kw_toks = set(_tokenize_words(topic_keywords))
-    # Filter to non-trivial tokens (length >= 4 to skip initials/short words)
     a_toks = {t for t in a_toks if len(t) >= 4 and not _is_generic_query_token(t)}
     kw_toks = {t for t in kw_toks if len(t) >= 4 and not _is_generic_query_token(t)}
     if not a_toks or not kw_toks:
         return False
     return bool(a_toks & kw_toks)
-
 
 def _extract_person_name(question: str) -> str:
     raw = (question or "").strip()
@@ -679,11 +632,6 @@ def _extract_person_name(question: str) -> str:
     cleaned = re.sub(r"(\w)['\\u2019]s\b", r"\1", raw)
     stopset = _get_stopword_set()
 
-    # --- Fix 13: NLTK-based guard inside _accept() as defense-in-depth.
-    # If all tokens are common English words and none appear in the NLTK
-    # names corpus, reject.  This catches "Computer Science", "Marine
-    # Paleontology", "Mechanisms Described", "Syracuse University" etc.
-    # without hardcoding any domain or institutional terms. ---
     _epn_name_tokens = _get_name_token_set()
     _epn_english_words = _get_english_word_set()
 
@@ -741,11 +689,6 @@ def _extract_person_name(question: str) -> str:
         return ranked[0][3]
     return ""
 
-
-# ---------------------------------------------------------------------------
-# Answer quality checks
-# ---------------------------------------------------------------------------
-
 _DEGENERATE_ANSWER_PATTERNS = re.compile(
     r"^\s*(?:[\w\s\.\,\-]+ is a researcher[\.\s]*"
     r"|[\w\s\.\,\-]+ is an? \w+[\.\s]*"
@@ -755,11 +698,7 @@ _DEGENERATE_ANSWER_PATTERNS = re.compile(
 
 def _answer_is_bad(answer: str) -> bool:
     a = (answer or "").strip()
-    # 10-word minimum instead of 20 — some models give concise but correct
-    # answers.  The degenerate pattern check catches the truly bad cases
-    # like "X is a researcher." regardless of word count.
     return not a or len(_tokenize_words(a)) < 10 or bool(_DEGENERATE_ANSWER_PATTERNS.match(a))
-
 
 def _extract_focus_from_question(question: str) -> str:
     raw = (question or "").strip()
@@ -772,13 +711,11 @@ def _extract_focus_from_question(question: str) -> str:
             return " ".join(vals[:limit])
     return ""
 
-
 def _is_invalid_focus_value(text: str) -> bool:
     toks = [t for t in _tokenize_words(text) if t]
     if not toks or max((len(t) for t in toks), default=0) < 3:
         return True
     return not [t for t in toks if not _is_generic_query_token(t)]
-
 
 def _query_is_short_or_pronoun(question: str) -> bool:
     q = (question or "").strip()
@@ -787,7 +724,6 @@ def _query_is_short_or_pronoun(question: str) -> bool:
     if _is_followup_coref_question(q):
         return True
     return len(_tokenize_words(q)) < max(1, int(getattr(settings, "followup_query_max_words", 8)))
-
 
 def _inject_anchor_into_query(question: str, anchor_value: str) -> str:
     q, anchor = collapse_whitespace(question), collapse_whitespace(anchor_value)
@@ -803,26 +739,16 @@ def _inject_anchor_into_query(question: str, anchor_value: str) -> str:
     stem = q.rstrip(" ?")
     return f"{stem} for {anchor}?" if stem else anchor
 
-
-# ---------------------------------------------------------------------------
-# Model runtime
-# ---------------------------------------------------------------------------
-
 class _DirectGenerationLLM:
     def __init__(self, *, model, tokenizer, generation_kwargs):
         self.model = model
         self.tokenizer = tokenizer
         self.generation_kwargs = dict(generation_kwargs or {})
-        # Cache device to avoid iterating parameters on every invoke.
         try:
             self._device = next(model.parameters()).device
         except StopIteration:
             self._device = torch.device("cpu")
 
-    # Structured separator used by invoke() to split system vs user content.
-    # Callers can embed this in the prompt string to indicate the boundary;
-    # invoke() will use it for chat-template formatting when the tokenizer
-    # supports it.  Chosen to be unlikely to appear in natural content.
     SYSTEM_USER_SEP = "\n<<SYS_USER_BOUNDARY>>\n"
 
     def invoke(self, prompt: str) -> str:
@@ -833,19 +759,6 @@ class _DirectGenerationLLM:
         max_ctx = int(getattr(self.model.config, "max_position_embeddings", 0)
                       or getattr(self.tokenizer, "model_max_length", 4096) or 4096)
 
-        # --- Fix E: Model-agnostic chat template application ---
-        # Instruction-tuned models expect messages wrapped in model-specific
-        # delimiters.  Without them, the model may treat system instructions as
-        # content to continue, echoing them in its output.
-        #
-        # Strategy:
-        # 1. If the prompt contains SYSTEM_USER_SEP, split there (explicit boundary).
-        # 2. Otherwise, treat the entire prompt as a user message.
-        # 3. If the tokenizer has apply_chat_template, use it for ANY model —
-        #    this is model-agnostic because every HF instruct model ships its
-        #    own Jinja template in tokenizer_config.json.
-        # 4. If the tokenizer has no chat_template (base models, old checkpoints),
-        #    fall back to the raw string — identical to the previous behavior.
         formatted_prompt = p
         _has_chat_template = (
             hasattr(self.tokenizer, "apply_chat_template")
@@ -860,15 +773,10 @@ class _DirectGenerationLLM:
                         {"role": "user", "content": user_part.strip()},
                     ]
                 else:
-                    # No explicit boundary — wrap entire prompt as user message.
-                    # This is safe for all model families: instruction-tuned models
-                    # will get proper <user> delimiters, base models without a
-                    # chat_template already fell through the _has_chat_template gate.
                     messages = [{"role": "user", "content": p}]
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True)
             except Exception:
-                # Any failure (missing template, Jinja error, etc.) — use raw string
                 formatted_prompt = p
 
         enc = self.tokenizer(formatted_prompt, return_tensors="pt", truncation=True,
@@ -895,7 +803,6 @@ class _DirectGenerationLLM:
 
         del enc, out
         return result
-
 
 def _needs_trust_remote_code(model_id_or_path: str, local_only: bool) -> bool:
     """Return True only for local models that bundle custom tokenizer/model classes.
@@ -925,16 +832,13 @@ def _needs_trust_remote_code(model_id_or_path: str, local_only: bool) -> bool:
     )
     if not path_is_local:
         return False
-    # Models that ship custom tokenizer/model classes and require this flag.
-    # Match against the tail directory name so absolute paths work correctly.
     _TRUST_REMOTE_CODE_ALLOWLIST = {
         "qwen-2.5-14b", "qwen_14b", "14b",
         "gpt-oss-20b", "gpt_oss_20b", "20b",
-        "gemma-3-12b", "gemma_12b", "12b",  # Fix K: Gemma 3 may ship custom classes
+        "gemma-3-12b", "gemma_12b", "12b",
     }
     basename = os.path.basename(path.rstrip("/\\")).lower()
     return any(allowed in basename for allowed in _TRUST_REMOTE_CODE_ALLOWLIST)
-
 
 class ModelRuntime:
     def __init__(self, model_id_or_path: str, *, max_new_tokens: int,
@@ -947,15 +851,7 @@ class ModelRuntime:
         self.quantize_bits = quantize_bits if quantize_bits else (8 if load_in_8bit else 0)
         trust_rc = _needs_trust_remote_code(model_id_or_path, local_only)
 
-        # Disable gradient tracking during the entire load — saves memory and
-        # time by preventing autograd graph construction for weight tensors.
         with torch.no_grad():
-            # --- Fix J: Fast tokenizer fallback ---
-            # Models downloaded with newer transformers (>= 4.45) save
-            # tokenizer.json in a format that older tokenizers libraries
-            # can't parse ("data did not match any variant of untagged enum
-            # ModelWrapper").  Fall back to the slow Python tokenizer which
-            # reads tokenizer_model/tokenizer_config.json instead.
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     model_id_or_path, local_files_only=local_only, use_fast=True,
@@ -973,11 +869,6 @@ class ModelRuntime:
             if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
                 self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-            # Detect best attention implementation available.
-            # flash_attention_2 requires Ampere+ (SM >= 8.0).
-            # Turing GPUs (SM 7.5, e.g. Quadro RTX 5000, RTX 2080) do NOT
-            # support FA2 — use SDPA instead, which is still 2-3× faster
-            # than eager attention on Turing.
             _attn_impl = "eager"
             _gpu_sm = 0
             if torch.cuda.is_available():
@@ -987,15 +878,13 @@ class ModelRuntime:
                     pass
 
             if _gpu_sm >= 80:
-                # Ampere or newer — try FA2 first
                 try:
-                    import flash_attn  # noqa: F401
+                    import flash_attn
                     _attn_impl = "flash_attention_2"
                 except ImportError:
                     pass
 
             if _attn_impl == "eager":
-                # SDPA works on all GPUs with PyTorch >= 2.0 (including Turing)
                 if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
                     _attn_impl = "sdpa"
 
@@ -1004,9 +893,6 @@ class ModelRuntime:
             print(f"[MODEL_LOAD] {model_id_or_path} | attn={_attn_impl} | "
                   f"gpu_sm={_gpu_sm} | quant={self.quantize_bits}bit")
 
-            # Common kwargs shared by all loading paths.
-            # attn_implementation requires transformers >= 4.36.  If the kwarg
-            # is rejected by an older version, we retry without it.
             _common_kwargs = dict(
                 local_files_only=local_only,
                 low_cpu_mem_usage=True,
@@ -1016,15 +902,33 @@ class ModelRuntime:
                 _common_kwargs["attn_implementation"] = _attn_impl
 
             if self.quantize_bits in (4, 8) and torch.cuda.is_available():
+                # --- Guard: detect poisoned CUDA context from a prior model ---
+                try:
+                    torch.cuda.synchronize()
+                    _probe = torch.tensor([1.0], device="cuda")
+                    _ = _probe + _probe
+                    torch.cuda.synchronize()
+                    del _probe
+                except RuntimeError as _cuda_err:
+                    raise RuntimeError(
+                        f"CUDA is in a bad state before loading {model_id_or_path}. "
+                        f"A previous model likely triggered a device-side assert. "
+                        f"Restart the process to reset the GPU. Error: {_cuda_err}"
+                    ) from _cuda_err
+
                 try:
                     from transformers import BitsAndBytesConfig
-                    import bitsandbytes  # noqa: F401 — verify it's actually installed
+                    import bitsandbytes
                     if self.quantize_bits == 4:
+                        # SM 7.5 (Turing) can hit CUDA assertions with NF4 +
+                        # double-quant on some architectures (notably Gemma 3).
+                        # Use double-quant only on SM >= 8.0 (Ampere+).
+                        _use_dq = (_gpu_sm >= 80)
                         quantization_config = BitsAndBytesConfig(
                             load_in_4bit=True,
                             bnb_4bit_compute_dtype=torch.float16,
                             bnb_4bit_quant_type="nf4",
-                            bnb_4bit_use_double_quant=True,
+                            bnb_4bit_use_double_quant=_use_dq,
                         )
                     else:
                         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
@@ -1036,7 +940,6 @@ class ModelRuntime:
                             **_common_kwargs,
                         )
                     except TypeError:
-                        # attn_implementation kwarg rejected by older transformers
                         _fallback = {k: v for k, v in _common_kwargs.items()
                                      if k != "attn_implementation"}
                         self.model = AutoModelForCausalLM.from_pretrained(
@@ -1052,14 +955,40 @@ class ModelRuntime:
                                    self.quantize_bits, e)
                     print(f"[MODEL_LOAD] {self.quantize_bits}-bit failed: {_err_str[:120]}")
 
-                    # --- Fix N: Graceful quantization fallback ladder ---
-                    # "set_submodule" error = torch<2.1 + bitsandbytes version
-                    # mismatch.  Try 8-bit (needs less torch internals) before
-                    # falling all the way back to fp16 (which OOMs on 8B+ models
-                    # with only 16GB VRAM).
                     _model_loaded = False
 
-                    # Step 1: If 4-bit failed, try 8-bit
+                    # --- Try to recover CUDA state before retrying ---
+                    if "assert" in _err_str.lower() or "cuda" in _err_str.lower():
+                        try:
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+
+                    # --- Retry 4-bit with FP4 quant type (more compatible on SM 7.x) ---
+                    if self.quantize_bits == 4 and not _model_loaded:
+                        try:
+                            print("[MODEL_LOAD] Trying 4-bit with fp4 quant type...")
+                            _fp4_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_compute_dtype=torch.float16,
+                                bnb_4bit_quant_type="fp4",
+                                bnb_4bit_use_double_quant=False,
+                            )
+                            _fb_kwargs = {k: v for k, v in _common_kwargs.items()
+                                          if k != "attn_implementation"}
+                            self.model = AutoModelForCausalLM.from_pretrained(
+                                model_id_or_path,
+                                quantization_config=_fp4_config,
+                                device_map="auto",
+                                **_fb_kwargs,
+                            )
+                            _model_loaded = True
+                            print(f"[MODEL_LOAD] Loaded {model_id_or_path} in 4-bit fp4 (fallback from nf4)")
+                        except Exception as e_fp4:
+                            print(f"[MODEL_LOAD] 4-bit fp4 also failed: {str(e_fp4)[:120]}")
+
                     if self.quantize_bits == 4 and not _model_loaded:
                         try:
                             print("[MODEL_LOAD] Trying 8-bit fallback...")
@@ -1079,7 +1008,6 @@ class ModelRuntime:
                             logger.warning("8-bit fallback also failed: %s", e2)
                             print(f"[MODEL_LOAD] 8-bit fallback also failed: {str(e2)[:120]}")
 
-                    # Step 2: Try fp16 with device_map="auto" (may OOM on large models)
                     if not _model_loaded:
                         try:
                             print("[MODEL_LOAD] Trying fp16 with device_map=auto...")
@@ -1095,7 +1023,6 @@ class ModelRuntime:
                                 device_map="auto", **_fallback)
                             _model_loaded = True
                         except Exception as e3:
-                            # Log version info so the user knows what to upgrade
                             _torch_ver = getattr(torch, "__version__", "unknown")
                             _bnb_ver = "unknown"
                             try:
@@ -1156,38 +1083,52 @@ class ModelRuntime:
         self.llm = _DirectGenerationLLM(model=self.model, tokenizer=self.tokenizer,
                                         generation_kwargs=self.generation_kwargs)
 
-        # Warmup: run a tiny forward pass to trigger CUDA kernel compilation
-        # and memory allocation.  Without this the first real query pays a
-        # 2-5 second penalty while kernels are JIT-compiled.
         self._warmup()
 
     def _warmup(self) -> None:
-        """Run a minimal forward pass to pre-compile CUDA kernels."""
+        """Run a minimal forward pass to pre-compile CUDA kernels
+        and validate the model can actually produce tokens."""
         try:
-            dummy = self.tokenizer("warmup", return_tensors="pt", truncation=True, max_length=8)
-            # With device_map="auto" the model may span devices; use the
-            # model's own device for the first embedding layer.
+            dummy = self.tokenizer("The answer is", return_tensors="pt",
+                                   truncation=True, max_length=8)
             target_device = next(self.model.parameters()).device
             dummy = {k: v.to(target_device) for k, v in dummy.items()}
             with torch.inference_mode():
-                self.model.generate(
-                    **dummy, max_new_tokens=1,
+                out = self.model.generate(
+                    **dummy, max_new_tokens=4,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
+
+            # --- Validate: did the model produce any new tokens? ---
+            prompt_len = int(dummy["input_ids"].shape[1])
+            new_tokens = out[0][prompt_len:]
             del dummy
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()  # surface async CUDA errors
+
+            if len(new_tokens) == 0:
+                raise RuntimeError(
+                    f"Model {self.model_id_or_path} produced 0 new tokens during "
+                    f"warmup — the GPU is likely in a bad state (CUDA device-side "
+                    f"assert). Restart the process to reset the GPU context."
+                )
+            del out
+            logger.info("Warmup OK — model generated %d tokens", len(new_tokens))
+
+        except RuntimeError:
+            raise  # propagate validation failures
         except Exception:
             logger.debug("Model warmup failed (non-fatal)", exc_info=True)
 
     def close(self) -> None:
-        # Delete heavy objects first, then collect once.
         model = getattr(self, "model", None)
         for attr in ("llm", "model", "tokenizer"):
             try:
                 delattr(self, attr)
             except Exception:
                 pass
-        # Only do the expensive gc+empty_cache once, not per-attribute.
         del model
         gc.collect()
         if torch.cuda.is_available():
@@ -1195,7 +1136,6 @@ class ModelRuntime:
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
-
 
 def _fast_count_tokens(text: str) -> int:
     """Character-based token estimate: ~4 chars per token.
@@ -1208,15 +1148,7 @@ def _fast_count_tokens(text: str) -> int:
     """
     return max(1, (len(text) + 3) // 4)
 
-
 def pack_docs(docs: List[Document], budget: int, count_tokens_fn) -> List[Document]:
-    # Use a fast char-based estimate instead of calling count_tokens_fn (the LLM
-    # tokenizer) on every doc.  The real tokenizer is O(n_chars) per call and on
-    # large models (8B+) adds hundreds of milliseconds per retrieval — showing up
-    # as inflated retrieval_total_ms in logs.  _fit_prompt_to_budget will trim the
-    # list to the true token budget using the real tokenizer after retrieval, so
-    # the approximation here only affects how many docs we pass through, not the
-    # final prompt.  MIN_DOCS floor ensures the LLM always has meaningful context.
     MIN_DOCS = 8
     out, total = [], 0
     for d in docs:
@@ -1243,24 +1175,15 @@ def pack_docs(docs: List[Document], budget: int, count_tokens_fn) -> List[Docume
         total += t
     return out
 
-
 format_docs_compact = build_compact_context
-
-
-# ---------------------------------------------------------------------------
-# Embeddings
-# ---------------------------------------------------------------------------
 
 class _TransformerMeanEmbeddings:
     def __init__(self, model_name: str, device: str) -> None:
-        # Determine the correct dtype kwarg for this transformers version.
-        # Versions >=4.49 renamed torch_dtype → dtype and deprecated the old name.
         import transformers as _tf
         _tf_version = tuple(int(x) for x in _tf.__version__.split(".")[:2])
         _dtype_kwarg = "dtype" if _tf_version >= (4, 49) else "torch_dtype"
 
         last_err: Optional[Exception] = None
-        # Try local cache first, then allow download if not cached.
         for local_only in (True, False):
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -1304,7 +1227,6 @@ class _TransformerMeanEmbeddings:
     def embed_query(self, text: str) -> List[float]:
         vecs = self._encode_texts([text])
         return vecs[0] if vecs else []
-
 
 class _BertFallbackEmbeddings:
     """Last-resort embedder that imports BertModel / BertTokenizer directly.
@@ -1356,12 +1278,10 @@ class _BertFallbackEmbeddings:
         vecs = self._encode_texts([text])
         return vecs[0] if vecs else []
 
-
 def build_embeddings() -> Any:
     model_name = config.EMBED_MODEL
     errors: List[str] = []
 
-    # Strategy 1: langchain HuggingFaceEmbeddings (needs sentence-transformers)
     try:
         return HuggingFaceEmbeddings(
             model_name=model_name,
@@ -1372,15 +1292,12 @@ def build_embeddings() -> Any:
         errors.append(f"HuggingFaceEmbeddings: {e}")
         logger.warning("Embedding init attempt failed (HuggingFaceEmbeddings): %s", e)
 
-    # Strategy 2: AutoModel fallback (needs only transformers)
     try:
         return _TransformerMeanEmbeddings(model_name, "cpu")
     except Exception as e:
         errors.append(f"AutoModel: {e}")
         logger.warning("Embedding init attempt failed (AutoModel): %s", e)
 
-    # Strategy 3: direct BertModel import fallback — handles newer transformers
-    # versions where AutoModel resolution may fail for cached BERT configs.
     try:
         return _BertFallbackEmbeddings(model_name, "cpu")
     except Exception as e:
@@ -1392,12 +1309,10 @@ def build_embeddings() -> Any:
         + "\n".join(f"  - {err}" for err in errors)
     )
 
-
 def clear_runtime_cache() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
 
 def _resolve_llm_path(llm_model_key: str) -> str:
     key = (llm_model_key or "").strip().lower()
@@ -1413,8 +1328,6 @@ def _resolve_llm_path(llm_model_key: str) -> str:
         return str(getattr(settings, "gpt_oss_20b_path", "") or "").strip() or getattr(config, "GPT_OSS_20B", "openai/gpt-oss-20b")
     return config.LLAMA_3B
 
-
-# Models that need 8-bit quantization (too large for fp16 on typical consumer GPUs)
 _4BIT_MODEL_KEYS = {
     "llama-3.1-8b", "llama_8b", "8b",
     "gemma-3-12b", "gemma_12b", "12b",
@@ -1429,26 +1342,17 @@ def _quantize_bits(llm_model_key: str) -> int:
         return 4 if bool(getattr(settings, "quantize_8bit", True)) else 0
     return 0
 
-
 def _is_remote_model(llm_model_key: str) -> bool:
     """Return True if the resolved model path is a HuggingFace Hub ID (not a local directory)."""
     import os as _os
     path = _resolve_llm_path(llm_model_key)
     if not path:
         return True
-    # If it looks like a local path and exists, it's local
     if _os.path.sep in path or path.startswith("/") or (len(path) > 2 and path[1] == ":"):
         return False
-    # If it exists on disk as-is, it's local
     if _os.path.isdir(path):
         return False
-    # Otherwise it's a HF Hub ID like "openai/gpt-oss-20b"
     return True
-
-
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
 
 MEMORY_EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", "Return JSON only with keys facts, decisions, preferences, tasks. "
@@ -1509,11 +1413,6 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Papers:\n{papers}\n\nQuestion:\n{question}"),
 ])
 
-
-# ---------------------------------------------------------------------------
-# Utility worker
-# ---------------------------------------------------------------------------
-
 @dataclass
 class UtilityJob:
     session_id: str
@@ -1529,7 +1428,6 @@ class UtilityJob:
     retrieval_meta_text: str = ""
     turns_already_persisted: bool = False
     rolling_summary_snapshot: Optional[str] = None
-
 
 class UtilityWorker:
     def __init__(self, *, store: SessionStore, memory_vs: Chroma, runtime: ModelRuntime):
@@ -1695,11 +1593,6 @@ class UtilityWorker:
                     retrieval_meta_text=job.retrieval_meta_text,
                     rolling_summary_snapshot=job.rolling_summary_snapshot)
 
-
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
-
 class Engine:
     def __init__(self, *, answer_runtime, utility_runtime, papers_vs, memory_vs,
                  store, session_id, utility_worker, stateless=False,
@@ -1712,7 +1605,7 @@ class Engine:
         self.session_id = session_id
         self.utility_worker = utility_worker
         self.stateless = bool(stateless)
-        self._manager = manager  # weak ref to EngineManager for lazy utility fetch
+        self._manager = manager
 
         self.last_focus = self.last_topic = self.rolling_summary = ""
         self.anchor: Dict[str, Any] = {}
@@ -1789,11 +1682,6 @@ class Engine:
                     max(1, min(3, int(getattr(settings, "rewrite_max_recent_turns", 3))))) or "",
                 question=question, anchor_value=anchor_value or "(none)")
             prompt_text = msgs[0].content + "\n" + msgs[1].content
-            # Use direct invoke instead of _invoke_with_timeout to avoid
-            # contention with the single-worker _LLM_EXECUTOR used by
-            # answer generation.  The rewrite runs BEFORE the answer call,
-            # so there's no concurrency concern — and direct invoke avoids
-            # the overhead of thread submission + future.result().
             timeout_s = int(getattr(settings, "rewrite_timeout_s", 10))
             raw = str(utility_rt.llm.invoke(prompt_text) or "")
             self.last_utility_llm_calls += 1
@@ -1820,8 +1708,6 @@ class Engine:
         has_followup_phrase = any(p and p in q.lower() for p in _get_followup_phrases())
         is_referential = bool(has_pronoun or has_followup_phrase)
 
-        # Explicit topic signals — bypass rewrite if query is long enough
-        # and contains clear entity signals (acronyms, quoted terms, or "about X")
         if word_count >= max_words and (
             re.search(r"\b[A-Z]{2,}\b", q) or
             re.search(r"\babout\s+\w+", q, re.IGNORECASE) or
@@ -1916,9 +1802,6 @@ class Engine:
             if k <= 0: k = total
             if fk <= 0: fk = total
         fk = max(fk, 2 * k)
-        # Use the configured mmr_lambda directly — the previous clamp to [0.3, 0.5]
-        # was suppressing the setting (default 0.6) and causing MMR to over-diversify,
-        # returning only 3-5 docs from a 152K collection.  Allow [0.3, 0.95].
         lm = max(0.3, min(0.95, float(lambda_mult if lambda_mult is not None else getattr(settings, "mmr_lambda", 0.6))))
 
         if query_embedding:
@@ -1928,10 +1811,6 @@ class Engine:
             if isinstance(vect_docs, list):
                 return vect_docs
 
-        # --- Fix G (revised): Catch HNSW index errors AND hangs ---
-        # ChromaDB can either raise RuntimeError on HNSW failures, or hang
-        # indefinitely in SQLite metadata hydration on large unfiltered queries.
-        # Wrap all retrieval calls with a timeout to prevent blocking.
         _retrieval_timeout = int(getattr(settings, "retrieval_timeout_s", 60))
 
         def _invoke_with_retrieval_timeout(retriever, q, timeout_s):
@@ -1959,11 +1838,6 @@ class Engine:
         search_kwargs = {"k": k, "fetch_k": fk, "lambda_mult": lm}
         if where_filter:
             search_kwargs["filter"] = where_filter
-            # --- Fix: When a metadata filter is active, try similarity search
-            # first.  Filtered queries typically return small result sets where
-            # MMR's fetch_k exceeds the available docs, triggering HNSW
-            # "contiguous 2D array" errors.  Similarity search is more robust
-            # for small filtered collections. ---
             try:
                 sim_kwargs = {"k": min(k, 30)}
                 sim_kwargs["filter"] = where_filter
@@ -1984,7 +1858,6 @@ class Engine:
                 raise
             logger.warning("HNSW error with filter=%s, falling back: %s", where_filter, e)
 
-        # Fallback 1: plain similarity search with filter, smaller k
         if where_filter:
             try:
                 fallback_kwargs = {"k": min(k, 20)}
@@ -1995,7 +1868,6 @@ class Engine:
             except RuntimeError:
                 logger.warning("HNSW fallback similarity+filter also failed")
 
-        # Fallback 2: MMR without filter
         try:
             plain_kwargs = {"k": k, "fetch_k": fk, "lambda_mult": lm}
             retriever = self.papers_vs.as_retriever(search_type="mmr", search_kwargs=plain_kwargs)
@@ -2079,10 +1951,6 @@ class Engine:
                        if not _is_generic_query_token(t))
         if not q_tokens:
             return unique
-        # For long/complex queries (>4 substantive tokens) the stripped token set is
-        # likely incomplete — dropping docs that miss even one token removes too many
-        # relevant results.  Instead, only hard-filter on short queries where token
-        # matching is reliable (e.g. a person name or single keyword).
         if len(q_tokens) > 4:
             return unique
         pruned = [d for d in unique if q_tokens & set(_tokenize_words(doc_haystack(d)))]
@@ -2098,22 +1966,12 @@ class Engine:
         docs = self._retrieve_once(q, query_embedding=query_embedding, search_k=search_k,
                                    fetch_k=fetch_k, lambda_mult=lambda_mult, where_filter=where_filter)
 
-        # --- Fix F (revised): Person-targeted supplemental retrieval ---
-        # When the resolved query contains a person name, run a supplemental
-        # metadata-filtered query.  Stop after the first variant that returns
-        # results — cascading through all variants wastes retrieval calls
-        # (e.g. "P. Systems", "P Systems" when no such person exists).
         if not where_filter:
             _person_in_query = _extract_person_name(q)
             if _person_in_query and len(_person_in_query) > 3 and _looks_like_person_candidate(_person_in_query):
                 _ptoks = [t for t in re.findall(r"[A-Za-z]+", str(_person_in_query).strip()) if t]
                 if len(_ptoks) >= 2:
-                    _first, _last = _ptoks[0], _ptoks[-1]
-                    _variants = [
-                        f"{_first} {_last}",
-                        f"{_first[0]}. {_last}",
-                    ]
-                    for _var in _variants:
+                    for _var in generate_name_variants(_ptoks):
                         _var = _var.strip()
                         if not _var:
                             continue
@@ -2123,7 +1981,7 @@ class Engine:
                             where_filter={"researcher": _var})
                         if _person_docs:
                             docs = self._merge_unique_docs(docs, _person_docs)
-                            break  # Found docs — no need to try more variants
+                            break
 
         is_followup = _query_is_short_or_pronoun(raw_question or q)
         anchor_value = str((self.anchor or {}).get("value", "") or "").strip()
@@ -2146,6 +2004,96 @@ class Engine:
 
         docs = self._post_filter_retrieved_docs(docs, query=q)
         return pack_docs(docs, budget_papers, self.answer_runtime.count_tokens) if budget_papers > 0 else docs
+
+    def retrieve_papers_by_author(self, query: str, person_name: str,
+                                  budget_papers: int, *,
+                                  query_embedding=None) -> List[Document]:
+        """Retrieve papers where *person_name* appears in the ``authors``
+        metadata field (co-author search) or in common ``researcher`` name
+        variants, using ChromaDB ``$or`` / ``$contains`` filters.
+
+        This fills the gap where Stage 1 exact-match on ``researcher`` fails
+        because the person is a co-author rather than the primary researcher.
+        """
+        toks = [t for t in re.findall(r"[A-Za-z]+", str(person_name or "").strip()) if t]
+        if len(toks) < 2:
+            return []
+        last = toks[-1]
+
+        or_clauses = [{"researcher": v} for v in generate_name_variants(toks)]
+        or_clauses.append({"authors": {"$contains": last}})
+        where_filter = {"$or": or_clauses}
+
+        q = _strip_corpus_noise_terms((query or "").strip()) or (query or "").strip()
+        if not q:
+            return []
+        self._log_retrieval_state(where_filter={"$or": f"[researcher variants + authors $contains {last}]"})
+        docs = self._retrieve_once(q, query_embedding=query_embedding,
+                                   where_filter=where_filter)
+        docs = self._post_filter_retrieved_docs(docs, query=q)
+        return pack_docs(docs, budget_papers, self.answer_runtime.count_tokens) if budget_papers > 0 else docs
+
+    def keyword_search_papers(self, keywords: List[str], budget: int,
+                              *, query_embedding=None) -> List[Document]:
+        """Search papers by keyword presence in the raw document text.
+
+        Uses ChromaDB's ``where_document`` ``$contains`` operator — a true
+        substring match on the stored chunk content.  When *query_embedding*
+        is provided the results are also ranked by vector similarity;
+        otherwise they are returned in ChromaDB's internal order.
+
+        Returns at most *budget* ``Document`` objects.
+        """
+        col = getattr(self.papers_vs, "_collection", None)
+        if col is None or not keywords:
+            return []
+
+        kws = list(dict.fromkeys(kw.strip() for kw in keywords if kw.strip()))
+        if not kws:
+            return []
+
+        budget = max(1, min(budget, 60))
+
+        try:
+            if query_embedding:
+                if len(kws) == 1:
+                    where_doc = {"$contains": kws[0]}
+                else:
+                    where_doc = {"$or": [{"$contains": kw} for kw in kws]}
+                raw = col.query(
+                    query_embeddings=[query_embedding],
+                    where_document=where_doc,
+                    n_results=budget,
+                    include=["documents", "metadatas"],
+                )
+                ids = (raw.get("ids") or [[]])[0]
+                documents = (raw.get("documents") or [[]])[0]
+                metadatas = (raw.get("metadatas") or [[]])[0]
+            else:
+                if len(kws) == 1:
+                    where_doc = {"$contains": kws[0]}
+                else:
+                    where_doc = {"$or": [{"$contains": kw} for kw in kws]}
+                raw = col.get(
+                    where_document=where_doc,
+                    limit=budget,
+                    include=["documents", "metadatas"],
+                )
+                ids = raw.get("ids") or []
+                documents = raw.get("documents") or []
+                metadatas = raw.get("metadatas") or []
+
+            docs: List[Document] = []
+            for i in range(len(ids)):
+                text = documents[i] if i < len(documents) else ""
+                meta = metadatas[i] if i < len(metadatas) else {}
+                docs.append(Document(page_content=text or "", metadata=meta or {}))
+            print(f"[RETRIEVE] keyword_search found {len(docs)} docs for keywords={kws}")
+            return docs
+
+        except Exception as e:
+            logger.warning("keyword_search_papers failed: %s", e, exc_info=True)
+            return []
 
     def retrieve_memory(self, query, budget_memory, *, query_embedding=None) -> List[Document]:
         docs = []
@@ -2174,16 +2122,47 @@ class Engine:
         referential = _is_followup_coref_question(q)
         anchor_escape = _is_anchor_escape_question(q)
 
+        # --- Fix: topic-pivot anchor handoff ---
+        # When an anchor-escape question ("who else studies it") fires with no
+        # active person anchor, inject the last known topic so the pronoun
+        # resolves to the subject of the preceding topic question.  This covers
+        # sequences like Q3("what is LIGO and Virgo?") → Q4("who else studies it")
+        # where the person anchor was cleared but the topic is still relevant.
+        #
+        # Guard: only inject topic when the question uses impersonal pronouns
+        # (it/this/that/those/these).  If the question uses person pronouns
+        # (he/she/him/her/they/them), the user is referring to a *person* and
+        # injecting a topic would produce a nonsensical query like
+        # "what else has LIGO published".  Those cases are handled downstream
+        # by the dangling-pronoun detector in the pipeline.
+        _person_pat = _get_person_pronoun_pattern()
+        _has_person_pronoun = bool(_person_pat and _person_pat.search(q))
+        _min_topic_chars = max(1, int(getattr(settings, "topic_inject_min_chars", 4)))
+        if (anchor_escape and not anchor_value
+                and self._user_turn_count() > 0
+                and not _has_person_pronoun):
+            _topic_for_inject = (self.last_topic or "").strip()
+            if not _topic_for_inject:
+                # Fall back: extract topic focus from the previous user turn
+                prev_user = self._last_user_turn_text()
+                if prev_user and _norm_text(prev_user) != _norm_text(q):
+                    _topic_for_inject = (_extract_focus_from_question(prev_user) or "").strip()
+            if not _topic_for_inject:
+                # Last resort: pull topic keywords from the rolling summary
+                _topic_for_inject = _extract_summary_topic_keywords(
+                    self.rolling_summary, max_chars=140).strip()
+            if _topic_for_inject and len(_topic_for_inject) > _min_topic_chars:
+                if not _anchor_in_text(_topic_for_inject, query_for_retrieval):
+                    query_for_retrieval = _inject_anchor_into_query(
+                        query_for_retrieval or q, _topic_for_inject).strip()
+                    _dbg("[REWRITE] anchor-escape topic inject",
+                         f"topic='{_topic_for_inject}' → query='{query_for_retrieval}'")
+        # --- end fix ---
+
         if referential and anchor_value and not anchor_escape and not _anchor_in_text(anchor_value, query_for_retrieval):
             query_for_retrieval = _inject_anchor_into_query(query_for_retrieval or q, anchor_value).strip()
 
         if referential and (not anchor_value or not _anchor_in_text(anchor_value, query_for_retrieval)):
-            # --- Fix: Guard against false-positive referential detection ---
-            # A query with 4+ substantive (non-generic) tokens is likely a new
-            # self-contained topic, not a follow-up — even if it contains a
-            # pronoun like "there" or "it" in a non-referential sense
-            # (e.g. "Is there any research on quantum computing at Syracuse?").
-            # Skip prior-turn context injection for such queries.
             _q_substantive_toks = [t for t in _tokenize_words(q)
                                    if len(t) >= 3 and not _is_generic_query_token(t)]
             _skip_prev_inject = len(_q_substantive_toks) >= 4
@@ -2191,17 +2170,12 @@ class Engine:
             if _skip_prev_inject:
                 query_for_retrieval = (query_for_retrieval or q).strip()
             else:
-                # --- Fix 10: Instead of blindly prepending the entire previous user
-                # query (which creates an unusable search string), extract only the
-                # meaningful entity/focus from the previous turn. ---
                 prev_user = self._last_user_turn_text()
                 if prev_user and _norm_text(prev_user) != _norm_text(q):
-                    # Try to extract just the person name or key entity from prev turn
                     prev_person = _extract_person_name(prev_user)
                     if prev_person and len(prev_person) > 3:
                         query_for_retrieval = _inject_anchor_into_query(q, prev_person).strip()
                     else:
-                        # Fall back to short focus extraction rather than full query concat
                         prev_focus = _extract_focus_from_question(prev_user)
                         if prev_focus and len(prev_focus) > 3:
                             query_for_retrieval = f"{q} {prev_focus}".strip()
@@ -2209,14 +2183,9 @@ class Engine:
                             query_for_retrieval = (query_for_retrieval or q).strip()
                 else:
                     query_for_retrieval = (query_for_retrieval or q).strip()
-            # --- Fix 5: Only inject summary keywords when there is a stable anchor
-            # and the keywords overlap with the anchor value.  Previously, summary
-            # keywords from prior turns (e.g. "alexander analyses") were blindly
-            # appended, dragging retrieval toward unrelated documents. ---
             if anchor_value:
                 topic_kw = _extract_summary_topic_keywords(self.rolling_summary, max_chars=140)
                 max_chars = max(64, int(getattr(settings, "rewrite_max_chars", 220)))
-                # Only inject if keywords have token overlap with the anchor
                 if topic_kw and _summary_keywords_overlap_anchor(topic_kw, anchor_value):
                     if _norm_text(topic_kw) not in _norm_text(query_for_retrieval):
                         trial = f"{query_for_retrieval} {topic_kw}".strip()
@@ -2226,8 +2195,6 @@ class Engine:
         if not query_for_retrieval:
             query_for_retrieval = q
 
-        # Augment implicit follow-ups with summary keywords — but ONLY when
-        # anchor is stable and keywords are relevant to the anchor.
         if (not self.last_rewrite_blocked and self._user_turn_count() > 0
             and not _has_explicit_entity_signal(q) and _query_is_short_or_pronoun(q)
             and self.rolling_summary and anchor_value):
@@ -2398,16 +2365,6 @@ class Engine:
                 and self.last_retrieval_confidence in {"medium", "high"}
                 and anchor_consistent and anchor_hq)
 
-        # --- Fix H: Preserve person-entity anchors through weak-confidence turns ---
-        # When answer_question() sets an anchor from explicit_entity_signal (Fix A),
-        # but retrieval confidence is "weak" (Fix C downgrades it because the first-pass
-        # had few name matches), the anchor gets reverted to empty by the else branch
-        # below.  This breaks follow-up questions like "Summarize his papers" because
-        # the anchor "Duncan Brown" is lost between turns.
-        #
-        # Fix: if the current anchor was set from an explicit entity signal during
-        # this turn AND the anchor has non-zero support in the retrieved docs,
-        # treat it as safe to persist even with weak confidence.
         anchor_source = str((self.anchor or {}).get("source", "") or "").strip().lower()
         person_anchor_set_this_turn = (
             anchor_source in {"explicit_entity_signal", "dominant_metadata:researcher"}
@@ -2425,8 +2382,6 @@ class Engine:
             anchor_to_save = _normalize_anchor(self.anchor)
             action_to_save = self.anchor_last_action
         elif person_anchor_set_this_turn:
-            # Person anchor is valid — persist it even though overall confidence is weak.
-            # Update focus to the person name so the rolling summary tracks them.
             if new_focus: self.last_focus = new_focus
             anchor_to_save = _normalize_anchor(self.anchor)
             action_to_save = self.anchor_last_action
@@ -2454,7 +2409,6 @@ class Engine:
             "rewrite_blocked": self.last_rewrite_blocked,
         }
 
-        # Persist state and optionally submit background utility job
         state = self.store.load(self.session_id)
         rolling = state.get("rolling_summary", "") or ""
         if summary_should_update:
@@ -2477,7 +2431,6 @@ class Engine:
                 turns_already_persisted=True, rolling_summary_snapshot=rolling))
             return
 
-        # Synchronous fallback for LLM summary regen
         if summary_should_update and llm_regen and self.utility_runtime is not None:
             rolling = _regenerate_rolling_summary(
                 llm=self.utility_runtime.llm, old_summary=rolling,
@@ -2505,8 +2458,6 @@ class Engine:
         papers_ctx = format_docs_compact(pap_docs, max_docs=max_docs, text_limit=text_limit)
         msgs = ANSWER_PROMPT.format_messages(papers=papers_ctx,
                                              question=context.rewritten_question.lower())
-        # Use structured separator so invoke() can reliably split system vs user
-        # content for chat-template formatting (Fix E).
         _sep = _DirectGenerationLLM.SYSTEM_USER_SEP
         full_prompt = _sep.join(m.content for m in msgs)
 
@@ -2535,11 +2486,6 @@ class Engine:
         self.finalize_turn(context, answer)
         return answer, context.paper_docs, []
 
-
-# ---------------------------------------------------------------------------
-# Engine manager
-# ---------------------------------------------------------------------------
-
 class EngineManager:
     def __init__(self) -> None:
         _ensure_dir(CACHE_DIR)
@@ -2563,7 +2509,7 @@ class EngineManager:
         self.active_answer_max_new_tokens = 0
         self.answer_generation_lock = threading.Lock()
         self.utility_worker: Optional[UtilityWorker] = None
-        self._utility_suppressed = False  # Set True when large answer model evicts utility
+        self._utility_suppressed = False
 
     def get_papers_vs(self, mode: str) -> Chroma:
         m = self.dbm.resolve_mode(mode)
@@ -2586,14 +2532,13 @@ class EngineManager:
         self.active_mode = resolved
         self.dbm.switch_config(resolved)
 
-    # Minimum VRAM headroom (MB) needed for the KV cache and generation.
     _VRAM_HEADROOM_MB = 2500
 
     def _vram_is_tight(self) -> bool:
         """Return True if free VRAM is below the headroom threshold."""
         vram_free = available_vram_mb()
         if vram_free <= 0:
-            return False  # Can't measure — assume OK
+            return False
         return vram_free < self._VRAM_HEADROOM_MB
 
     def _evict_utility_if_needed(self) -> None:
@@ -2611,9 +2556,6 @@ class EngineManager:
                 pass
             self.utility_runtime = None
             self.active_utility_model_key = ""
-            # Set suppression flag — prevents get_engine from reloading the
-            # utility model on the very next question, which was causing
-            # load→evict→load→evict thrashing (~20-30s wasted per question).
             self._utility_suppressed = True
             print("[VRAM] Evicted utility model to free VRAM for answer generation")
 
@@ -2635,14 +2577,10 @@ class EngineManager:
         q_bits = _quantize_bits(key)
         local_only = not _is_remote_model(key)
 
-        # For large answer models: evict utility BEFORE loading and suppress
-        # it for the lifetime of this answer model.
         if attr_name == "answer_runtime":
             if q_bits > 0:
                 self._evict_utility_if_needed()
             else:
-                # Switching to a small model — clear suppression so utility
-                # can load again when there's room.
                 self._utility_suppressed = False
 
         rt = ModelRuntime(_resolve_llm_path(key), max_new_tokens=max_new,
@@ -2653,7 +2591,6 @@ class EngineManager:
         if max_tokens_attr and desired_max is not None:
             setattr(self, max_tokens_attr, desired_max)
 
-        # After loading a large answer model, check VRAM and suppress if tight
         if attr_name == "answer_runtime" and self._vram_is_tight():
             self._evict_utility_if_needed()
 
@@ -2669,7 +2606,6 @@ class EngineManager:
         self._switch_runtime("utility_runtime", "active_utility_model_key", llm_model_key)
 
     def _ensure_utility_worker(self) -> None:
-        # Don't load utility if it was suppressed due to VRAM pressure
         if getattr(self, "_utility_suppressed", False):
             return
         if self._vram_is_tight():
@@ -2689,8 +2625,6 @@ class EngineManager:
         if self.answer_runtime is None:
             self.switch_answer_model(getattr(settings, "answer_model_key", "llama-3.2-3b"))
 
-        # Only load utility model if not suppressed (large answer model active)
-        # and VRAM has room.
         enable_bg = int(getattr(settings, "enable_utility_background", 1)) == 1
         suppressed = getattr(self, "_utility_suppressed", False)
         if enable_bg and not suppressed and not self._vram_is_tight():
@@ -2724,7 +2658,6 @@ class EngineManager:
             except Exception: pass
         except Exception:
             logger.error("Failed to clear memory vectors for session %s", session_id, exc_info=True)
-
 
 _GLOBAL_MANAGER: Optional[EngineManager] = None
 _GLOBAL_MANAGER_LOCK = threading.Lock()

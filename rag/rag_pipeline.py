@@ -1,3 +1,4 @@
+#rag_pipeline.py
 import json
 import logging
 import os
@@ -18,36 +19,23 @@ from rag_utils import (
     retrieval_confidence_label, classify_generic_intent, strip_prompt_leak,
     looks_like_person_candidate, strip_possessive, has_explicit_entity_signal,
     short_hash, utcnow_iso, query_tokens_for_relevance,
-    is_meta_command, anchor_query_overlap,
+    is_meta_command, anchor_query_overlap, get_person_pronoun_pattern,
+    tokenize_name, generate_name_variants, split_author_names,
 )
 from runtime_settings import settings
 from rag_graph import graph_retrieve_from_paper_docs
-from conversation_memory import (
-    get_cached_answer, set_cached_answer, get_pipeline_cache, set_pipeline_cache,
-)
-from cache_manager import (
-    build_cache_key as build_pipeline_cache_key,
-    state_signature_from_state, retrieval_cache_summary, should_cache_turn,
-    CACHE_KEY_VERSION as _CACHE_KEY_VERSION,
-)
  
 logger = logging.getLogger(__name__)
- 
  
 def _env_int(name: str, default: int) -> int:
     try: return int(str(os.getenv(name, str(default))).strip())
     except Exception: return int(default)
  
- 
 PIPELINE_CFG = {
-    "cache_version": os.getenv("RAG_CACHE_VERSION", _CACHE_KEY_VERSION),
     "max_docs_after_filter": _env_int("RAG_MAX_DOCS_AFTER_FILTER", 30),
     "fallback_max_items": _env_int("RAG_FALLBACK_MAX_ITEMS", 8),
     "recent_turns_in_prompt": _env_int("RAG_RECENT_TURNS_IN_PROMPT",
         int(getattr(settings, "recent_turns_in_prompt", 4))),
-    "qa_cache_enable": os.getenv("RAG_QA_CACHE_ENABLE",
-        "1" if bool(getattr(settings, "qa_cache_enable", False)) else "0"
-    ).strip().lower() in {"1", "true", "yes", "y", "on"},
     "empty_question_answer": os.getenv("RAG_EMPTY_QUESTION_ANSWER", "Please enter a question."),
     "llm_no_answer": os.getenv("RAG_LLM_NO_ANSWER",
         "I could not generate an answer from the retrieved context."),
@@ -83,12 +71,15 @@ PIPELINE_CFG = {
         "Detected intents: default, comparison, time_range, list.\n")),
     "prompt_mid": os.getenv("RAG_PROMPT_MID", "\n\nQUESTION:\n"),
     "prompt_suffix": os.getenv("RAG_PROMPT_SUFFIX", "\n\nRespond with the final user-facing answer only."),
+    "dangling_pronoun_answer": os.getenv("RAG_DANGLING_PRONOUN_ANSWER",
+        "I'm not sure who or what you're referring to — the conversation "
+        "has moved on and I've lost the thread of the earlier topic."
+        "{hint} Could you name the specific researcher or topic "
+        "you'd like me to look into?"),
+    "dangling_pronoun_hint": os.getenv("RAG_DANGLING_PRONOUN_HINT",
+        ' Your previous question was about "{prev_topic}", but the '
+        'conversational focus has shifted since then.'),
 }
- 
- 
-# ---------------------------------------------------------------------------
-# Intent helpers
-# ---------------------------------------------------------------------------
  
 _SUMMARY_INTENT_PATTERN = re.compile(
     r"\b(summarize|summarise|summary|summaries|abstract|overview|describe|"
@@ -99,11 +90,6 @@ _SUMMARY_INTENT_PATTERN = re.compile(
  
 def _is_summary_intent(question: str) -> bool:
     return bool(_SUMMARY_INTENT_PATTERN.search(question or ""))
-
-
-# ---------------------------------------------------------------------------
-# Meta-query detection & handling (corpus count, most recent paper, etc.)
-# ---------------------------------------------------------------------------
 
 _META_QUERY_CORPUS_COUNT = re.compile(
     r"\b(how many|number of|count of|total)\b.{0,40}\b(papers?|documents?|records?|articles?|corpus|entries|items)\b",
@@ -118,7 +104,6 @@ _META_QUERY_OLDEST = re.compile(
     re.IGNORECASE,
 )
 
-
 def _detect_meta_query(question: str) -> str:
     """Classify whether the question is a meta-query about the database itself.
     Returns: 'corpus_count', 'most_recent', 'oldest', or '' (not a meta-query)."""
@@ -132,7 +117,6 @@ def _detect_meta_query(question: str) -> str:
     if _META_QUERY_OLDEST.search(q):
         return "oldest"
     return ""
-
 
 def _answer_meta_query(meta_type: str, mgr, effective_mode: str) -> Optional[str]:
     """Answer database meta-queries directly from ChromaDB metadata, bypassing LLM."""
@@ -155,10 +139,8 @@ def _answer_meta_query(meta_type: str, mgr, effective_mode: str) -> Optional[str
             return None
 
     if meta_type in ("most_recent", "oldest"):
-        # Query ChromaDB for papers sorted by year
         ascending = (meta_type == "oldest")
         try:
-            # Retrieve a sample and find extreme years from metadata
             sample = col.get(limit=min(2000, col.count()),
                              include=["metadatas"])
             if not sample or not sample.get("metadatas"):
@@ -182,7 +164,6 @@ def _answer_meta_query(meta_type: str, mgr, effective_mode: str) -> Optional[str
                 return None
             years_papers.sort(key=lambda x: x[0], reverse=(not ascending))
             target_year = years_papers[0][0]
-            # Collect all papers from the target year
             target_papers = [(t, r) for y, t, r in years_papers if y == target_year]
             direction = "oldest" if ascending else "most recent"
             lines = [f"The {direction} papers in the database are from {target_year}:"]
@@ -199,24 +180,16 @@ def _answer_meta_query(meta_type: str, mgr, effective_mode: str) -> Optional[str
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# Comparison query: multi-entity detection
-# ---------------------------------------------------------------------------
-
 def _extract_comparison_entities(question: str) -> List[str]:
     """Extract multiple person names from a comparison query like
     'Compare the research areas of Duncan Brown and Alexander Nitz'."""
     q = (question or "").strip()
     if not q:
         return []
-    # Split on 'and', 'vs', 'versus', 'compared to', 'with'
     splitters = re.compile(
         r"\b(?:and|vs\.?|versus|compared\s+(?:to|with)|with)\b", re.IGNORECASE)
-    # First extract person-name candidates from the full question
     from rag_engine import _extract_person_name
     people = []
-    # Try splitting the question by conjunctions and extracting from each part
     parts = splitters.split(q)
     for part in parts:
         name = strip_possessive(_extract_person_name(part.strip()) or "")
@@ -225,11 +198,6 @@ def _extract_comparison_entities(question: str) -> List[str]:
                 people.append(name)
     return people
 
-
-# ---------------------------------------------------------------------------
-# Document helpers
-# ---------------------------------------------------------------------------
- 
 def _doc_to_source_md(d) -> str:
     meta = d.metadata or {}
     authors = re.sub(r"</?[a-zA-Z][^>]*>", "", str(meta.get("authors", "") or "")).strip()
@@ -250,7 +218,6 @@ def _doc_to_source_md(d) -> str:
         if doi.startswith("http"): parts.append(doi)
     return " ".join(parts)
  
- 
 def _doc_to_ref(d) -> Dict[str, str]:
     meta = getattr(d, "metadata", {}) or {}
     return {
@@ -258,7 +225,6 @@ def _doc_to_ref(d) -> Dict[str, str]:
         "chunk": str(meta.get("chunk", meta.get("chunk_id", meta.get("id", "")))),
         "title": str(meta.get("title", "")),
     }
- 
  
 def _filter_noisy_docs(docs, question: str, *, person_name="",
                        anchor_value="", anchor_confidence=0.0,
@@ -276,9 +242,6 @@ def _filter_noisy_docs(docs, question: str, *, person_name="",
     a_sig = max(0.0, min(1.0, float(anchor_confidence)))
     w_t = float(getattr(settings, "rerank_w_token", 1.0))
     w_p = float(getattr(settings, "rerank_w_person", 3.0))
-    # When the query is a summary/describe intent targeting a person, boost
-    # person-match weight so the person's docs aren't outranked by docs that
-    # happen to match generic action words ("mechanisms", "described", etc.)
     if summary_intent and person_name:
         w_p = max(w_p, 5.0)
     w_a = float(getattr(settings, "rerank_w_anchor", 2.0))
@@ -302,10 +265,8 @@ def _filter_noisy_docs(docs, question: str, *, person_name="",
     kept = [d for d, _ in scored[:limit]]
     return kept if kept else deduped[:limit]
  
- 
 def _normalize_meta_value(value) -> str:
     return norm_text(str(value or ""))
- 
  
 def _metadata_key_allowed(key: str) -> bool:
     k = (key or "").strip().lower()
@@ -313,13 +274,11 @@ def _metadata_key_allowed(key: str) -> bool:
         return False
     return not (k.endswith("_id") and k != "paper_id")
  
- 
 def _metadata_value_allowed(value: str) -> bool:
     v = _normalize_meta_value(value)
     if not v or len(v) < 3 or is_placeholder_anchor_value(v):
         return False
     return not (re.fullmatch(r"[0-9\W]+", v) or re.fullmatch(r"(19|20)\d{2}", v))
- 
  
 def _iter_doc_metadata_key_values(d) -> List[Tuple[str, str, str]]:
     meta = getattr(d, "metadata", {}) or {}
@@ -334,30 +293,29 @@ def _iter_doc_metadata_key_values(d) -> List[Tuple[str, str, str]]:
             out.append((k, v, raw_text))
     return out
  
- 
-def _split_author_names(raw_authors: str) -> List[str]:
-    if not raw_authors:
-        return []
-    return [n for p in re.split(r"\s*[;,]\s*|\s+and\s+", raw_authors)
-            if (n := re.sub(r"\s+", " ", p.strip())) and len(n) >= 2]
- 
- 
 def _person_name_signatures(name: str) -> Dict[str, str]:
-    toks = [t for t in re.findall(r"[A-Za-z]+", str(name or "").strip()) if t]
+    toks = tokenize_name(name)
     if len(toks) < 2:
         return {}
     first, last = toks[0], toks[-1]
-    return {
+    sig: Dict[str, str] = {
         "first": first.lower(),
         "last": last.lower(),
         "last_name": last,
-        "full_name": f"{first} {last}",
-        "initial_last_dot": f"{first[0]}. {last}",
-        "initial_last_plain": f"{first[0]} {last}",
+        "variants": generate_name_variants(toks),
     }
- 
- 
+    middles = toks[1:-1]
+    if middles:
+        sig["middle_tokens"] = [m.lower() for m in middles]
+    return sig
+
 def _name_match_strength(text: str, sig: Dict[str, str]) -> int:
+    """Score how well *text* matches the person described by *sig*.
+
+    Returns 3 (full/first-name match), 2 (initial match), 1 (last-name
+    only), or 0 (no match).  Middle names are handled dynamically via a
+    regex gap that allows any number of middle tokens / initials.
+    """
     if not text or not sig:
         return 0
     first = str(sig.get("first", "") or "").strip()
@@ -368,17 +326,30 @@ def _name_match_strength(text: str, sig: Dict[str, str]) -> int:
     hay = re.sub(r"\s+", " ", hay).strip()
     if not hay:
         return 0
-    if (re.search(rf"\b{re.escape(first)}\s+{re.escape(last)}\b", hay)
-        or re.search(rf"\b{re.escape(last)}\s+{re.escape(first)}\b", hay)):
+
+    _MID_GAP = r"(?:\s+[a-z]\.?\s*)*\s+"
+
+    if (re.search(rf"\b{re.escape(first)}{_MID_GAP}{re.escape(last)}\b", hay)
+        or re.search(rf"\b{re.escape(last)}{_MID_GAP}{re.escape(first)}\b", hay)):
         return 3
-    if (re.search(rf"\b{re.escape(first[0])}\.?\s+{re.escape(last)}\b", hay)
-        or re.search(rf"\b{re.escape(last)}\s+{re.escape(first[0])}\.?\b", hay)):
+    fi = first[0]
+    for v in (sig.get("variants") or []):
+        vl = v.lower()
+        if vl.startswith(first) and vl in hay:
+            return 3
+
+    if (re.search(rf"\b{re.escape(fi)}\.?{_MID_GAP}{re.escape(last)}\b", hay)
+        or re.search(rf"\b{re.escape(last)}{_MID_GAP}{re.escape(fi)}\.?\b", hay)):
         return 2
+    for v in (sig.get("variants") or []):
+        vl = v.lower()
+        if vl.startswith(fi) and not vl.startswith(first) and vl in hay:
+            return 2
+
     if re.search(rf"\b{re.escape(last)}\b", hay):
         return 1
     return 0
- 
- 
+
 def _doc_person_match_score(d, person_name: str) -> float:
     sig = _person_name_signatures(person_name)
     if not sig:
@@ -388,11 +359,16 @@ def _doc_person_match_score(d, person_name: str) -> float:
     authors_text = str(meta.get("authors", "") or "")
     researcher_strength = _name_match_strength(researcher_text, sig)
     author_strength = 0
-    for author in _split_author_names(authors_text):
+    for author in split_author_names(authors_text):
         author_strength = max(author_strength, _name_match_strength(author, sig))
     if author_strength == 0 and authors_text:
         author_strength = _name_match_strength(authors_text, sig)
- 
+
+    content_strength = 0
+    page_content = str(getattr(d, "page_content", "") or "")
+    if page_content:
+        content_strength = _name_match_strength(page_content[:2000], sig)
+
     if researcher_strength >= 3:
         return 4.0
     if author_strength >= 3:
@@ -401,12 +377,17 @@ def _doc_person_match_score(d, person_name: str) -> float:
         return 2.0
     if author_strength == 2:
         return 1.5
+    if content_strength >= 3:
+        return 1.2
+    if content_strength == 2:
+        return 1.0
     if researcher_strength == 1:
         return 0.3
     if author_strength == 1:
         return 0.2
+    if content_strength == 1:
+        return 0.15
     return 0.0
- 
  
 def _rank_docs_for_person(docs, person_name: str) -> List[Tuple[Any, float]]:
     ranked: List[Tuple[Any, float]] = []
@@ -423,12 +404,8 @@ def _rank_docs_for_person(docs, person_name: str) -> List[Tuple[Any, float]]:
     ranked.sort(key=_sort_key)
     return ranked
  
- 
 def _select_docs_for_person(ranked_docs: List[Tuple[Any, float]], *,
                             max_docs: int) -> Tuple[List[Any], Dict[str, int]]:
-    # Score 2.0 = initial + last-name match on researcher field (e.g. "D. Brown"
-    # matching "Duncan Brown").  This is strong evidence in academic metadata
-    # where initial-format names are the norm.
     strong_docs = [d for d, score in ranked_docs if score >= 2.0]
     matched_docs = [d for d, score in ranked_docs if score >= 1.0]
     weak_docs = [d for d, score in ranked_docs if score < 1.0]
@@ -453,9 +430,7 @@ def _select_docs_for_person(ranked_docs: List[Tuple[Any, float]], *,
         "total": len(ranked_docs),
     }
  
- 
 _CONFIDENCE_ORDER = ("weak", "low", "medium", "high")
- 
  
 def _downgrade_confidence(label: str, *, steps: int = 1) -> str:
     key = str(label or "").strip().lower()
@@ -463,7 +438,6 @@ def _downgrade_confidence(label: str, *, steps: int = 1) -> str:
         return key or "weak"
     idx = _CONFIDENCE_ORDER.index(key)
     return _CONFIDENCE_ORDER[max(0, idx - max(1, int(steps)))]
- 
  
 def _downshift_confidence_for_person_support(label: str, *,
                                              strong_count: int, matched_count: int,
@@ -477,16 +451,9 @@ def _downshift_confidence_for_person_support(label: str, *,
     strong_ratio = float(strong_count) / max(1, int(total_count))
     matched_ratio = float(matched_count) / max(1, int(total_count))
 
-    # --- Fix: Use absolute counts alongside ratios for confidence decisions.
-    # After targeted retrieval we may have 8 matching docs in a pool of 30,
-    # giving matched_ratio=0.27 which used to trigger a downgrade even though
-    # 8 docs is strong absolute evidence.  Treat matched_count >= 4 as
-    # sufficient evidence regardless of ratio. ---
     has_strong_absolute = matched_count >= 4
     has_some_strong = strong_count >= 2
 
-    # Only downgrade when evidence is genuinely weak — not when names are
-    # stored in initial format (D. Brown) which gives score 2.0 = strong.
     if out == "high" and not has_strong_absolute and (strong_ratio < 0.3 or matched_ratio < 0.5):
         out = "medium"
     if out in {"high", "medium"} and not has_some_strong and strong_ratio < 0.1 and matched_ratio < 0.3:
@@ -494,7 +461,6 @@ def _downshift_confidence_for_person_support(label: str, *,
     if out in {"medium", "low"} and matched_count < 2 and matched_ratio < 0.15:
         out = _downgrade_confidence(out, steps=1)
     return out
- 
  
 def _dominant_metadata_filter_from_docs(docs, question: str, *,
                                         majority_ratio: float = 0.6, min_count: int = 3) -> Dict[str, Any]:
@@ -512,7 +478,7 @@ def _dominant_metadata_filter_from_docs(docs, question: str, *,
         seen_pairs: set = set()
         for key, norm_val, raw_val in _iter_doc_metadata_key_values(d):
             if key.lower() == "authors":
-                for name in _split_author_names(raw_val):
+                for name in split_author_names(raw_val):
                     nv = _normalize_meta_value(name)
                     if not _metadata_value_allowed(name):
                         continue
@@ -532,9 +498,6 @@ def _dominant_metadata_filter_from_docs(docs, question: str, *,
  
     def _sort_key(item):
         (k, nv), cnt = item
-        # Only 'researcher' is a reliable key for second-pass filtering.
-        # 'title' dominant hits are almost always corpus noise ("Untitled") or
-        # coincidental shared titles — never use title as a filter pivot.
         ALLOWED_FILTER_KEYS = {"researcher"}
         return (-cnt,
                 0 if k.lower() in ALLOWED_FILTER_KEYS else 2,
@@ -567,18 +530,12 @@ def _dominant_metadata_filter_from_docs(docs, question: str, *,
         result["filter"] = {"key": result["key"], "value": result["value"]}
     return result
  
- 
-# ---------------------------------------------------------------------------
-# Answer helpers
-# ---------------------------------------------------------------------------
- 
 def _insufficient_context_answer(question: str, intent: str) -> str:
     q = re.sub(r"\s+", " ", (question or "").strip())
     if q:
         return (f'I couldn\'t find enough matching evidence for "{q}" in the retrieved papers. '
                 "Please clarify the entity, topic, or time range you want.")
     return "I couldn't find enough matching evidence. Please clarify the entity or topic you want."
- 
  
 def _uncertain_retrieval_answer(question: str, *, anchor_value: str = "", reason: str = "") -> str:
     q = re.sub(r"\s+", " ", (question or "").strip())
@@ -590,11 +547,6 @@ def _uncertain_retrieval_answer(question: str, *, anchor_value: str = "", reason
         return (f'I\'m not confident there is enough consistent evidence yet for "{q}". '
                 "Please add a specific entity, paper title, or year so I can answer accurately.")
     return "I'm not confident there is enough consistent evidence yet. Please add a specific entity, paper title, or year."
- 
- 
-# ---------------------------------------------------------------------------
-# Answer sanitization
-# ---------------------------------------------------------------------------
  
 _BLOCKED_MARKERS = (
     "detected intent:", "retrieval count:", "pipeline_json", "chroma_retrieval",
@@ -628,10 +580,6 @@ _BOILERPLATE_PHRASES = (
     "let me know if you would like me to proceed",
     "i can help with the next question",
     "i'm here to assist you", "i'm here to help you", "best regards",
-    # --- Fix B: Prompt-leak patterns ---
-    # Some models echo system prompt instructions into user-facing answers
-    # when chat template delimiters are missing or misapplied.  These patterns
-    # catch the most common leaked instruction fragments.
     "remove any extraneous text",
     "leave any intermediate reasoning out",
     "leave out any extraneous text",
@@ -652,10 +600,8 @@ _BOILERPLATE_PHRASES = (
 _SELF_REF_TERMS = ("reformatted", "required response format", "response format",
                     "answer format", "the answer has been", "this answer has been")
  
- 
 def _normalize_for_similarity(text: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", re.sub(r"\s+", " ", str(text or "").strip().lower()))
- 
  
 def _strip_leading_answer_labels(text: str) -> str:
     cleaned = str(text or "").strip()
@@ -667,12 +613,8 @@ def _strip_leading_answer_labels(text: str) -> str:
         cleaned = updated
     return cleaned
  
- 
 def _is_closure_or_process(text: str) -> bool:
     lower = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    # Only catch internal debug/pipeline notes — NOT legitimate answer text.
-    # "context" alone is too broad (kills "Note: in this context, the findings...")
-    # so we use more specific pipeline terms.
     if lower.startswith("note:") and any(t in lower for t in (
         "pipeline_json", "retrieval_count", "chroma_retrieval",
         "prompt_max_docs", "prompt_doc_text_limit",
@@ -704,7 +646,6 @@ def _is_closure_or_process(text: str) -> bool:
         "i noticed that the response contains some extraneous",
         "to only include information present in the retrieved",
     ))
- 
  
 def _sanitize_user_answer(text: str) -> str:
     raw = str(text or "").strip()
@@ -738,9 +679,7 @@ def _sanitize_user_answer(text: str) -> str:
         seen_norms.append(norm)
         result.append(para)
  
-    # Post-processing pipeline
     text_out = "\n\n".join(result).strip()
-    # Dedupe repeated sentences
     if text_out:
         kept_sents, last_norms = [], []
         for p in re.split(r"(?<=[.!?])\s+", text_out):
@@ -753,24 +692,20 @@ def _sanitize_user_answer(text: str) -> str:
             kept_sents.append(sent)
             last_norms = (last_norms + [n])[-6:]
         text_out = " ".join(kept_sents).strip()
-    # Remove closure sentences
     if text_out:
         parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text_out) if p.strip()]
         text_out = " ".join(p for p in parts if not _is_closure_or_process(p)).strip()
-    # Trim incomplete tail
     if text_out and not re.search(r'[.!?"\')\\]]\s*$', text_out):
         parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text_out) if p.strip()]
         if len(parts) > 1:
             tail = parts[-1]
             if not re.match(r"^[-*]|\d+\.", tail) and len(re.findall(r"[A-Za-z0-9]+", tail)) <= 14:
                 text_out = " ".join(parts[:-1]).strip() or text_out
-    # Strip self-referential notes
     if text_out:
         text_out = "\n".join(ln for ln in text_out.splitlines()
                              if not (ln.strip().lower().startswith("note:")
                                      and any(t in ln.strip().lower() for t in _SELF_REF_TERMS))).strip()
     return text_out or _strip_leading_answer_labels(cleaned) or cleaned
- 
  
 def sanitize_answer_for_display(text: str) -> str:
     cleaned = _sanitize_user_answer(text)
@@ -805,11 +740,6 @@ def sanitize_answer_for_display(text: str) -> str:
         paragraphs.append(" ".join(current))
     return re.sub(r"\n{3,}", "\n\n", "\n\n".join(paragraphs)).strip()
  
- 
-# ---------------------------------------------------------------------------
-# Anchor management
-# ---------------------------------------------------------------------------
- 
 def _build_anchor_from_dominance(dominance) -> Dict[str, Any]:
     if not dominance.get("dominant"):
         return {}
@@ -823,16 +753,11 @@ def _build_anchor_from_dominance(dominance) -> Dict[str, Any]:
     return {"type": key, "value": value, "source": f"dominant_metadata:{key}",
             "confidence": max(0.0, min(1.0, confidence))}
  
- 
 def _choose_anchor_update(*, current_anchor, candidate_anchor, dominance, question,
                           resolved_question=""):
     anchor_now = normalize_anchor(current_anchor)
     candidate = normalize_anchor(candidate_anchor)
  
-    # Fix #7: If there's no new candidate and the current anchor has zero
-    # token overlap with the query, clear it instead of keeping stale context.
-    # BUT: if the query contains pronouns/follow-up phrases ("he", "his",
-    # "tell me more"), keep the anchor — the user is referring to it.
     if anchor_now and not candidate:
         anchor_value = str(anchor_now.get("value", "") or "").strip()
         if anchor_value and not anchor_query_overlap(anchor_value, question):
@@ -844,18 +769,12 @@ def _choose_anchor_update(*, current_anchor, candidate_anchor, dominance, questi
     if not candidate:
         return {}, "none"
     if not anchor_now:
-        # --- Fix: Before accepting a brand-new anchor from dominance, verify
-        # it has overlap with either the raw or resolved question.  This prevents
-        # e.g. Samuel Johnson becoming the anchor when the user asked about
-        # Duncan Brown and the resolved query says "Duncan Brown". ---
         candidate_value = str(candidate.get("value", "") or "").strip()
         if candidate_value:
             has_raw_overlap = anchor_query_overlap(candidate_value, question)
             has_resolved_overlap = (bool(resolved_question)
                                     and anchor_query_overlap(candidate_value, resolved_question))
             if not has_raw_overlap and not has_resolved_overlap:
-                # The candidate has no overlap with what the user asked about —
-                # it came from noisy retrieval results.  Don't set it.
                 return {}, "blocked_no_query_overlap"
         return candidate, "set_from_dominance"
  
@@ -867,17 +786,12 @@ def _choose_anchor_update(*, current_anchor, candidate_anchor, dominance, questi
         anchor_now["source"] = candidate.get("source", anchor_now.get("source", "retrieval"))
         return anchor_now, "kept_reinforced"
  
-    # --- Fix 4 (revised): Before replacing, verify the new candidate has token
-    # overlap with the raw OR resolved user query.  A high-confidence anchor on
-    # unrelated docs (e.g. Samuel Johnson when user asked about Duncan Brown)
-    # must NOT silently replace the current anchor. ---
     candidate_value = str(candidate.get("value", "") or "").strip()
     if candidate_value:
         has_raw_overlap = anchor_query_overlap(candidate_value, question)
         has_resolved_overlap = (bool(resolved_question)
                                 and anchor_query_overlap(candidate_value, resolved_question))
         if not has_raw_overlap and not has_resolved_overlap:
-            # The candidate anchor has zero overlap with what the user actually asked.
             if is_followup_coref_question(question):
                 return anchor_now, "kept_candidate_no_query_overlap"
             return anchor_now, "kept_candidate_no_query_overlap"
@@ -891,11 +805,6 @@ def _choose_anchor_update(*, current_anchor, candidate_anchor, dominance, questi
         return candidate, "replaced_with_strong_evidence"
     return anchor_now, "kept_ambiguous_switch_requires_confirmation"
  
- 
-# ---------------------------------------------------------------------------
-# Prompt assembly
-# ---------------------------------------------------------------------------
- 
 def _extract_answer_text(raw_answer) -> str:
     raw_text = str(raw_answer or "")
     answer_text = strip_prompt_leak(raw_text).strip()
@@ -908,7 +817,6 @@ def _extract_answer_text(raw_answer) -> str:
                 return cand
     return raw_text.strip()
  
- 
 def _runtime_prompt_token_budget(runtime, reserved_new_tokens: int) -> int:
     if runtime is None:
         return 0
@@ -919,22 +827,15 @@ def _runtime_prompt_token_budget(runtime, reserved_new_tokens: int) -> int:
             try: max_ctx = int(getattr(source, "max_position_embeddings", 0) or
                                getattr(source, "model_max_length", 0) or 0)
             except Exception: pass
-    # Cap unrealistically large values (e.g. tokenizer reports 1M) but don't
-    # floor small-context models at 4096 — 8B models have 8192, 12B/14B have
-    # 32768+.  Use 8192 as the conservative fallback instead of 4096 so the
-    # full retrieved context fits without _fit_prompt_to_budget over-shrinking.
     if max_ctx <= 0 or max_ctx > 131072:
         max_ctx = 8192
     return max(256, max_ctx - max(64, int(reserved_new_tokens) + 24))
  
- 
 def _compose_answer_prompt(*, base_sections, style_hint, question_for_answer, context_blob):
-    # System content: behavioral instructions, style policy, recent turns, memory
     system_parts = list(base_sections)
     system_parts.append("ANSWER POLICY:\n" + style_hint)
     system_content = "\n\n".join(system_parts)
 
-    # User content: retrieved papers + question
     user_parts = []
     ctx = (context_blob or "").strip()
     if ctx:
@@ -943,16 +844,12 @@ def _compose_answer_prompt(*, base_sections, style_hint, question_for_answer, co
                       + (question_for_answer or "") + PIPELINE_CFG["prompt_suffix"])
     user_content = "\n\n".join(user_parts)
 
-    # Join with structured separator so invoke() can split system vs user
-    # for chat-template formatting (Fix E).  Import here to avoid circular
-    # import at module level.
     try:
         from rag_engine import _DirectGenerationLLM
         sep = _DirectGenerationLLM.SYSTEM_USER_SEP
     except ImportError:
         sep = "\n\n"
     return system_content + sep + user_content
- 
  
 def _fit_prompt_to_budget(*, runtime, docs, base_sections, style_hint,
                           question_for_answer, max_docs, text_limit,
@@ -973,9 +870,6 @@ def _fit_prompt_to_budget(*, runtime, docs, base_sections, style_hint,
         question_for_answer=question_for_answer,
         context_blob=build_compact_context(docs, max_docs=docs_cap, text_limit=text_cap))
  
-    # Phase 1: Shrink text_limit first (preserves doc count which is more
-    # important for answer quality than per-doc verbosity).
-    # Phase 2: Then alternate shrinking docs and text.
     phase = 1
     for _ in range(36):
         if budget <= 0 or runtime is None:
@@ -988,13 +882,11 @@ def _fit_prompt_to_budget(*, runtime, docs, base_sections, style_hint,
  
         prev = (docs_cap, text_cap)
         if phase == 1:
-            # Phase 1: only shrink text until we hit the floor
             if text_cap > min_text_limit:
                 text_cap = max(min_text_limit, text_cap - max(20, text_cap // 6))
             else:
-                phase = 2  # switch to alternating
+                phase = 2
         if phase == 2:
-            # Phase 2: alternate between shrinking docs and text
             if docs_cap > min_docs and text_cap <= min_text_limit:
                 docs_cap = max(min_docs, docs_cap - max(1, docs_cap // 5))
             elif text_cap > min_text_limit:
@@ -1016,7 +908,6 @@ def _fit_prompt_to_budget(*, runtime, docs, base_sections, style_hint,
             context_blob=build_compact_context(docs, max_docs=docs_cap, text_limit=text_cap))
     return prompt, docs_cap, text_cap
  
- 
 def _clip_sentences(text: str, *, max_sentences: int = 2, max_chars: int = 320) -> str:
     compact = re.sub(r"\s+", " ", str(text or "").strip())
     if not compact:
@@ -1025,7 +916,6 @@ def _clip_sentences(text: str, *, max_sentences: int = 2, max_chars: int = 320) 
     if parts:
         compact = " ".join(parts[:max(1, max_sentences)]).strip()
     return compact[:max_chars].rstrip() + "..." if len(compact) > max_chars else compact
- 
  
 def _clean_assistant_turn_for_prompt(text: str) -> str:
     blocked = ("summary:", "no further analysis is required", "no additional retrieval is required",
@@ -1037,7 +927,6 @@ def _clean_assistant_turn_for_prompt(text: str) -> str:
             if not any(b in re.sub(r"\s+", " ", line or "").strip().lower() for b in blocked)]
     return _clip_sentences(_strip_leading_answer_labels(" ".join(kept).strip()),
                            max_sentences=2, max_chars=360)
- 
  
 def _rolling_summary_for_prompt(summary_text: str) -> str:
     raw = str(summary_text or "").strip()
@@ -1081,7 +970,6 @@ def _rolling_summary_for_prompt(summary_text: str) -> str:
             lines.append(f"{key}: {' | '.join(vals)}")
     return "\n".join(lines).strip()
  
- 
 def _build_recent_turns_context(state, max_turns: int) -> str:
     turns = list(state.get("recent_turns") or state.get("turns", []) or [])
     if max_turns <= 0 or not turns:
@@ -1097,7 +985,6 @@ def _build_recent_turns_context(state, max_turns: int) -> str:
         if text:
             rows.append(f"{'User' if role == 'user' else 'Assistant'}: {text}")
     return "\n".join(rows).strip()
- 
  
 def _fallback_answer_from_docs(question: str, docs, intent: str = "default") -> Optional[str]:
     if not docs:
@@ -1131,14 +1018,12 @@ def _fallback_answer_from_docs(question: str, docs, intent: str = "default") -> 
         lines.append("Most relevant papers: " + "; ".join(works) + ".")
     return " ".join(lines).strip() if len(lines) > 1 else None
  
- 
 def _clean_title_for_answer(title: str) -> str:
     text = re.sub(r"</?[a-zA-Z][^>]*>", "", str(title or "")).strip()
     text = re.sub(r"\s+", " ", text)
     if not text or text.lower() == "untitled":
         return ""
     return normalize_title_case(text)
- 
  
 def _supported_researcher_evidence(docs, *, max_researchers: int = 6,
                                    max_titles_per_researcher: int = 3) -> List[Tuple[str, Dict[str, Any]]]:
@@ -1162,7 +1047,6 @@ def _supported_researcher_evidence(docs, *, max_researchers: int = 6,
         }))
     return out
  
- 
 def _extract_person_like_spans(text: str, *, max_items: int = 24) -> List[str]:
     raw = str(text or "")
     if not raw:
@@ -1183,13 +1067,11 @@ def _extract_person_like_spans(text: str, *, max_items: int = 24) -> List[str]:
             break
     return out
  
- 
 def _answer_mentions_unsupported_researcher(answer: str, docs) -> bool:
     answer_people = _extract_person_like_spans(answer)
     if not answer_people:
         return False
  
-    # Collect signatures from doc metadata (both directions)
     doc_sigs: List[Dict[str, str]] = []
     doc_names: List[str] = []
     seen_names = set()
@@ -1200,7 +1082,7 @@ def _answer_mentions_unsupported_researcher(answer: str, docs) -> bool:
         if researcher:
             candidates.append(researcher)
         authors = str(meta.get("authors", "") or "")
-        candidates.extend(_split_author_names(authors))
+        candidates.extend(split_author_names(authors))
         for candidate in candidates:
             person = re.sub(r"\s+", " ", str(candidate or "").strip())
             if not person or not looks_like_person_candidate(person):
@@ -1218,24 +1100,16 @@ def _answer_mentions_unsupported_researcher(answer: str, docs) -> bool:
         return False
  
     for person in answer_people:
-        # Standard check: answer person against doc sigs
         if any(_name_match_strength(person, sig) >= 2 for sig in doc_sigs):
             continue
-        # Reverse check: doc names against answer person's sig.
-        # This catches "Duncan Brown" (answer) vs "D. Brown" (doc):
-        # _name_match_strength("D. Brown", sig_for_Duncan_Brown) gives 2
-        # because D matches first initial of Duncan.
         answer_sig = _person_name_signatures(person)
         if answer_sig and any(_name_match_strength(doc_name, answer_sig) >= 2 for doc_name in doc_names):
             continue
-        # Last-name-only fallback: if both share the same last name,
-        # don't flag as unsupported (common in academic metadata).
         person_last = (answer_sig.get("last", "") or "").lower() if answer_sig else ""
         if person_last and any((sig.get("last", "") or "").lower() == person_last for sig in doc_sigs):
             continue
         return True
     return False
- 
  
 def _build_researcher_extract_answer(docs, *, max_researchers: int = 5) -> Optional[str]:
     evidence = _supported_researcher_evidence(docs, max_researchers=max_researchers,
@@ -1254,7 +1128,6 @@ def _build_researcher_extract_answer(docs, *, max_researchers: int = 5) -> Optio
             paragraphs.append(f"{name}: supported by {count} retrieved paper(s).")
     return "\n\n".join(paragraphs).strip()
  
- 
 def _collect_doc_titles(docs) -> set:
     """Collect normalized titles from retrieved documents for validation."""
     titles = set()
@@ -1265,7 +1138,6 @@ def _collect_doc_titles(docs) -> set:
         if raw_title and raw_title.lower() not in {"untitled", "unknown", "n/a"}:
             titles.add(raw_title.lower())
     return titles
- 
  
 def _strip_hallucinated_citations(answer: str, docs) -> str:
     """Remove lines containing fabricated paper titles not found in retrieved
@@ -1280,9 +1152,6 @@ def _strip_hallucinated_citations(answer: str, docs) -> str:
     if not doc_titles:
         return answer
  
-    # Only match quoted strings long enough to be paper titles (30+ chars).
-    # The old 15-char threshold caught short quoted phrases like "body size"
-    # or "deep learning" that are legitimate answer content, not citations.
     quoted_pattern = re.compile(r'"([^"]{30,200})"')
     citation_pattern = re.compile(
         r'[A-Z][a-z]+(?:\s+et\s+al\.?)?,?\s*["\u201c]([^"\u201d]{30,200})["\u201d]')
@@ -1301,9 +1170,6 @@ def _strip_hallucinated_citations(answer: str, docs) -> str:
                     if cited_title in doc_title or doc_title in cited_title:
                         matched = True
                         break
-                    # Raise threshold from 0.6 to 0.5 — some models abbreviate
-                    # or rephrase titles slightly.  0.5 still catches outright
-                    # fabrications while being more tolerant of formatting diffs.
                     ratio = SequenceMatcher(None, cited_title, doc_title).ratio()
                     if ratio >= 0.5:
                         matched = True
@@ -1320,32 +1186,38 @@ def _strip_hallucinated_citations(answer: str, docs) -> str:
     result = "\n".join(cleaned_lines).strip()
     return result if result else answer
  
- 
-# ---------------------------------------------------------------------------
-# Person retrieval: metadata filter → fulltext vector fallback
-# ---------------------------------------------------------------------------
-
 def _retrieve_for_person(
     eng, person_name: str, retrieval_q: str, budget_papers: int,
     query_embedding, raw_question: str,
     *, pa_val: str = "", pa_conf: float = 0.0, summary_intent: bool = False,
     existing_docs=None,
 ) -> tuple:
-    """Two-stage retrieval for a named person.
+    """Multi-stage retrieval for a named person.
 
-    Stage 1 — metadata filter on the ``researcher`` field.
-        Tries the full name exactly as extracted.  No hardcoded variants.
-
-    Stage 2 — fulltext / vector fallback (fires only when Stage 1 finds nothing).
-        Runs an unfiltered vector search then post-filters by name presence
-        in the document haystack using _doc_person_match_score (handles
-        initials, last-name-only, varied formats).
+    Stage 1  — exact metadata filter on the ``researcher`` field.
+    Stage 1b — co-author / variant search: ``$or`` across researcher name
+               variants **and** ``$contains`` on the ``authors`` field so
+               that collaborators (not just PIs) are discoverable.
+    Stage 2  — hybrid vector + keyword fallback.
+               2a) Name-targeted vector search: uses the **person's name**
+                   as the query (not the full question) so the embedding
+                   matches chunks that mention the person rather than
+                   biographical boilerplate.
+               2b) Keyword / document-content search: uses ChromaDB's
+                   ``where_document $contains`` to find any chunk whose
+                   raw text includes the person's last name — a BM25-like
+                   substring match that catches co-author mentions the
+                   vector model might miss.
+               Results from 2a and 2b are merged and post-filtered by
+               ``_doc_person_match_score``.
 
     Returns (docs, stage, person_support)
-        stage: 1=metadata hit, 2=fulltext fallback, 0=not found
+        stage: 1=metadata hit, 2=fulltext/hybrid fallback, 0=not found
     """
     existing = list(existing_docs or [])
-    name_parts = [p.lower() for p in person_name.split() if len(p) > 2]
+    name_toks = [t for t in re.findall(r"[A-Za-z]+", str(person_name or "")) if t]
+    name_parts = [p.lower() for p in name_toks if len(p) > 2]
+    last_name = name_toks[-1] if name_toks else ""
 
     def _noisy_filter(docs):
         return _filter_noisy_docs(
@@ -1363,9 +1235,6 @@ def _retrieve_for_person(
             max_docs=min(max(6, budget_papers or 12), 12),
         )
 
-    # ------------------------------------------------------------------
-    # Stage 1: single metadata filter using the name as-is
-    # ------------------------------------------------------------------
     stage1_docs = eng.retrieve_papers(
         retrieval_q, budget_papers,
         query_embedding=None,
@@ -1381,57 +1250,88 @@ def _retrieve_for_person(
             print(f"[RETRIEVE] Stage1 metadata hit for '{person_name}': {matched_count} matched")
             return selected, 1, support
 
-    # ------------------------------------------------------------------
-    # Stage 2: unfiltered vector search + name-presence post-filter
-    # ------------------------------------------------------------------
-    if bool(getattr(settings, "fulltext_fallback_enable", True)):
-        print(f"[RETRIEVE] Stage1 miss for '{person_name}' — falling back to fulltext vector search")
-        all_docs = eng.retrieve_papers(
+    if hasattr(eng, "retrieve_papers_by_author") and len(name_toks) >= 2:
+        print(f"[RETRIEVE] Stage1 miss — trying co-author search for '{person_name}'")
+        stage1b_docs = eng.retrieve_papers_by_author(
+            retrieval_q, person_name, budget_papers,
+            query_embedding=query_embedding,
+        )
+        if stage1b_docs:
+            filtered = _noisy_filter(stage1b_docs)
+            merged = dedupe_docs(existing + filtered)
+            selected, support = _rank_and_select(merged)
+            if support["matched"] > 0:
+                matched_count = support["matched"]
+                print(f"[RETRIEVE] Stage1b co-author hit for '{person_name}': "
+                      f"{matched_count} matched from {len(stage1b_docs)} docs")
+                return selected, 1, support
+
+    if not bool(getattr(settings, "fulltext_fallback_enable", True)):
+        return list(existing), 0, {"strong": 0, "matched": 0, "total": 0}
+
+    print(f"[RETRIEVE] Stage1/1b miss for '{person_name}' — falling back to hybrid search")
+
+    name_query = person_name
+    vector_docs = eng.retrieve_papers(
+        name_query, budget_papers,
+        query_embedding=query_embedding,
+        where_filter=None,
+        raw_question=raw_question,
+    )
+
+    if retrieval_q.lower().strip() != name_query.lower().strip():
+        topic_docs = eng.retrieve_papers(
             retrieval_q, budget_papers,
             query_embedding=query_embedding,
             where_filter=None,
             raw_question=raw_question,
         )
-        # Post-filter: keep only docs where the person's name appears
-        # in the full haystack.  Use _doc_person_match_score for richer
-        # matching (handles initials, last-name-only, etc.).
+        vector_docs = dedupe_docs(vector_docs + topic_docs)
+
+    keyword_docs = []
+    if hasattr(eng, "keyword_search_papers") and last_name and len(last_name) > 2:
+        kw_variants = generate_name_variants(name_toks)
+        if last_name.lower() not in {v.lower() for v in kw_variants}:
+            kw_variants.append(last_name)
+        for kw in kw_variants:
+            keyword_docs = eng.keyword_search_papers(
+                [kw], budget_papers,
+                query_embedding=query_embedding,
+            )
+            if keyword_docs:
+                break
+
+    all_docs = dedupe_docs(vector_docs + keyword_docs)
+
+    name_matched = [
+        d for d in all_docs
+        if _doc_person_match_score(d, person_name) >= 1.0
+    ]
+    if not name_matched:
         name_matched = [
             d for d in all_docs
-            if _doc_person_match_score(d, person_name) >= 1.0
+            if any(part in doc_haystack(d) for part in name_parts)
         ]
-        # Substring fallback for unusual formats
-        if not name_matched:
-            name_matched = [
-                d for d in all_docs
-                if any(part in doc_haystack(d) for part in name_parts)
-            ]
-        if name_matched:
-            filtered = _noisy_filter(name_matched)
-            merged = dedupe_docs(existing + filtered)
-            selected, support = _rank_and_select(merged)
-            if support["matched"] > 0:
-                matched_count = support["matched"]
-                print(f"[RETRIEVE] Stage2 fulltext hit for '{person_name}': "
-                      f"{matched_count} matched from {len(name_matched)} name-filtered docs")
-                return selected, 2, support
+    if name_matched:
+        filtered = _noisy_filter(name_matched)
+        merged = dedupe_docs(existing + filtered)
+        selected, support = _rank_and_select(merged)
+        if support["matched"] > 0:
+            matched_count = support["matched"]
+            print(f"[RETRIEVE] Stage2 hybrid hit for '{person_name}': "
+                  f"{matched_count} matched from {len(name_matched)} name-filtered docs "
+                  f"(vector={len(vector_docs)}, keyword={len(keyword_docs)})")
+            return selected, 2, support
 
-        # Stage 2 found nothing name-matched — return unfiltered vector docs
-        # so the LLM can at least attempt an answer, but signal weak confidence.
-        if all_docs:
-            merged = dedupe_docs(existing + _noisy_filter(all_docs))
-            selected, support = _rank_and_select(merged)
-            print(f"[RETRIEVE] Stage2 no name match for '{person_name}' — "
-                  f"returning {len(selected)} unfiltered vector docs (conf=weak)")
-            return selected, 2, {"strong": 0, "matched": 0, "total": len(selected)}
+    if all_docs:
+        merged = dedupe_docs(existing + _noisy_filter(all_docs))
+        selected, support = _rank_and_select(merged)
+        print(f"[RETRIEVE] Stage2 no name match for '{person_name}' — "
+              f"returning {len(selected)} unfiltered vector docs (conf=weak)")
+        return selected, 2, {"strong": 0, "matched": 0, "total": len(selected)}
 
-    # Nothing found at all
     return list(existing), 0, {"strong": 0, "matched": 0, "total": 0}
 
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
- 
 def answer_question(question: str, user_key: str,
                     use_graph: Optional[bool] = None, stateless: Optional[bool] = None) -> Dict[str, Any]:
     q = (question or "").strip()
@@ -1439,7 +1339,6 @@ def answer_question(question: str, user_key: str,
         return {"answer": PIPELINE_CFG["empty_question_answer"],
                 "sources": [], "graph_hits": [], "graph_graph": {}, "graph_error": ""}
  
-    # Fix #4: Intercept meta-commands before any retrieval or generation
     if is_meta_command(q):
         mgr = get_global_manager()
         stateless_flag = bool(stateless) if stateless is not None else bool(getattr(settings, "stateless_default", False))
@@ -1467,21 +1366,16 @@ def answer_question(question: str, user_key: str,
  
     stateless = bool(stateless) if stateless is not None else bool(getattr(settings, "stateless_default", False))
     use_graph_flag = settings.use_graph if use_graph is None else bool(use_graph)
-    previous_pipeline = get_pipeline_cache(user_key)
     mgr = get_global_manager()
     requested_mode = str(getattr(settings, "active_mode", "") or "").strip()
     effective_mode = mgr.dbm.resolve_mode(requested_mode)
     answer_model_key = str(getattr(settings, "answer_model_key", "") or settings.llm_model)
 
-    # --- Fix: Intercept meta-queries about the database itself ---
-    # Questions like "how many papers" or "most recent paper" can be answered
-    # directly from ChromaDB metadata without LLM generation.
     meta_query_type = _detect_meta_query(q)
     if meta_query_type:
         mgr.switch_mode(effective_mode)
         meta_answer = _answer_meta_query(meta_query_type, mgr, effective_mode)
         if meta_answer:
-            # Persist the turn in session state
             if not stateless:
                 try:
                     state = mgr.store.load(user_key)
@@ -1499,14 +1393,6 @@ def answer_question(question: str, user_key: str,
                     "llm_calls": {"answer_llm_calls": 0, "utility_llm_calls": 0}}
  
     pre_state = {"rolling_summary": "", "turns": []} if stateless else mgr.store.load(user_key)
-    cache_state_sig = state_signature_from_state(pre_state if isinstance(pre_state, dict) else {})
-    cache_key = build_pipeline_cache_key(user_key=user_key, resolved_text=q,
-                                         effective_mode=effective_mode, state_signature=cache_state_sig)
-    if (not stateless) and PIPELINE_CFG["qa_cache_enable"]:
-        cached = get_cached_answer(user_key, cache_key)
-        if isinstance(cached, dict):
-            return cached
- 
     mgr.switch_mode(effective_mode)
     mgr.switch_answer_model(answer_model_key)
  
@@ -1533,17 +1419,12 @@ def answer_question(question: str, user_key: str,
         retrieval_q = resolved_q or q
         raw_retrieval_count = len(paper_docs_raw)
 
-        # Compute query embedding once here so _retrieve_for_person Stage 2
-        # can use it for fulltext vector fallback without re-embedding.
         query_embedding = eng._embed_query_vector(
             strip_corpus_noise_terms(retrieval_q) or retrieval_q
         ) if retrieval_q.strip() else None
  
         _early_person = strip_possessive(_extract_person_name(q) or "")
         if not (_early_person and len(_early_person) > 3 and looks_like_person_candidate(_early_person)):
-            # --- Fix D: For follow-up queries, the raw question may be "what does
-            # he study" with no person name.  The resolved query (after rewrite)
-            # may be "what does William Gearty study".  Check both. ---
             if resolved_q and resolved_q != q:
                 _early_person = strip_possessive(_extract_person_name(resolved_q) or "")
                 if not (_early_person and len(_early_person) > 3 and looks_like_person_candidate(_early_person)):
@@ -1551,16 +1432,9 @@ def answer_question(question: str, user_key: str,
             else:
                 _early_person = ""
 
-        # --- Fix M: Summary-intent + person → focus retrieval on the person ---
-        # When the user says "Summarize the mechanisms described in his papers",
-        # the resolved query becomes "Summarize the mechanisms described in D.
-        # Brown papers".  Vector search then gets dominated by "mechanisms" and
-        # "described" — generic words that match thousands of unrelated papers.
-        # Strip the action verbs and keep only the person name + key nouns.
         if summary_intent and _early_person:
             _person_toks = set(tokenize_words(_early_person))
             _q_toks = tokenize_words(retrieval_q)
-            # Keep person-name tokens and non-generic content tokens
             _kept = [t for t in _q_toks
                      if t in _person_toks or (len(t) >= 4 and not is_generic_query_token(t))]
             _focused = " ".join(_kept).strip()
@@ -1584,11 +1458,6 @@ def answer_question(question: str, user_key: str,
         dom_ratio = float(dominance.get("ratio", 0) or 0)
         replace_conf = float(getattr(settings, "dominant_replace_confidence", 0.82))
         maj_ratio = float(getattr(settings, "dominant_majority_ratio", 0.6))
-        # --- Bug 6 fix: Relax dom_usable gate.  The previous strong_floor was
-        # too high (0.84) and sometimes blocked targeted second-pass retrieval
-        # even when dominance was clearly established.  Now: if the dominance
-        # detector already confirmed dominant=True (ratio >= majority_ratio AND
-        # confidence >= conf_floor), that's sufficient for a second-pass query. ---
         dom_usable = (bool(dominance.get("dominant")) and bool(dominant_filter)
                       and not is_placeholder_anchor_value(str(dominant_filter.get("value", "") or "")))
  
@@ -1598,22 +1467,44 @@ def answer_question(question: str, user_key: str,
         explicit_person_name = ""
         person_support = {"strong": 0, "matched": 0, "total": 0}
 
-        # --- Fix: Anchor-based follow-up retrieval ---
-        # When the query is a coreference follow-up ("his papers", "what does
-        # she study", "tell me more about that") and we have a stable anchor
-        # from a prior turn, run targeted where_filter retrieval using the
-        # anchor value.  Without this, follow-ups drift to unrelated docs
-        # because the vector query lacks the person's name.
         _is_coref_followup = is_followup_coref_question(q)
         _anchor_is_researcher = (
             _pa_val
             and _pa_conf >= float(getattr(settings, "anchor_stable_confidence", 0.72))
             and str((_pre_anc or {}).get("type", "")).strip().lower() == "researcher"
         )
+
+        # --- Fix: detect unresolvable person-pronoun references ---
+        # If the question uses person pronouns (he/she/him/her/they/them) but
+        # we have no active researcher anchor, no person detected in the raw or
+        # rewritten query, and the rewrite didn't inject any substantive entity,
+        # the pronoun can't be resolved.  Flag it so we return a clarification
+        # message rather than a thin answer from generic retrieval.
+        #
+        # Only person pronouns trigger this — impersonal pronouns (it/this/that)
+        # referring to topics often work fine with broad retrieval.  Questions
+        # like "tell me more about that" retrieve topically even without explicit
+        # resolution, but "what else has he published" is truly unresolvable.
+        _person_pat = get_person_pronoun_pattern()
+        _dangling_pronoun = False
+        if (_is_coref_followup and not _anchor_is_researcher and not _early_person
+                and _person_pat and _person_pat.search(q)):
+            # Check whether the rewrite actually resolved the pronoun by
+            # comparing substantive tokens between raw and resolved queries.
+            _min_injected = max(1, int(getattr(settings, "dangling_pronoun_min_injected", 2)))
+            _min_raw = max(1, int(getattr(settings, "dangling_pronoun_min_raw_substantive", 2)))
+            _raw_subst = {t for t in tokenize_words(q)
+                          if len(t) >= 4 and not is_generic_query_token(t)}
+            _res_subst = {t for t in tokenize_words(resolved_q or q)
+                          if len(t) >= 4 and not is_generic_query_token(t)}
+            _injected = _res_subst - _raw_subst
+            if len(_injected) < _min_injected and len(_raw_subst) < _min_raw:
+                # Neither the raw query nor the rewrite has enough substance
+                # to anchor the retrieval — this is a dangling person pronoun.
+                _dangling_pronoun = True
+        # --- end fix ---
+
         if _is_coref_followup and _anchor_is_researcher and not _early_person:
-            # The user is referring to a previously-discussed researcher via
-            # pronouns.  Use _retrieve_for_person so Stage2 fulltext fallback
-            # fires automatically if the metadata filter finds nothing.
             _anchor_docs, _, _ = _retrieve_for_person(
                 eng, _pa_val, retrieval_q, budget_papers,
                 query_embedding, q,
@@ -1637,10 +1528,6 @@ def answer_question(question: str, user_key: str,
             dom_second_count = len(second)
             paper_docs = dedupe_docs(paper_docs + second)
  
-        # --- Fix A: Person-entity targeted retrieval ---
-        # Detect person name from the raw question OR the resolved question
-        # (which may have been rewritten from a follow-up like "what does he study"
-        # -> "what does William Gearty study").
         _person_from_q = strip_possessive(_extract_person_name(q) or "")
         if not (_person_from_q and len(_person_from_q) > 3 and looks_like_person_candidate(_person_from_q)):
             _person_from_q = ""
@@ -1656,10 +1543,6 @@ def answer_question(question: str, user_key: str,
             person_name = _detected_person
             explicit_person_name = person_name
 
-            # Two-stage retrieval: metadata filter first, fulltext vector
-            # fallback automatically if Stage 1 finds nothing.
-            # No hardcoded name variants — _retrieve_for_person handles any
-            # storage format via the fulltext fallback.
             selected_docs, _retrieval_stage, person_support = _retrieve_for_person(
                 eng, person_name, retrieval_q, budget_papers,
                 query_embedding, q,
@@ -1671,12 +1554,9 @@ def answer_question(question: str, user_key: str,
             if person_support["matched"] > 0:
                 paper_docs = dedupe_docs(selected_docs)
             else:
-                # Not found via any path — clear so hallucination guard
-                # does not over-correct on unrelated docs.
                 explicit_person_name = ""
                 person_support = {"strong": 0, "matched": 0, "total": 0}
 
-            # Re-compute dominance after person-aware reranking.
             dominance = _dominant_metadata_filter_from_docs(
                 paper_docs, resolved_q or q,
                 majority_ratio=float(getattr(settings, "dominant_majority_ratio", 0.6)),
@@ -1686,12 +1566,6 @@ def answer_question(question: str, user_key: str,
         post_filter_count = len(paper_docs)
         mem_docs = context.mem_docs or []
 
-        # --- Fix: Multi-entity comparison retrieval ---
-        # When a comparison query names multiple people (e.g. "Compare Duncan
-        # Brown and Alexander Nitz"), run targeted retrieval for each named
-        # person separately.  This must run even when dom_usable is True
-        # (dominance found one person) because the other person still needs
-        # targeted retrieval.
         _comparison_ran = False
         if detected_intent == "comparison":
             comparison_people = _extract_comparison_entities(q)
@@ -1713,7 +1587,6 @@ def answer_question(question: str, user_key: str,
                     paper_docs = dedupe_docs(all_comparison_docs)
                     post_filter_count = len(paper_docs)
                     _comparison_ran = True
-                    # Re-compute dominance after comparison merge
                     dominance = _dominant_metadata_filter_from_docs(
                         paper_docs, resolved_q or q,
                         majority_ratio=float(getattr(settings, "dominant_majority_ratio", 0.6)),
@@ -1738,9 +1611,6 @@ def answer_question(question: str, user_key: str,
                 "confidence": explicit_conf,
             }
  
-        # If dominance didn't produce an anchor candidate but we have a named
-        # person in the query, build an anchor from that so follow-up pronouns
-        # ("his", "her") resolve correctly.
         if not candidate_anchor and not dom_usable:
             person_name = strip_possessive(_extract_person_name(q) or "")
             if person_name and len(person_name) > 3 and looks_like_person_candidate(person_name):
@@ -1756,9 +1626,6 @@ def answer_question(question: str, user_key: str,
             current_anchor=anchor_before, candidate_anchor=candidate_anchor,
             dominance=dominance, question=q, resolved_question=resolved_q)
  
-        # Clear anchor when the new query has zero keyword overlap with the
-        # anchor value — catches topic shifts like going from "William Gearty"
-        # to "neurological injury" without explicit shift phrases.
         if anchor_after and anchor_after.get("value"):
             anchor_val = str(anchor_after.get("value", "") or "").strip()
             if anchor_val and not anchor_in_text(anchor_val, q):
@@ -1776,12 +1643,6 @@ def answer_question(question: str, user_key: str,
         anchor_value = str(anchor_after.get("value", "") or "").strip()
         anc_ratio = anchor_support_ratio(anchor_value, paper_docs) if anchor_value else 1.0
  
-        # If the anchor is present but almost entirely absent from the retrieved docs
-        # (ratio < 0.15) and this is not a follow-up coref question, the anchor is
-        # stale — clear it now so retrieval_confidence isn't dragged to "inconsistent".
-        # Exception: if dominance already confirmed the anchor via a targeted second pass
-        # (dom_second_count > 0) or the query is a summary/follow-up of the anchor entity,
-        # keep it even with a low first-pass ratio.
         anchor_confirmed_by_dominance = (
             dom_second_count > 0
             and anchor_value
@@ -1812,7 +1673,6 @@ def answer_question(question: str, user_key: str,
         eng.last_retrieval_confidence = retrieval_confidence
         eng.last_anchor_support_ratio = float(anc_ratio)
  
-        # Diversity downgrade: many different researchers in a person query = noisy
         if _early_person and post_filter_count > 0:
             _rs = {norm_text(str((getattr(d, "metadata", {}) or {}).get("researcher", "")))
                    for d in paper_docs} - {"", "unknown", "n/a"}
@@ -1820,10 +1680,6 @@ def answer_question(question: str, user_key: str,
                 retrieval_confidence = _downgrade_confidence(retrieval_confidence, steps=1)
                 eng.last_retrieval_confidence = retrieval_confidence
 
-        # --- Precompute retrieval-success guard flags ---
-        # These flags are used by both Fix C (confidence downgrade) and the
-        # person-not-found early exit to avoid false negatives when the person
-        # was actually found via dominance, anchor follow-up, or comparison.
         _dom_found_person = (
             dom_usable
             and str(dominant_filter.get("key", "")).lower() == "researcher"
@@ -1834,14 +1690,6 @@ def answer_question(question: str, user_key: str,
             and dom_second_count > 0
         )
 
-        # --- Fix C (revised): Person-miss confidence downgrade ---
-        # When the user asks "who is X" and we have docs but NONE match X's name,
-        # the retrieval is effectively a miss even if doc_count is high.
-        # Downgrade confidence to "weak" so the hallucination guard activates
-        # instead of letting the LLM fabricate an identity from unrelated docs.
-        # BUT: skip this when dominance already found the person as a researcher
-        # (dom_usable=True with researcher key), or when the anchor-based
-        # follow-up retrieval successfully found matching docs.
         if (_detected_person and post_filter_count > 0
                 and explicit_person_name == ""
                 and person_support["matched"] == 0
@@ -1851,29 +1699,20 @@ def answer_question(question: str, user_key: str,
             retrieval_confidence = "weak"
             eng.last_retrieval_confidence = retrieval_confidence
  
-        # Continuous confidence → prompt budget scaling
         _cf = {"high": 1.0, "medium": 0.85, "low": 0.65, "weak": 0.45, "inconsistent": 0.4
                }.get(retrieval_confidence, 0.7)
 
-        # Model-agnostic doc cap: scale prompt_max_docs by the model's actual
-        # token budget relative to a reference budget.  Small models (3B with
-        # 8K context) get fewer docs; large models (14B with 32K) get more.
-        # This replaces hardcoded per-model caps with a continuous scale.
         _runtime = getattr(mgr, "answer_runtime", None)
         _token_budget = _runtime_prompt_token_budget(
             _runtime, int(getattr(settings, "answer_max_new_tokens", 384)))
-        _REFERENCE_BUDGET = 16000  # tokens — a generous mid-range model
+        _REFERENCE_BUDGET = 16000
         _budget_ratio = min(1.0, max(0.25, _token_budget / _REFERENCE_BUDGET)) if _token_budget > 0 else 0.5
         _base_max_docs = int(getattr(settings, "prompt_max_docs", 24))
         prompt_max_docs = max(2, int(_base_max_docs * _cf * _budget_ratio))
         prompt_text_limit = max(160, int(int(getattr(settings, "prompt_doc_text_limit", 800)) * _cf))
  
-        # Prompt assembly
         rolling_summary_text = pre_state.get("rolling_summary", "") or ""
         pre_turns_count = len(pre_state.get("turns", []) or [])
-        # Only include recent turns context when the topic is continuous.
-        # When the anchor was cleared due to a topic shift, recent turns from a different
-        # topic will cause the LLM to hallucinate or open with the wrong subject.
         topic_shifted = anchor_action in {
             "cleared_no_query_overlap", "cleared_low_support_ratio",
         } or (anchor_action == "none" and not anchor_before and not anchor_after)
@@ -1882,9 +1721,6 @@ def answer_question(question: str, user_key: str,
             recent_turns_ctx = _build_recent_turns_context(
                 pre_state, max_turns=min(6, max(2, int(PIPELINE_CFG["recent_turns_in_prompt"]))))
  
-        # Retrieved context goes first so the LLM grounds on actual paper data.
-        # Rolling summary is NOT included — the LLM should answer from docs only,
-        # not from conversation history that can leak stale/wrong researcher names.
         prompt_base = [PIPELINE_CFG["prompt_prefix"].rstrip()]
         if recent_turns_ctx:
             prompt_base.append("RECENT TURNS (for coreference only, not evidence):\n" + recent_turns_ctx)
@@ -1930,11 +1766,6 @@ def answer_question(question: str, user_key: str,
                 "Do not use outside knowledge. Do not fabricate facts."
             )
 
-        # --- Fix I: Disambiguation hint for person queries ---
-        # When the retrieved docs for a named person span very different topic
-        # clusters, this may indicate a name collision (e.g. two "Duncan Brown"
-        # researchers at the same university).  Add a prompt hint so the LLM
-        # notes the topic diversity rather than blending them into one identity.
         if _detected_person and explicit_person_name and paper_docs:
             _topics_set = set()
             for _d in paper_docs:
@@ -1943,7 +1774,6 @@ def answer_question(question: str, user_key: str,
                     _tv = str(_m.get(_tk, "") or "").strip().lower()
                     if _tv and len(_tv) > 3 and _tv not in {"unknown", "n/a", "other"}:
                         _topics_set.add(_tv)
-            # Also check if paper titles span very different domains
             _title_words = {}
             for _d in paper_docs[:12]:
                 _m = getattr(_d, "metadata", {}) or {}
@@ -1951,8 +1781,6 @@ def answer_question(question: str, user_key: str,
                 for _w in re.findall(r"[a-z]{5,}", _t):
                     if not is_generic_query_token(_w):
                         _title_words[_w] = _title_words.get(_w, 0) + 1
-            # If top title keywords are very diverse (low max frequency),
-            # the papers may belong to different people with the same name.
             _max_freq = max(_title_words.values()) if _title_words else 0
             _n_unique = len([w for w, c in _title_words.items() if c >= 2])
             if len(_topics_set) > 2 or (_max_freq <= 2 and _n_unique <= 1 and len(paper_docs) > 4):
@@ -1964,7 +1792,6 @@ def answer_question(question: str, user_key: str,
                     "Do not blend unrelated research areas into a single description."
                 )
  
-        # Balance researcher coverage so one person doesn't fill entire context
         _by_r = {}
         for _d in paper_docs:
             _by_r.setdefault(norm_text(str((getattr(_d, "metadata", {}) or {}).get("researcher", ""))) or "_", []).append(_d)
@@ -1980,16 +1807,6 @@ def answer_question(question: str, user_key: str,
             question_for_answer=question_for_answer,
             max_docs=prompt_max_docs, text_limit=prompt_text_limit)
  
-        # Answer generation
-        # --- Fix: Clear person-not-found answer ---
-        # When user asks "who is X" and all targeted retrieval paths found
-        # zero matching docs for X, give a direct not-found answer instead of
-        # sending unrelated vector-search results to the LLM (which hallucinates).
-        # IMPORTANT: Do NOT trigger when the dominance detector already found the
-        # person (dom_usable=True sets anchor_action to "set_from_dominance"),
-        # or when the anchor-based follow-up retrieval found docs, or when the
-        # comparison path ran successfully.
-        # (_dom_found_person, _anchor_followup_found defined earlier before Fix C)
         _person_not_found = (
             _detected_person
             and not explicit_person_name
@@ -1999,7 +1816,26 @@ def answer_question(question: str, user_key: str,
             and person_support.get("matched", 0) == 0
             and retrieval_confidence == "weak"
         )
-        if not paper_docs or _person_not_found:
+
+        # --- Fix: produce a clarification message for dangling pronouns ---
+        # If we flagged this question as having an unresolvable pronoun
+        # reference, return a helpful clarification prompt instead of
+        # running the LLM on generic / irrelevant retrieval results.
+        if _dangling_pronoun and not explicit_person_name and not _dom_found_person:
+            _prev_user = prev_user_text or ""
+            _hint = ""
+            if _prev_user:
+                _prev_topic = _extract_person_name(_prev_user) or ""
+                if not _prev_topic:
+                    _hint_max = max(10, int(getattr(settings, "dangling_pronoun_hint_max_chars", 60)))
+                    _prev_topic = collapse_whitespace(_prev_user)[:_hint_max].rstrip()
+                if _prev_topic:
+                    try:
+                        _hint = PIPELINE_CFG["dangling_pronoun_hint"].format(prev_topic=_prev_topic)
+                    except (KeyError, IndexError):
+                        _hint = ""
+            answer_text = PIPELINE_CFG["dangling_pronoun_answer"].format(hint=_hint)
+        elif not paper_docs or _person_not_found:
             if _person_not_found and _detected_person:
                 answer_text = (
                     f'I could not find any papers by "{_detected_person}" in the '
@@ -2011,12 +1847,8 @@ def answer_question(question: str, user_key: str,
             else:
                 answer_text = _insufficient_context_answer(q, detected_intent)
         else:
-            # LLM call
             prompt_for_call = prompt
  
-            # Guard against hallucination: when retrieval is weak/low AND the
-            # anchor was cleared (topic shift), inject a strict constraint to
-            # prevent fabricating connections to previous conversation topics.
             low_evidence_guard = (
                 retrieval_confidence in {"weak", "low"}
                 and anchor_action in {"cleared_no_query_overlap", "cleared_weak_retrieval", "none"}
@@ -2026,8 +1858,6 @@ def answer_question(question: str, user_key: str,
             if retrieval_confidence == "inconsistent" or low_evidence_guard:
                 base_no_summary = [s for s in prompt_base if not s.startswith("ROLLING SUMMARY")]
                 if retrieval_confidence == "inconsistent":
-                    # For inconsistent retrievals, use a strict guard that prevents
-                    # the LLM from drawing on prior conversation topics or outside knowledge.
                     inconsistent_guard_style = (
                         "CRITICAL: The retrieved evidence is inconsistent — the papers do not "
                         "all match the current question. "
@@ -2074,7 +1904,6 @@ def answer_question(question: str, user_key: str,
             generation_time_ms = (time.perf_counter() - t0_gen) * 1000.0
             answer_text = _extract_answer_text(raw_answer)
  
-            # Debug: log raw vs extracted to diagnose answer-stripping issues
             if getattr(settings, "debug_rag", False):
                 _raw_len = len(raw_answer or "")
                 _ext_len = len(answer_text or "")
@@ -2085,12 +1914,6 @@ def answer_question(question: str, user_key: str,
                 elif _raw_len > 0 and _ext_len < 24:
                     print(f"[ANSWER_DEBUG] SHORT_ANSWER: {answer_text!r}")
  
-            # Only retry if we got a genuine empty response — NOT a timeout.
-            # When the first call times out the LLM thread is still running on
-            # the GPU; submitting a second call to the single-worker executor
-            # just queues it behind the zombie first call, burning another full
-            # timeout_s before returning empty again.  Skip the retry entirely
-            # in that case and let the fallback answer fire instead.
             _timeout_s = int(getattr(settings, "llm_timeout_s", 40))
             _timed_out = generation_time_ms >= (_timeout_s * 1000 * 0.95)
             if not answer_text and not _timed_out:
@@ -2126,19 +1949,10 @@ def answer_question(question: str, user_key: str,
             researcher_evidence = _supported_researcher_evidence(paper_docs)
             explicit_person_query = bool(strip_possessive(_extract_person_name(q) or ""))
  
-            # --- Bug 5 fix: Strip fabricated citations before grounding checks.
-            # The 3B model sometimes invents plausible-looking paper titles, DOIs,
-            # and journal references that don't exist in retrieved docs.  Remove
-            # sentences containing such fabricated citations. ---
             answer_text = _strip_hallucinated_citations(answer_text, paper_docs)
  
-            # Grounding check: only replace with extract answer when hallucination is
-            # clearly present AND retrieval confidence is low/weak.
-            # Do NOT replace on medium/high confidence — the LLM likely answered correctly
-            # and the name-match heuristic has false positives (initials vs full names, etc.)
             has_unsupported = _answer_mentions_unsupported_researcher(answer_text, paper_docs)
  
-            # Only trigger the sterile extract on weak/low confidence where hallucination risk is high
             if has_unsupported and retrieval_confidence in {"weak", "low"}:
                 safe_answer = _build_researcher_extract_answer(paper_docs)
                 if safe_answer:
@@ -2149,20 +1963,13 @@ def answer_question(question: str, user_key: str,
                   and has_unsupported and retrieval_confidence == "inconsistent"):
                 answer_text = _build_researcher_extract_answer(paper_docs) or answer_text
  
-        # Sanitize the answer but with a safety net: if the sanitizer removes
-        # more than 80% of the content, the filters are probably being too
-        # aggressive for this model's output style.  Keep the original in that
-        # case — a slightly verbose answer is better than the generic fallback.
         pre_sanitize = (answer_text or "").strip()
         sanitized = _sanitize_user_answer(answer_text).strip()
         if sanitized and len(sanitized) >= len(pre_sanitize) * 0.2:
             answer_text = sanitized
         elif sanitized:
-            # Sanitizer removed >80% — likely a model mismatch. Keep original
-            # but still strip leading labels.
             answer_text = _strip_leading_answer_labels(pre_sanitize).strip() or pre_sanitize
         else:
-            # Sanitizer returned empty — use original or fallback
             answer_text = _strip_leading_answer_labels(pre_sanitize).strip() or pre_sanitize or PIPELINE_CFG["llm_no_answer"]
         eng.last_answer_llm_calls = int(answer_llm_calls)
         eng.finalize_turn(context, answer_text, no_results=not paper_docs)
@@ -2180,10 +1987,9 @@ def answer_question(question: str, user_key: str,
         rolling_summary_text=rolling_summary_text, pre_turns_count=pre_turns_count,
         stateless=stateless, t0_total=t0_total, generation_time_ms=generation_time_ms,
         answer_llm_calls=answer_llm_calls, user_key=user_key, use_graph_flag=use_graph_flag,
-        previous_pipeline=previous_pipeline, pre_state=pre_state,
-        cache_state_sig=cache_state_sig, prompt_max_docs=prompt_max_docs,
+        pre_state=pre_state,
+        prompt_max_docs=prompt_max_docs,
         prompt_text_limit=prompt_text_limit)
- 
  
 def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
                   retrieval_q, detected_intent, effective_mode, requested_mode,
@@ -2192,7 +1998,7 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
                   raw_retrieval_count, first_pass_docs, dom_second_count, post_filter_count,
                   rolling_summary_text, pre_turns_count, stateless, t0_total,
                   generation_time_ms, answer_llm_calls, user_key, use_graph_flag,
-                  previous_pipeline, pre_state, cache_state_sig,
+                  pre_state,
                   prompt_max_docs, prompt_text_limit) -> Dict[str, Any]:
  
     post_state = ({"rolling_summary": rolling_summary_text, "turns": pre_state.get("turns", []) or []}
@@ -2208,7 +2014,6 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
     post_anc_ratio = float(post_extra.get("anchor_support_ratio",
                            getattr(eng, "last_anchor_support_ratio", anc_ratio)) or 0.0)
  
-    # Sources
     sources, seen_titles = [], set()
     for d in paper_docs:
         try:
@@ -2250,7 +2055,6 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
  
     chroma_refs = [_doc_to_ref(d) for d in paper_docs[:12]]
     mem_refs = [_doc_to_ref(d) for d in mem_docs[:8]]
-    ret_digest = retrieval_cache_summary(paper_docs, retrieval_text=retrieval_q, limit_ids=12)
  
     chroma_json = {
         "count": len(paper_docs), "retrieval_count_raw": raw_retrieval_count,
@@ -2260,7 +2064,7 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
         "dominant_filter_usable": dom_usable,
         "anchor_support_ratio": round(float(anc_ratio), 4),
         "anchor_consistent": bool(anchor_consistent), "retrieval_confidence": retrieval_confidence,
-        "doc_refs": chroma_refs, "retrieval_digest": ret_digest,
+        "doc_refs": chroma_refs,
     }
  
     user_query_json = {
@@ -2276,19 +2080,11 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
     }
  
     rolling_json = {"summary": post_summary, "turns": len(post_turns), "updated": post_summary_updated}
-    cache_json = {
-        "previous_pipeline_present": bool(previous_pipeline),
-        "previous_pipeline_sig": short_hash(
-            json.dumps((previous_pipeline or {}).get("session_state", {}), ensure_ascii=False, sort_keys=True)
-            if isinstance(previous_pipeline, dict) else "", length=10),
-        "timestamp": utcnow_iso(),
-    }
- 
     combined = {
         "user_query": user_query_json, "chroma_retrieval": chroma_json,
         "rolling_summary": rolling_json,
         "conversation_memory": {"count": len(mem_docs), "doc_refs": mem_refs},
-        "cache": cache_json, "session_state": session_state,
+        "session_state": session_state,
         "context_size_chars": len(build_compact_context(paper_docs, max_docs=prompt_max_docs,
                                                         text_limit=prompt_text_limit)),
         "timing_ms": timing, "llm_calls": llm_calls,
@@ -2301,28 +2097,13 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
         except Exception:
             pass
  
-    cacheable = should_cache_turn(retrieval_text=retrieval_q,
-                                  rewrite_blocked=bool(getattr(eng, "last_rewrite_blocked", False)))
-    pipeline_cache = {
-        "user_query": {k: user_query_json[k] for k in
-                       ("text", "resolved_text", "retrieval_text", "detected_intent", "effective_mode")},
-        "chroma_retrieval": {k: chroma_json[k] for k in
-                             ("count", "retrieval_count_raw", "post_filter_count", "retrieval_confidence", "retrieval_digest")},
-        "rolling_summary": rolling_json,
-        "conversation_memory": {"count": len(mem_docs)}, "cache": cache_json,
-        "session_state": {"turn_count": session_state["turn_count"], "summary_len": session_state["summary_len"],
-                          "effective_mode": effective_mode, "llm_calls": llm_calls},
-        "timing_ms": timing,
-    }
-    set_pipeline_cache(user_key, pipeline_cache if cacheable else {})
- 
     out = {
         "answer": answer_text, "sources": sources,
         "graph_hits": [], "graph_graph": {}, "graph_error": "",
         "user_query": user_query_json, "chroma_retrieval": chroma_json,
         "rolling_summary": rolling_json,
         "conversation_memory": {"count": len(mem_docs), "doc_refs": mem_refs},
-        "cache": cache_json, "session_state": session_state,
+        "session_state": session_state,
         "timing_ms": timing, "llm_calls": llm_calls, "pipeline_json": combined,
     }
  
@@ -2331,31 +2112,9 @@ def _build_output(*, answer_text, paper_docs, mem_docs, eng, mgr, q, resolved_q,
         out["graph_hits"] = g.get("hits", []) or []
         out["graph_graph"] = g.get("graph", {}) or {}
         out["graph_error"] = g.get("error", "") or ""
- 
-    if (not stateless) and PIPELINE_CFG["qa_cache_enable"] and (not use_graph_flag) and cacheable:
-        cache_write_key = build_pipeline_cache_key(
-            user_key=user_key, resolved_text=resolved_q or q,
-            effective_mode=effective_mode, state_signature=cache_state_sig)
-        set_cached_answer(user_key, cache_write_key, {
-            "answer": out["answer"], "sources": list(out.get("sources", []))[:10],
-            "graph_hits": [], "graph_graph": {}, "graph_error": "",
-            "user_query": pipeline_cache["user_query"],
-            "chroma_retrieval": pipeline_cache["chroma_retrieval"],
-            "rolling_summary": rolling_json,
-            "conversation_memory": {"count": len(mem_docs)},
-            "cache": {"timestamp": utcnow_iso(), "retrieval_digest": ret_digest, "state_sig": cache_state_sig},
-            "session_state": pipeline_cache["session_state"],
-            "timing_ms": timing, "llm_calls": llm_calls,
-        })
- 
+
     return out
  
-# ---------------------------------------------------------------------------
-# Public-API integrity guard
-# ---------------------------------------------------------------------------
-# This runs once at import time.  If either public symbol is ever accidentally
-# moved out of this module, the ImportError surfaces immediately at startup
-# rather than hours later as a cryptic AttributeError in production.
 assert callable(answer_question), (
     "rag_pipeline.answer_question must be defined in this module — "
     "do not move it without updating all callers."
