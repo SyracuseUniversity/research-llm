@@ -1,4 +1,8 @@
-# streamlit_app.py
+import warnings
+import logging
+warnings.filterwarnings("ignore", message=".*torch.classes.*")
+logging.getLogger("streamlit.watcher.local_sources_watcher").setLevel(logging.ERROR)
+
 import os
 import html
 import uuid
@@ -9,25 +13,21 @@ from streamlit_agraph import agraph, Node, Edge, Config
 _LOCAL_EMBED_PATH = os.environ.get("LOCAL_EMBED_PATH", "")
 if _LOCAL_EMBED_PATH and os.path.isdir(_LOCAL_EMBED_PATH):
     os.environ.setdefault("EMBED_MODEL", _LOCAL_EMBED_PATH)
-# Note: HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE removed — they block
-# the transformers cache format migration needed by v4.22+. Local models
-# still load from disk via local_files_only in ModelRuntime.
 _HF_HOME = os.environ.get("HF_HOME_OVERRIDE", "")
 if _HF_HOME and os.path.isdir(_HF_HOME):
     os.environ.setdefault("HF_HOME", _HF_HOME)
 os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "poll")
 os.environ.setdefault("RAG_LLM_TIMEOUT_S", "300")
 
 from rag_pipeline import answer_question, sanitize_answer_for_display
 from runtime_settings import settings
 from rag_engine import get_global_manager
-from conversation_memory import hard_reset_memory, clear_qa_cache
-from cache_manager import clear_cache as clear_rag_cache
+from conversation_memory import hard_reset_memory
 
 import psutil
 import torch
-
 
 def _safe_call(fn, *args, **kwargs):
     try: return fn(*args, **kwargs)
@@ -38,7 +38,6 @@ def _esc(value) -> str:
 
 def _esc_answer(value) -> str:
     return sanitize_answer_for_display(str(value or ""))
-
 
 def _render_graph(g: dict, graph_key: str) -> None:
     nodes_raw = g.get("nodes", []) or []
@@ -92,11 +91,6 @@ def _render_graph(g: dict, graph_key: str) -> None:
     with st.container():
         agraph(nodes=nodes, edges=edges, config=config)
 
-
-# ---------------------------------------------------------------------------
-# App bootstrap
-# ---------------------------------------------------------------------------
-
 st.set_page_config(page_title="Syracuse Research Assistant", layout="wide")
 st.title("Syracuse Research Assistant")
 
@@ -111,10 +105,6 @@ ENGINE_MANAGER = st.session_state["engine_manager"]
 settings.debug_rag = True
 settings.use_graph = True
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-
 with st.sidebar:
     st.subheader("System Memory")
     ram_ph = st.empty()
@@ -125,11 +115,6 @@ with st.sidebar:
     st.divider()
     st.subheader("Session")
 
-    if st.button("Clear Cache"):
-        _safe_call(clear_qa_cache, USER_KEY)
-        _safe_call(clear_rag_cache)
-        st.success("Cache cleared.")
-
     if st.button("Reset Memory"):
         _safe_call(hard_reset_memory, USER_KEY)
         st.success("Memory cleared.")
@@ -137,25 +122,17 @@ with st.sidebar:
     if st.button("Restart Conversation"):
         st.session_state["messages"] = []
         _safe_call(hard_reset_memory, USER_KEY)
-        _safe_call(clear_qa_cache, USER_KEY)
-        _safe_call(clear_rag_cache)
         st.session_state["user_key"] = str(uuid.uuid4())
-        # Don't unload models on restart — they're expensive to reload and the
-        # user almost certainly wants to keep chatting with the same model.
-        # Only reset the conversation state (memory, cache, session key).
-        # If the user wants a different model, the Model dropdown handles that.
         st.success("Conversation restarted.")
         st.rerun()
 
     st.divider()
     st.subheader("Dataset")
 
-    # Build dropdown from registered DatabaseManager configs
-    _db_labels = ENGINE_MANAGER.dbm.display_labels()         # {"full": "Legacy DB", "openalex": "OpenAlex DB"}
-    _label_to_key = {v: k for k, v in _db_labels.items()}    # reverse map
+    _db_labels = ENGINE_MANAGER.dbm.display_labels()
+    _label_to_key = {v: k for k, v in _db_labels.items()}
     _options = list(_db_labels.values())
 
-    # Persist selection across reruns
     if "active_dataset" not in st.session_state:
         st.session_state["active_dataset"] = _db_labels.get(ENGINE_MANAGER.active_mode, _options[0])
 
@@ -170,13 +147,11 @@ with st.sidebar:
         new_mode = _label_to_key[selected_label]
         ENGINE_MANAGER.switch_mode(new_mode)
         settings.active_mode = new_mode
-        # Invalidate the cached papers vectorstore so it reloads from new chroma dir
         ENGINE_MANAGER.papers_vs_cache.pop(new_mode, None)
         st.session_state["active_dataset"] = selected_label
         st.success(f"Switched to **{selected_label}**")
         st.rerun()
     else:
-        # Ensure engine manager stays in sync on every rerun
         current_key = _label_to_key.get(selected_label, "full")
         if ENGINE_MANAGER.active_mode != current_key:
             ENGINE_MANAGER.switch_mode(current_key)
@@ -195,13 +170,11 @@ with st.sidebar:
     _model_labels = list(_MODEL_OPTIONS.keys())
     _model_keys = list(_MODEL_OPTIONS.values())
 
-    # Persist selection
     if "active_model" not in st.session_state:
-        # Match current setting to a label
         current_key = getattr(settings, "answer_model_key", "llama-3.2-3b")
         st.session_state["active_model"] = next(
             (lbl for lbl, k in _MODEL_OPTIONS.items() if k == current_key),
-            _model_labels[0],  # default to 3B
+            _model_labels[0],
         )
 
     selected_model_label = st.selectbox(
@@ -217,10 +190,6 @@ with st.sidebar:
         settings.llm_model = new_model_key
         st.session_state["active_model"] = selected_model_label
 
-        # Let switch_answer_model handle the full unload→load cycle in one
-        # pass.  The old code manually closed the runtime, ran gc.collect +
-        # empty_cache, then called switch_answer_model which did it all again
-        # — doubling the cleanup time for no benefit.
         with st.spinner(f"Loading **{selected_model_label}**..."):
             try:
                 ENGINE_MANAGER.switch_answer_model(new_model_key)
@@ -232,7 +201,6 @@ with st.sidebar:
     st.divider()
     st.subheader("Session Diagnostics")
     diag_ph = st.empty()
-
 
 def _refresh_sidebar(user_key: str) -> None:
     vm = psutil.virtual_memory()
@@ -255,7 +223,6 @@ def _refresh_sidebar(user_key: str) -> None:
 
     state = ENGINE_MANAGER.store.load(user_key)
     active_cfg = ENGINE_MANAGER.dbm.get_active_config()
-    # Show attention implementation being used
     _attn_info = ""
     _rt = getattr(ENGINE_MANAGER, "answer_runtime", None)
     if _rt and hasattr(_rt, "model"):
@@ -278,12 +245,7 @@ def _refresh_sidebar(user_key: str) -> None:
         "retrieval_confidence": str(state.get("retrieval_confidence", "") or ""),
     })
 
-
 _refresh_sidebar(USER_KEY)
-
-# ---------------------------------------------------------------------------
-# Chat history & input
-# ---------------------------------------------------------------------------
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []

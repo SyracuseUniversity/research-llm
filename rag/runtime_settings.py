@@ -129,9 +129,18 @@ class RuntimeSettings:
     session_turn_trim_target_chars: int = _env_int("RAG_SESSION_TURN_TRIM_TARGET_CHARS", 24000)
     summary_compress_threshold_chars: int = _env_int("RAG_SUMMARY_COMPRESS_THRESHOLD_CHARS", 1400)
  
+    # Topic-pivot / dangling-pronoun handling
+    person_pronoun_regex: str = _env("RAG_PERSON_PRONOUN_REGEX",
+        r"\b(he|she|him|her|his|hers|they|them|their)\b")
+    topic_inject_min_chars: int = _env_int("RAG_TOPIC_INJECT_MIN_CHARS", 4)
+    dangling_pronoun_min_injected: int = _env_int("RAG_DANGLING_PRONOUN_MIN_INJECTED", 2)
+    dangling_pronoun_min_raw_substantive: int = _env_int("RAG_DANGLING_PRONOUN_MIN_RAW_SUBSTANTIVE", 2)
+    dangling_pronoun_hint_max_chars: int = _env_int("RAG_DANGLING_PRONOUN_HINT_MAX_CHARS", 60)
+
     _CACHE_BUSTING_FIELDS: frozenset = frozenset({
         "generic_query_terms", "generic_token_min_len",
         "followup_phrases", "followup_pronoun_regex",
+        "person_pronoun_regex",
     })
  
     def __setattr__(self, name: str, value: object) -> None:

@@ -5,10 +5,10 @@ Tests every permutation of (model × database) with a fixed set of questions.
 Results are saved to a timestamped JSON file and a human-readable summary.
 
 Usage:
-    python benchmark_rag.py                    # run all permutations
-    python benchmark_rag.py --models 3b 8b     # only test specific models
-    python benchmark_rag.py --databases full    # only test specific databases
-    python benchmark_rag.py --dry-run           # show what would run without executing
+    python benchmark_rag.py
+    python benchmark_rag.py --models 3b 8b
+    python benchmark_rag.py --databases full
+    python benchmark_rag.py --dry-run
 
 Output:
     benchmark_results_YYYYMMDD_HHMMSS.json   — full structured results
@@ -27,25 +27,83 @@ from datetime import datetime, timezone
 from itertools import product
 from typing import Any, Dict, List, Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# Ensure the RAG project is importable
-# ---------------------------------------------------------------------------
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-# Silence noisy logs during import
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("RAG_DEBUG", "0")           # suppress pipeline debug spam
+os.environ.setdefault("RAG_DEBUG", "0")
 os.environ.setdefault("RAG_EMBED_DEVICE", "cpu")
 os.environ.setdefault("RAG_LLM_TIMEOUT_S", "300")
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Subprocess isolation: each model×db permutation runs in its own process
+# so a CUDA device-side assert in one model cannot corrupt the next.
 # ---------------------------------------------------------------------------
+_SINGLE_RUN_FLAG = "--single-run"
+
+def _run_single_in_subprocess(model_key: str, db_key: str,
+                               questions: List[str], output_path: str,
+                               timeout: int = 7200) -> Dict[str, Any]:
+    """Spawn a child process for one model×db permutation."""
+    import subprocess, tempfile
+    config = {"model_key": model_key, "db_key": db_key,
+              "questions": questions, "output_path": output_path}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                      delete=False, dir=".") as f:
+        json.dump(config, f, ensure_ascii=False)
+        config_path = f.name
+
+    env = {**os.environ, "RAG_LLM_TIMEOUT_S": os.environ.get("RAG_LLM_TIMEOUT_S", "300")}
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), _SINGLE_RUN_FLAG, config_path],
+            timeout=timeout, env=env,
+        )
+        if os.path.exists(output_path):
+            with open(output_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {"model_key": model_key, "db_key": db_key,
+                "error": f"Subprocess exited {proc.returncode} but no output",
+                "model_label": MODELS.get(model_key, model_key),
+                "db_label": DATABASES.get(db_key, db_key),
+                "model_load_s": 0, "questions": [], "db_health": {}}
+    except subprocess.TimeoutExpired:
+        return {"model_key": model_key, "db_key": db_key,
+                "error": f"Subprocess timed out after {timeout}s",
+                "model_label": MODELS.get(model_key, model_key),
+                "db_label": DATABASES.get(db_key, db_key),
+                "model_load_s": 0, "questions": [], "db_health": {}}
+    except Exception as e:
+        return {"model_key": model_key, "db_key": db_key,
+                "error": f"Subprocess failed: {e}",
+                "model_label": MODELS.get(model_key, model_key),
+                "db_label": DATABASES.get(db_key, db_key),
+                "model_load_s": 0, "questions": [], "db_health": {}}
+    finally:
+        try: os.unlink(config_path)
+        except OSError: pass
+
+
+def _single_run_entrypoint(config_path: str) -> None:
+    """Child-process entry: load manager, run one conversation, write result."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    model_key = config["model_key"]
+    db_key = config["db_key"]
+    questions = config["questions"]
+    output_path = config["output_path"]
+
+    runner = BenchmarkRunner()
+    runner._ensure_imports()
+    result = runner.run_conversation(questions, model_key, db_key)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
 
 MODELS: Dict[str, str] = {
-    #"llama-3.2-3b":   "LLaMA 3.2 3B",
+    # "llama-3.2-3b":   "LLaMA 3.2 3B",
     "llama-3.1-8b":   "LLaMA 3.1 8B (4-bit)",
     "gemma-3-12b":    "Gemma 3 12B (4-bit)",
     "qwen-2.5-14b":   "Qwen 2.5 14B (4-bit)",
@@ -59,75 +117,57 @@ DATABASES: Dict[str, str] = {
 }
 
 QUESTIONS: List[str] = [
-    # --- Block 1: Person lookup + follow-up coreference chain ---
     "who is duncan brown",
     "Summarize the mechanisms described in his papers",
     "what is LIGO and Virgo?",
     "who else studies it",
 
-    # --- Block 2: Topic shift → new person + follow-ups ---
     "Which faculty have demonstrated expertise in intrinsically disordered proteins, especially in relation to environmental sensing, emergent cellular behavior, or plant systems?",
     "who is william gearty",
     "what does he study",
     "who else studies paleontology",
 
-    # --- Block 3: Complex discovery + named entity + broad topic ---
     "Identify researchers whose work could contribute to precision, personalized recovery pathways for neurological injury using continuous behavioral or physiological monitoring.",
     "Tell me about Alexander Nitz's research at Syracuse University",
     "computer science research at syracuse university",
 
-    # --- Block 4: Fresh person lookup mid-conversation (topic shift stress) ---
     "who is Melissa Green",
     "what topics does she publish on",
 
-    # --- Block 5: Comparison intent ---
     "Compare the research areas of Duncan Brown and Alexander Nitz",
 
-    # --- Block 6: Time-range intent ---
     "What papers were published on machine learning between 2020 and 2024?",
 
-    # --- Block 7: List intent with broad scope ---
     "List faculty working on climate change or environmental sustainability",
     "who works on artificial intelligence",
 
-    # --- Block 8: Ambiguous / common name stress test ---
+    "who is collin capano, what does he study, and who does he collaborate with",
+
     "who is David Smith",
     "tell me about his most cited work",
 
-    # --- Block 9: Department-level broad queries ---
     "what kind of research does the physics department do",
     "biology research at syracuse",
 
-    # --- Block 10: Negation / out-of-corpus handling ---
     "Is there any research on quantum computing at Syracuse?",
     "who studies dark matter",
 
-    # --- Block 11: Short pronoun-only follow-ups (coreference stress) ---
     "tell me more about that",
     "what else has he published",
 
-    # --- Block 12: Multi-entity question ---
     "Which researchers have collaborated on gravitational wave detection?",
 
-    # --- Block 13: Edge cases ---
     "what is the most recent paper in the database",
     "how many papers does the corpus contain",
     "switch topic",
     "who works on both machine learning and healthcare",
 ]
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
-
 def _now_tag() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
-
 
 def _gpu_info() -> Dict[str, Any]:
     info: Dict[str, Any] = {"available": False}
@@ -145,40 +185,30 @@ def _gpu_info() -> Dict[str, Any]:
         pass
     return info
 
-
 def _answer_word_count(text: str) -> int:
     return len((text or "").split())
-
 
 def _source_count(out: Dict[str, Any]) -> int:
     return len(out.get("sources", []) or [])
 
-
-# ---------------------------------------------------------------------------
-# Core benchmark runner
-# ---------------------------------------------------------------------------
-
 class BenchmarkRunner:
     def __init__(self):
-        self.mgr = None         # lazy-loaded EngineManager
-        self.settings = None    # lazy-loaded RuntimeSettings
+        self.mgr = None
+        self.settings = None
 
     def _ensure_imports(self):
         """Lazy import so the script can parse args / --dry-run without loading models."""
         if self.mgr is not None:
             return
-        from rag_pipeline import answer_question  # noqa: F401
+        from rag_pipeline import answer_question
         from rag_engine import get_global_manager
         from runtime_settings import settings
-        from conversation_memory import hard_reset_memory, clear_qa_cache
-        from cache_manager import clear_cache as clear_rag_cache
+        from conversation_memory import hard_reset_memory
 
         self.mgr = get_global_manager()
         self.settings = settings
         self.answer_question = answer_question
         self.hard_reset_memory = hard_reset_memory
-        self.clear_qa_cache = clear_qa_cache
-        self.clear_rag_cache = clear_rag_cache
 
     def _switch_model(self, model_key: str) -> float:
         """Switch answer model, return time taken in seconds."""
@@ -193,7 +223,6 @@ class BenchmarkRunner:
         """Switch active database/dataset."""
         self.mgr.switch_mode(db_key)
         self.settings.active_mode = db_key
-        # Invalidate cached vectorstore so it reloads from the new chroma dir
         if hasattr(self.mgr, "papers_vs_cache"):
             self.mgr.papers_vs_cache.pop(db_key, None)
 
@@ -201,10 +230,8 @@ class BenchmarkRunner:
         """Check DB health before running questions against it."""
         health: Dict[str, Any] = {"healthy": True, "doc_count": -1}
         try:
-            # Try the manager's own validation first
             if hasattr(self.mgr, "dbm") and hasattr(self.mgr.dbm, "validate_active_config"):
                 health = self.mgr.dbm.validate_active_config()
-            # Fall back to direct collection count check
             if health.get("doc_count", -1) < 0:
                 try:
                     vs = self.mgr.get_papers_vs(db_key)
@@ -221,14 +248,6 @@ class BenchmarkRunner:
         """Full session reset between question sequences."""
         try:
             self.hard_reset_memory(user_key)
-        except Exception:
-            pass
-        try:
-            self.clear_qa_cache(user_key)
-        except Exception:
-            pass
-        try:
-            self.clear_rag_cache()
         except Exception:
             pass
 
@@ -252,9 +271,6 @@ class BenchmarkRunner:
                 question, user_key=user_key,
                 use_graph=False, stateless=stateless,
             )
-        # FIX 1: Re-raise KeyboardInterrupt instead of swallowing it.
-        # Previously this was caught and turned into a warning string,
-        # which meant Ctrl+C had no effect — the loop just continued.
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -304,20 +320,15 @@ class BenchmarkRunner:
 
         user_key = f"bench_{model_key}_{db_key}_{uuid.uuid4().hex[:8]}"
 
-        # Switch database
         print(f"\n  [DB] Switching to {db_key}...")
         self._switch_database(db_key)
 
-        # Validate DB health
         health = self._validate_database(db_key)
         if not health.get("healthy", True):
             reason = health.get("reason", "unknown")
             doc_count = health.get("doc_count", 0)
             print(f"  [WARN] Database '{db_key}' unhealthy: {reason} (docs: {doc_count})")
 
-        # Switch model
-        # FIX 1 (continued): Don't catch KeyboardInterrupt here either —
-        # let it propagate up to run_all where it's handled cleanly.
         print(f"  [MODEL] Loading {model_key}...")
         try:
             model_load_s = self._switch_model(model_key)
@@ -337,12 +348,10 @@ class BenchmarkRunner:
             }
         print(f"  [MODEL] {model_key} loaded in {model_load_s:.1f}s")
 
-        # Reset session state
         self._reset_session(user_key)
 
         results = _results_ref if _results_ref is not None else []
 
-        # Run each question in sequence (stateful conversation)
         for i, q in enumerate(questions, 1):
             print(f"  [{i}/{len(questions)}] {q[:60]}{'...' if len(q) > 60 else ''}")
             t0 = time.perf_counter()
@@ -367,7 +376,6 @@ class BenchmarkRunner:
             if on_progress is not None:
                 on_progress()
 
-        # Cleanup session
         self._reset_session(user_key)
 
         return {
@@ -432,9 +440,6 @@ class BenchmarkRunner:
             }
 
         def _save_incremental() -> None:
-            # FIX 1 (continued): Don't use bare `except Exception` here —
-            # that would catch and swallow KeyboardInterrupt on Python 2
-            # and is just sloppy. Be explicit.
             try:
                 snapshot = _build_results()
                 tmp = json_path + ".tmp"
@@ -453,41 +458,52 @@ class BenchmarkRunner:
             print(header)
             print(f"{_LINE}")
 
-            partial_run = {
-                "model_key": model_key,
-                "model_label": MODELS.get(model_key, model_key),
-                "db_key": db_key,
-                "db_label": DATABASES.get(db_key, db_key),
-                "model_load_s": 0,
-                "error": "",
-                "questions": [],
-                "status": "in_progress",
-            }
-            current_run_ref[0] = partial_run
+            # --- Each permutation runs in a subprocess with a fresh CUDA context ---
+            run_output_path = os.path.join(
+                output_dir, f"_bench_run_{model_key}_{db_key}_{tag}.json")
 
-            # FIX 1 (continued): Catch KeyboardInterrupt at the top-level loop,
-            # save whatever we have so far, then exit cleanly.
             try:
-                run = self.run_conversation(questions, model_key, db_key,
-                                            on_progress=_save_incremental,
-                                            _results_ref=partial_run["questions"])
+                run = _run_single_in_subprocess(
+                    model_key, db_key, questions, run_output_path,
+                    timeout=int(os.environ.get("RAG_LLM_TIMEOUT_S", "300")) * len(questions) + 600,
+                )
             except KeyboardInterrupt:
                 print("\n\n[INTERRUPTED] Ctrl+C received — saving partial results...")
-                partial_run["status"] = "interrupted"
-                partial_run["error"] = "Interrupted by user"
-                all_runs.append(partial_run)
+                all_runs.append({
+                    "model_key": model_key, "model_label": MODELS.get(model_key, model_key),
+                    "db_key": db_key, "db_label": DATABASES.get(db_key, db_key),
+                    "error": "Interrupted by user", "model_load_s": 0, "questions": [],
+                })
                 current_run_ref[0] = None
                 _save_incremental()
                 print(f"[INTERRUPTED] Partial results saved to: {json_path}")
                 sys.exit(0)
 
+            # Print per-question summaries from the completed run
+            for qi, qr in enumerate(run.get("questions", []), 1):
+                wc = qr.get("answer_word_count", 0)
+                src = qr.get("source_count", 0)
+                gen = qr.get("timing", {}).get("generation_ms", 0)
+                conf = qr.get("retrieval", {}).get("confidence", "")
+                err = qr.get("error", "")
+                line = f"  [{qi}/{len(questions)}] {qr.get('question', '')[:50]}..."
+                line += f"  \u2192 {wc}w, {src}src, {gen:.0f}ms"
+                if conf: line += f", {conf}"
+                if err: line += f" ERROR: {err}"
+                print(line)
+
+            if run.get("error"):
+                print(f"  [ERROR] {run['error']}")
+
             current_run_ref[0] = None
             all_runs.append(run)
 
+            # Clean up temp file
+            try: os.unlink(run_output_path)
+            except OSError: pass
+
             _save_incremental()
             print(f"  [SAVED] Results saved ({len(all_runs)}/{len(combos)} permutations)")
-
-            self._free_vram()
 
         results = _build_results()
         results["status"] = "complete"
@@ -496,11 +512,6 @@ class BenchmarkRunner:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
         return results
-
-
-# ---------------------------------------------------------------------------
-# Report generation
-# ---------------------------------------------------------------------------
 
 def generate_summary(results: Dict[str, Any], filepath: str) -> None:
     _DASH = "\u2014"
@@ -555,7 +566,6 @@ def generate_summary(results: Dict[str, Any], filepath: str) -> None:
             )
         lines.append("")
 
-    # Aggregate stats per model
     lines.append("\n" + "=" * 60)
     lines.append("AGGREGATE STATS PER MODEL (across all databases)")
     lines.append("=" * 60)
@@ -601,7 +611,6 @@ def generate_summary(results: Dict[str, Any], filepath: str) -> None:
             f"{conf_str}"
         )
 
-    # Aggregate stats per database
     lines.append("\n" + "=" * 60)
     lines.append("AGGREGATE STATS PER DATABASE (across all models)")
     lines.append("=" * 60)
@@ -641,7 +650,6 @@ def generate_summary(results: Dict[str, Any], filepath: str) -> None:
             f"{conf_str}"
         )
 
-    # Per-question diagnostics (shows which questions consistently fail)
     lines.append("\n" + "=" * 60)
     lines.append("PER-QUESTION DIAGNOSTICS (across all runs)")
     lines.append("=" * 60)
@@ -688,21 +696,12 @@ def generate_summary(results: Dict[str, Any], filepath: str) -> None:
         f.write(report)
     print(f"\nSummary written to: {filepath}")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(description="RAG Benchmark \u2014 test all model\u00d7database permutations")
     parser.add_argument("--models", nargs="+", default=None,
                         help=f"Model keys to test (default: all). Options: {', '.join(MODELS.keys())}")
     parser.add_argument("--databases", nargs="+", default=None,
                         help=f"Database keys to test (default: all). Options: {', '.join(DATABASES.keys())}")
-    # FIX 3: --questions now takes a file path, not inline strings.
-    # Passing 30 questions on the command line is impractical and error-prone.
-    # Edit QUESTIONS in this file to change the default set.
-    # Use --questions-file path/to/questions.txt for a one-per-line override.
     parser.add_argument("--questions-file", default=None,
                         help="Path to a text file with one question per line (overrides built-in QUESTIONS list)")
     parser.add_argument("--output-dir", default=".",
@@ -713,14 +712,18 @@ def main():
                         help="Show what would run without executing")
     args = parser.parse_args()
 
-    # FIX 2: Use nargs="+" (one or more) instead of nargs="*" (zero or more).
-    # With nargs="*", passing --models with no values gives [] which is falsy,
-    # silently falling back to all models. nargs="+" makes it an error instead.
     model_keys = args.models if args.models else list(MODELS.keys())
     db_keys = args.databases if args.databases else list(DATABASES.keys())
 
-    # FIX 3: Load questions from a file if provided, otherwise use the
-    # in-file QUESTIONS list. Editing QUESTIONS above is the intended workflow.
+    def _resolve_key(short, lookup):
+        if short in lookup:
+            return short
+        matches = [k for k in lookup if short.lower() in k.lower()]
+        return matches[0] if len(matches) == 1 else short
+
+    model_keys = [_resolve_key(m, MODELS) for m in model_keys]
+    db_keys = [_resolve_key(d, DATABASES) for d in db_keys]
+
     if args.questions_file:
         with open(args.questions_file, "r", encoding="utf-8") as f:
             questions = [line.strip() for line in f if line.strip() and not line.startswith("#")]
@@ -771,6 +774,9 @@ def main():
     print(f"  Summary: {summary_path}")
     print(f"{'='*60}")
 
-
 if __name__ == "__main__":
+    # --- Subprocess entry point: run a single model×db permutation ---
+    if len(sys.argv) >= 3 and sys.argv[1] == _SINGLE_RUN_FLAG:
+        _single_run_entrypoint(sys.argv[2])
+        sys.exit(0)
     main()

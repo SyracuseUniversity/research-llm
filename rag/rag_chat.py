@@ -1,4 +1,3 @@
-#rag_chat.py
 """
 RAG Live Chat
 =============
@@ -39,11 +38,7 @@ import sys
 import time
 import traceback
 import uuid
-try:
-    import readline  # noqa: F401 — enables arrow-key history on Linux/macOS
-except ImportError:
-    pass  # readline unavailable on Windows; line editing disabled
-
+import readline
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 

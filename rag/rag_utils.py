@@ -55,6 +55,7 @@ def bootstrap_nltk_data() -> None:
         pass
  
 _WORDNET_AVAILABLE: Optional[bool] = None
+_WORDNET_TOKEN_CACHE: Dict[str, bool] = {}
  
 def _wordnet_is_common_word(token: str) -> bool:
     """Return True if *token* has WordNet synsets as a noun, verb, adjective,
@@ -65,29 +66,32 @@ def _wordnet_is_common_word(token: str) -> bool:
     Some names like 'brown', 'grant', 'mark' DO appear in WordNet (as
     adjectives/verbs), but those also appear in the NLTK names corpus, so the
     caller can combine both signals.
-
-    WordNet availability is cached for the lifetime of the process via
-    `_WORDNET_AVAILABLE`; synsets for individual tokens are looked up on each call.
+ 
+    Results are cached per-token for the lifetime of the process.
     """
     global _WORDNET_AVAILABLE
+    if token in _WORDNET_TOKEN_CACHE:
+        return _WORDNET_TOKEN_CACHE[token]
     if _WORDNET_AVAILABLE is False:
         return False
     try:
         from nltk.corpus import wordnet as _wn
         _WORDNET_AVAILABLE = True
-        return bool(_wn.synsets(token))
+        result = bool(_wn.synsets(token))
     except LookupError:
         bootstrap_nltk_data()
         try:
             from nltk.corpus import wordnet as _wn
             _WORDNET_AVAILABLE = True
-            return bool(_wn.synsets(token))
+            result = bool(_wn.synsets(token))
         except Exception:
             _WORDNET_AVAILABLE = False
-            return False
+            result = False
     except Exception:
         _WORDNET_AVAILABLE = False
-        return False
+        result = False
+    _WORDNET_TOKEN_CACHE[token] = result
+    return result
  
 def get_stopword_set() -> Set[str]:
     global _NLTK_STOPWORDS_CACHE
